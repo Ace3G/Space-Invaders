@@ -96,22 +96,29 @@ PLAYER_WIDTH = 30
 PLAYER_HEIGHT = 24
 PLAYER_SPEED = 3.5
 BASE_SHOT_COOLDOWN = 27
+COOP_FIRE_COOLDOWN_STEP = 0.65  # A modest team boost; each pilot still fires slower than solo.
 # Slightly stronger rapid fire as more pilots join, with per-player
 # cooldowns still scaling against the number of *active* pilots.
-# Solo: 2.2x; two pilots: 2.35x; three: 2.5x; four: 2.65x.
-RAPID_FIRE_MULTIPLIERS = (2.5, 3, 3.25, 3.4)
+# Solo: 3x; two pilots: 3.4x; three: 3.7x; four: 4x.
+RAPID_FIRE_MULTIPLIERS = (3.0, 3.4, 3.7, 4.0)
+RAPID_FIRE_LASER_MULTIPLIER = 1.75
 MAX_DAMAGE_BONUS = 3
-# Each discharge always reaches a second nearby foe, then rolls for each
-# extra hop independently. At most six foes (including the original) are hit.
+# Eligible discharges arc to a second foe if one is in range, then roll for
+# extra hops. The hop list limits the total number of additional targets.
 LIGHTNING_HOP_CHANCES = (1.0, 0.85, 0.65, 0.45, 0.25)
 BOMB_BLAST_RADIUS = 62
-BULLET_TIME_RADIUS = 110
+BULLET_TIME_RADIUS = 150
+GRAVITY_FIELD_RADIUS = 150
+GRAVITY_MAX_PROJECTILE_TURN = 0.65  # Total radians; a field cannot trap a shot in orbit.
 BULLET_TIME_SLOWDOWN = 0.48  # Permanent movement multiplier after a shot first enters any field.
-# Each DISTINCT incoming projectile slowed by Bullet Time transfers a burst of
-# momentum to the pilot.  Stacks last until that Bullet Time charge expires.
+# Each distinct projectile slowed by Bullet Time grants Momentum. Frostbite
+# kills build separate Shatter stacks; the stronger bonus applies, without adding.
 BULLET_TIME_MAX_STACKS = 16
 BULLET_TIME_SPEED_PER_STACK = 0.28  # Up to +4.48 movement/frame.
 BULLET_TIME_FIRE_PER_STACK = 0.085  # Up to +136% fire rate.
+SHATTER_MAX_STACKS = 6
+SHATTER_SPEED_PER_STACK = 0.5  # Stronger per stack, but +3 max versus Momentum's +4.48.
+SHATTER_FIRE_PER_STACK = 0.15  # +90% max versus Momentum's +136%.
 ENEMY_AIM_LEAD_FRAMES = 4
 PLAYER_COLORS = (RED, PLAYER_BLUE, CYAN, YELLOW)
 PLAYER_CONTROLS = (
@@ -204,7 +211,7 @@ BUNKER_SHAPE = [
     "XX       XX"
 ]
 
-# --- 8-Bit Pixel Art Design Templates (9 characters wide) ---
+# --- Pixel-art templates, scaled to each ship's dimensions ---
 PLAYER_ART = ["    X    ", "   XXX   ", "   XXX   ", " XXXXXXX ", "XXXXXXXXX", "XXXXXXXXX"]
 
 # Standard Variations (3 models/colors)
@@ -319,10 +326,10 @@ VISUAL_VARIATIONS = {
 
 ENEMY_JOURNAL = (
     ("Standard", "Basic enemy that travels with the formation."),
-    ("Shooter", "Fires steady straight shots toward the bottom of the screen."),
+    ("Shooter", "Periodically fires straight downward shots."),
     ("Speedy", "Fast-moving attacker; a swift mutation can push it beyond normal speed."),
     ("Scout", "Small, nimble enemy that darts across the formation."),
-    ("Striker", "Fires fast, aimed shots at the nearest player."),
+    ("Striker", "Fires fast, aimed shots at a randomly chosen active pilot."),
     ("Tank", "Has extra armor and takes several hits to destroy."),
     ("Diver", "Dives vertically while sweeping across the screen."),
     ("Weaver", "Moves side to side while weaving up and down."),
@@ -330,27 +337,27 @@ ENEMY_JOURNAL = (
     ("Bomber", "Drops a mine that bursts into a ring of projectiles."),
     ("Swarmer", "Appears in clusters and moves quickly."),
     ("Lancer", "Fires a pair of aimed bolts from either side."),
-    ("Bulwark", "Heavily armored and occasionally fires a large shot."),
+    ("Bulwark", "Heavily armored and occasionally fires straight downward shots."),
     (
         "Splitter",
         "Splits into three shardlings; each surviving fragment regrows independently.",
     ),
     ("Shardling", "Small, quick splitter fragment. Each one regrows alone if it survives."),
-    ("Warden", "Gives nearby enemies a protective shield."),
-    ("Artillery", "Lobs a slow, heavy aimed projectile."),
-    ("Volley", "Fires a three-shot fan toward the nearest player."),
-    ("Mine Layer", "Drops several timed mines across a row."),
+    ("Warden", "At wave start, gives nearby allies one shield charge that blocks a hit."),
+    ("Artillery", "Fires a large projectile aimed at an active pilot."),
+    ("Volley", "Fires a three-shot fan toward a randomly chosen active pilot."),
+    ("Mine Layer", "Drops two timed mines that burst into small rings of shots."),
     ("Seeker", "Launches a projectile that slowly homes in on a player."),
-    ("Ricochet", "Fires an aimed shot that can bounce off screen edges."),
+    ("Ricochet", "Fires aimed shots that can bounce off the left and right screen edges."),
     ("Prism", "Shoots a projectile that splits into a radial burst."),
     ("Pulse", "Releases a ring of shots in every direction."),
     ("Blink", "Periodically blinks to a new position along its row."),
     ("Charger", "Moves laterally and fires fast, aimed shots."),
-    ("Medic", "Heals nearby wounded allies over time; cannot create shields."),
+    ("Medic", "Heals one nearby wounded ally at a time; cannot create shields."),
     ("Orbit", "Sweeps in broad arcs while moving across the screen."),
     ("Scatterer", "Fires a wide spread of shots to cover more space."),
     ("Phantom", "Fires a wavering projectile that sways as it travels."),
-    ("Boss", "Appears every fifth wave and uses a changing special attack."),
+    ("Boss", "Appears every fifth wave with changing attacks. Later encounters can pair two bosses."),
 )
 ENEMY_MUTATIONS = (
     (
@@ -360,7 +367,7 @@ ENEMY_MUTATIONS = (
     ),
     (
         "SWIFT",
-        "Moves faster; only a Speedy enemy with this mutation can exceed player speed.",
+        "Can speed up a ship or give it independent movement; the effect varies by enemy type.",
         YELLOW,
     ),
     ("VOLATILE", "Explodes into a ring of shots when destroyed.", PINK),
@@ -452,7 +459,7 @@ POWERUP_LABELS = {
     "homing": "HOMING SHOT",
     "lightning": "CHAIN LIGHTNING",
     "score_boost": "DOUBLE SCORE",
-    "cryo": "CRYO SHOTS",
+    "cryo": "FROSTBITE",
     "orbit_drones": "ORBIT DRONES",
     "supply_beacon": "SUPPLY BEACON",
     "gravity_well": "GRAVITY WELL",
@@ -475,7 +482,7 @@ POWERUP_TIMER_LABELS = {
     "homing": "HOMING",
     "lightning": "LIGHTNING",
     "score_boost": "2X SCORE",
-    "cryo": "CRYO",
+    "cryo": "FROSTBITE",
     "orbit_drones": "DRONES",
     "gravity_well": "GRAVITY",
     "chain_reaction": "CHAIN REACTION",
@@ -510,28 +517,28 @@ POWERUP_TIMER_KEYS = {
 }
 POWERUP_JOURNAL = (
     ("life", "Adds one life, up to five. A boss reward can revive an eliminated player with one life."),
-    ("shield", "Blocks damage and destroys enemy shots near your ship. Ram normal enemies safely."),
-    ("rapid_fire", "Fires normal shots and bombs 2.2x faster solo, up to 2.65x with four active players; lasers pulse 40% faster."),
-    ("speed", "Moves your ship faster in every direction, from 3.5 to 5.5 pixels per frame."),
+    ("shield", "Blocks damage and destroys nearby enemy projectiles. Ramming destroys regular foes; bosses survive the ram."),
+    ("rapid_fire", f"Normal shots and bombs fire about {RAPID_FIRE_MULTIPLIERS[0]:g}x faster solo, up to {RAPID_FIRE_MULTIPLIERS[-1]:g}x with four active pilots; lasers pulse about {(RAPID_FIRE_LASER_MULTIPLIER - 1):.0%} faster."),
+    ("speed", "Boosts movement in every direction. Stacks with Bullet Time Momentum."),
     ("triple_shot", "Fires three parallel shots at once. Bomb blasts do not stack on one enemy; lasers gain three powerful piercing beams."),
-    ("laser", "Hold fire for a strong, full-screen piercing beam. Hits every enemy in its path for 3 base damage per pulse, including bosses. Takes priority over bombs."),
+    ("laser", "Hold fire for an upward piercing beam. Main-beam hits deal 3 base damage per pulse, including bosses. Takes priority over bombs."),
     ("magnet", "Pulls dropped powerups toward your ship from anywhere on the screen."),
-    ("bomb", "Slower explosive shots deal 3 base damage within 62 pixels. Each enemy takes one blast per volley, even with triple shot."),
-    ("bullet_time", "Permanently slows any bullet entering the field to 48% speed; each unique bullet feeds Momentum (+0.28 movement and +8.5% fire rate per stack, maximum 16). Momentum lasts until the buff expires."),
-    ("piercing", "Normal shots deal 2 base damage and pass through up to three different enemies. Does not affect bombs or lasers."),
-    ("damage_up", "Rare pickup: permanently adds 1 weapon damage, up to +3. Extra pickups grant double score instead."),
-    ("homing", "Normal shots and bombs steer toward enemies; lasers gain a guided off-axis beam. Can combine with Lightning for longer chains."),
-    ("lightning", "Shots, bombs and laser pulses always arc to a nearby second enemy. Further hops have 85%, 65%, 45%, then 25% chances, up to six enemies total. Homing extends each hop's reach; Piercing and Triple Shot offer more opportunities."),
+    ("bomb", f"Fires less often, but each bomb deals 3 base damage within {BOMB_BLAST_RADIUS} pixels. Triple-shot blasts do not stack on the same enemy."),
+    ("bullet_time", f"A {BULLET_TIME_RADIUS}-pixel field keeps enemy shots at {BULLET_TIME_SLOWDOWN:.0%} speed, excluding lasers. Each distinct shot grants Momentum, max {BULLET_TIME_MAX_STACKS}. Buff expiry or life loss clears Momentum."),
+    ("piercing", "Normal shots deal 2 base damage and can hit up to three different foes. Does not change bombs or lasers."),
+    ("damage_up", f"Adds 1 damage to normal shots, bombs and lasers for this run, up to +{MAX_DAMAGE_BONUS}. Support shots are unchanged. Extra pickups grant Double Score."),
+    ("homing", "Normal shots and bombs steer toward foes; lasers add a weaker guided arc while keeping their main beam. Extends Lightning's reach."),
+    ("lightning", f"Main shots, bombs and laser pulses arc for reduced damage. First hop needs a foe in range; later chances are {', '.join(f'{chance:.0%}' for chance in LIGHTNING_HOP_CHANCES[1:])}. Up to {1 + len(LIGHTNING_HOP_CHANCES)} foes total. Homing extends reach."),
     ("score_boost", "Doubles the score you earn from defeating enemies while active."),
-    ("cryo", "Weapon hits slow ordinary enemies by 40% for two seconds. Bosses resist the freeze and slow by 15%."),
-    ("orbit_drones", "Two orbiting helpers fire independent supporting shots for 15 seconds."),
-    ("supply_beacon", "Improves powerup drops from your next eight kills. Stored until those kills are used."),
-    ("gravity_well", "A ten-second field gently bends nearby moving hostile shots away. Boss lasers stay fixed."),
-    ("emergency_warp", "Stores one emergency escape until used, including across waves and saves. Your next damaging hit teleports you to a safer spot without losing a life. Duplicate charges grant Double Score."),
-    ("nova_pulse", "A 190-pixel defensive blast clears moving hostile shots and deals three damage to foes, six to bosses. Lasers are unaffected."),
-    ("missile_swarm", "Launches six basic guided missiles toward the fleet. Other weapon buffs do not multiply this swarm."),
+    ("cryo", f"Hits slow foes for {CRYO_SLOW_MS // 1000}s. Credited kills grant Shatter: +{SHATTER_SPEED_PER_STACK:g} speed and +{SHATTER_FIRE_PER_STACK:.0%} fire per stack, max {SHATTER_MAX_STACKS}. Stronger per stack, weaker at max than Momentum; bonuses do not add."),
+    ("orbit_drones", f"Two orbiting helpers fire basic support shots for {POWERUP_DURATIONS['orbit_drones'] // 1000} seconds. Damage Up and other weapon buffs do not boost them."),
+    ("supply_beacon", "Stores eight credited-kill charges. Ordinary kills get better drop odds; boss kills spend a charge too. Drop limits still apply."),
+    ("gravity_well", f"A {POWERUP_DURATIONS['gravity_well'] // 1000}-second, {GRAVITY_FIELD_RADIUS}-pixel field gently bends nearby moving hostile shots away. Boss lasers stay fixed."),
+    ("emergency_warp", "Stored across waves and saves. After Reflector blocks run out, a damaging hit spends the charge to warp you to a safer spot. Duplicates grant Double Score."),
+    ("nova_pulse", "A 190-pixel blast clears enemy projectiles, including mines, and deals 3 damage to foes or 6 to bosses. Boss lasers are unaffected."),
+    ("missile_swarm", "Stores a charge for up to six guided missiles. Fires at visible foes once there is room for support shots. Weapon buffs do not multiply the swarm."),
     ("reflector", "Stores three blocks. Each damaging hit spends a block and returns a basic bolt toward the nearest foe."),
-    ("chain_reaction", "For 15 seconds, your kills release small friendly bursts. Their shrapnel cannot create further bursts."),
+    ("chain_reaction", f"For {POWERUP_DURATIONS['chain_reaction'] // 1000} seconds, credited kills can send up to three shards at nearby visible foes. Support shots and Nova Pulse do not start bursts."),
 )
 JOURNAL_ENTRIES_PER_PAGE = 10
 
@@ -544,12 +551,11 @@ def journal_page_count():
     )
 
 
-# Small increase from the previous overly sparse pickup rate. Keep the
-# two-pickup cap and cooldown so long games do not turn into pickup clutter.
-NORMAL_POWERUP_DROP_CHANCE = 0.075
-MUTATED_POWERUP_DROP_CHANCE = 0.15
+# Limit random drops with a world-pickup cap and a shared cooldown.
+NORMAL_POWERUP_DROP_CHANCE = 0.06
+MUTATED_POWERUP_DROP_CHANCE = 0.12
 MAX_WORLD_POWERUPS = 2
-POWERUP_DROP_COOLDOWN_MS = 2000
+POWERUP_DROP_COOLDOWN_MS = 2400
 _LAST_RANDOM_POWERUP_DROP_MS = -POWERUP_DROP_COOLDOWN_MS
 ENEMY_SCORE_VALUES = {
     "standard": 100,
@@ -1464,6 +1470,9 @@ def check_bunker_collisions(bunkers, player_bullets, enemy_bullets, enemies, par
 
     # Enemy bullets colliding with bunker blocks
     for bullet in enemy_bullets[:]:
+        # Telegraphs are harmless until the beam becomes active.
+        if bullet.get("laser_state") == "warning":
+            continue
         bullet_rect = bullet["rect"]
         for block in bunkers[:]:
             if bullet_rect.colliderect(block):
@@ -1541,6 +1550,8 @@ def update_and_draw_particles(screen, particles, advance=True):
                              (x - round(p["dx"] * 0.7), y - round(p["dy"] * 0.7)),
                              (x, y), max(1, round(3 * alpha)))
             pygame.draw.circle(screen, UI_TEXT, (x, y), max(1, round(2 * alpha)))
+        elif p.get("kind") in ("powerup_pickup", "shatter"):
+            draw_powerup_collection_particle(screen, p)
         elif p.get("kind") == "ring":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             ring_radius = int(p["radius"] + progress * 28)
@@ -1559,8 +1570,8 @@ def update_and_draw_particles(screen, particles, advance=True):
 
 def create_bosses(round_num):
     enemies = []
-    # Predictable paired encounters begin after the player has learned the
-    # patterns. Their combined health and fire rate use one encounter budget.
+    # Later paired encounters share a projectile cap and stagger their volleys;
+    # their combined health is tuned separately from a single boss.
     boss_count = 2 if round_num >= 40 and round_num % 20 == 0 else 1
     progress = boss_difficulty_progress(round_num)
     tier = enemy_health_tier(round_num)
@@ -2267,6 +2278,8 @@ def create_powerup(x, y):
         "dx": random.uniform(-0.8, 0.8),
         "dy": 2.4,
         "lifetime": 500,
+        # Cosmetic phase is deterministic and does not consume gameplay RNG.
+        "visual_phase": POWERUP_TYPES.index(powerup_type) * 0.73,
     }
 
 
@@ -2321,11 +2334,14 @@ def grant_powerup(player, powerup_type, enemy_bullets=None):
     elif powerup_type in POWERUP_TIMER_KEYS:
         timer_key = POWERUP_TIMER_KEYS[powerup_type]
         if powerup_type == "bullet_time" and player[timer_key] <= now:
+            player["momentum_stacks"] = 0
+            player["momentum_flash_until"] = 0
             # New charge: an old projectile may count again, but never twice
             # during the same charge (even if it leaves/re-enters the field).
-            player["momentum_stacks"] = 0
             player["momentum_generation"] = player.get("momentum_generation", 0) + 1
-            player["momentum_flash_until"] = 0
+        if powerup_type == "cryo" and player[timer_key] <= now:
+            player["shatter_stacks"] = 0
+            player["shatter_flash_until"] = 0
         # Repeated drops extend a buff, but cannot bank unlimited invulnerability.
         player[timer_key] = min(max(now, player[timer_key]) + duration, now + duration * 2)
     if powerup_type in ("rapid_fire", "laser", "bomb", "triple_shot", "piercing"):
@@ -2337,7 +2353,7 @@ def grant_powerup(player, powerup_type, enemy_bullets=None):
         audio.play(audio.powerup)
 
 
-def update_powerups(powerups, players, enemy_bullets):
+def update_powerups(powerups, players, enemy_bullets, particles=None):
     now = pygame.time.get_ticks()
 
     for powerup in powerups[:]:
@@ -2377,12 +2393,14 @@ def update_powerups(powerups, players, enemy_bullets):
             player_rect = pygame.Rect(player["x"], player["y"], PLAYER_WIDTH, PLAYER_HEIGHT)
             if powerup["rect"].colliderect(player_rect):
                 grant_powerup(player, powerup["type"], enemy_bullets)
+                if particles is not None:
+                    spawn_powerup_pickup_effect(player, powerup["type"], particles)
                 powerups.remove(powerup)
                 break
 
 
 def momentum_stacks(player, now):
-    """The bonus is active only while Bullet Time is, with no permanent speed creep."""
+    """Bullet Time's captured energy only lasts while that buff is active."""
     if (player.get("bullet_time_until", 0) <= now
             or player.get("eliminated", False)
             or player.get("respawn_until", 0) > now):
@@ -2390,23 +2408,35 @@ def momentum_stacks(player, now):
     return min(BULLET_TIME_MAX_STACKS, player.get("momentum_stacks", 0))
 
 
-def collect_bullet_momentum(bullet, player, now, particles=None):
-    """Each projectile charges each pilot at most once per Bullet Time charge."""
-    if bullet.get("laser_state") is not None:  # Stationary laser warnings/beams aren't moving shots.
+def shatter_stacks(player, now):
+    """Frostbite kill stacks are independent, with a lower total bonus."""
+    if (player.get("cryo_until", 0) <= now or player.get("eliminated", False)
+            or player.get("respawn_until", 0) > now):
+        return 0
+    return min(SHATTER_MAX_STACKS, player.get("shatter_stacks", 0))
+
+
+def powerup_speed_bonus(player, now):
+    return max(momentum_stacks(player, now) * BULLET_TIME_SPEED_PER_STACK,
+               shatter_stacks(player, now) * SHATTER_SPEED_PER_STACK)
+
+
+def powerup_fire_bonus(player, now):
+    return max(momentum_stacks(player, now) * BULLET_TIME_FIRE_PER_STACK,
+               shatter_stacks(player, now) * SHATTER_FIRE_PER_STACK)
+
+
+def grant_momentum(player, now, origin=None, particles=None):
+    """Award one Bullet Time stack to a living pilot."""
+    if (player.get("bullet_time_until", 0) <= now
+            or player.get("eliminated", False) or player.get("respawn_until", 0) > now):
         return False
-    generation = player.get("momentum_generation", 0)
-    absorbed = bullet.setdefault("momentum_collected_by", {})
-    player_number = player["number"]
-    if absorbed.get(player_number) == generation:
-        return False
-    absorbed[player_number] = generation
     old_stacks = player.get("momentum_stacks", 0)
     player["momentum_stacks"] = min(BULLET_TIME_MAX_STACKS, old_stacks + 1)
     player["momentum_flash_until"] = now + 440
-    # Draw a handful of small colorful energy motes arcing from the shot to
-    # the pilot. The projectile continues on, but now travels in slow motion.
-    if particles is not None:
-        start_x, start_y = bullet["rect"].center
+    # Small energy motes communicate a captured shot.
+    if particles is not None and origin is not None:
+        start_x, start_y = origin
         target_x = player["x"] + PLAYER_WIDTH / 2
         target_y = player["y"] + PLAYER_HEIGHT / 2
         distance = max(1.0, math.hypot(target_x - start_x, target_y - start_y))
@@ -2421,6 +2451,41 @@ def collect_bullet_momentum(bullet, player, now, particles=None):
                 "color": (UI_CYAN, UI_VIOLET, player["color"])[index % 3],
                 "lifetime": 13, "max_lifetime": 13,
             })
+    return True
+
+
+def grant_shatter(player, now, origin=None, particles=None):
+    """One credited Frostbite kill grants one Shatter stack, up to six."""
+    if (player.get("cryo_until", 0) <= now or player.get("eliminated", False)
+            or player.get("respawn_until", 0) > now):
+        return False
+    old_stacks = player.get("shatter_stacks", 0)
+    player["shatter_stacks"] = min(SHATTER_MAX_STACKS, old_stacks + 1)
+    if old_stacks < SHATTER_MAX_STACKS:
+        player["shatter_flash_until"] = now + 500
+    if particles is not None and origin is not None and old_stacks < SHATTER_MAX_STACKS:
+        available = max(0, 48 - sum(p.get("kind") == "shatter" for p in particles))
+        for index in range(min(6, available)):
+            angle = math.tau * index / 6
+            particles.append({"kind": "shatter", "x": float(origin[0]), "y": float(origin[1]),
+                              "dx": math.cos(angle) * 4.5, "dy": math.sin(angle) * 4.5,
+                              "radius": 4, "color": POWERUP_COLORS["cryo"],
+                              "angle": angle, "lifetime": 18, "max_lifetime": 18})
+    return True
+
+
+def collect_bullet_momentum(bullet, player, now, particles=None):
+    """Each projectile charges each pilot at most once per Bullet Time charge."""
+    if bullet.get("laser_state") is not None:
+        return False
+    generation = player.get("momentum_generation", 0)
+    absorbed = bullet.setdefault("momentum_collected_by", {})
+    player_number = player["number"]
+    if absorbed.get(player_number) == generation:
+        return False
+    if not grant_momentum(player, now, bullet["rect"].center, particles):
+        return False
+    absorbed[player_number] = generation
     return True
 
 
@@ -2458,14 +2523,10 @@ def enemy_fire_probability(enemy_type, round_num, player_count):
         "ricochet": .0026, "prism": .0015, "pulse": .0013,
         "charger": .0030, "scatterer": .0014, "phantom": .0022,
     }.get(enemy_type, .0030)
-    # Difficulty increases a little each SECTOR, not every wave.
+    # Ordinary firing chances rise gently with each 20-wave health tier.
     sector_factor = min(1.15, .94 + .025 * (enemy_health_tier(round_num) - 1))
     coop_factor = 1 + .12 * max(0, min(4, player_count) - 1)
     return min(.012, base * 1.55 * sector_factor * coop_factor)
-
-
-GRAVITY_FIELD_RADIUS = 110
-GRAVITY_MAX_PROJECTILE_TURN = 0.65  # Total radians; a field cannot trap a shot in orbit.
 
 
 def bend_projectile_from_gravity(bullet, players, now):
@@ -3101,8 +3162,8 @@ def player_laser_rect(player, shot_offset=0):
 
 
 def player_weapon_cooldown(player, active_count, now, weapon="normal"):
-    """Keep team firepower consistent across 1-4 active pilots."""
-    delay = BASE_SHOT_COOLDOWN * max(1, active_count)
+    """Scale co-op firepower gently while keeping each gun slower than solo."""
+    delay = BASE_SHOT_COOLDOWN * (1 + COOP_FIRE_COOLDOWN_STEP * max(0, active_count - 1))
     if weapon == "bomb":
         delay *= 1.65
     elif weapon == "laser":
@@ -3112,14 +3173,14 @@ def player_weapon_cooldown(player, active_count, now, weapon="normal"):
         delay = 7 + 4 * (max(1, active_count) - 1)
     if player["rapid_fire_until"] > now:
         if weapon == "laser":
-            # Laser is intentionally already very powerful; keep its 40% buff.
-            delay /= 1.4
+            # Strengthen pulses without bypassing the minimum laser interval.
+            delay /= RAPID_FIRE_LASER_MULTIPLIER
         else:
             pilot_index = min(max(int(active_count), 1), len(RAPID_FIRE_MULTIPLIERS)) - 1
             delay /= RAPID_FIRE_MULTIPLIERS[pilot_index]
-    # Momentum boosts ALL weapons, including the strong piercing laser; its
-    # 16-stack cap prevents instant-fire lasers and keeps four-player co-op sane.
-    delay /= 1.0 + momentum_stacks(player, now) * BULLET_TIME_FIRE_PER_STACK
+    # The stronger active stack bonus boosts all main weapons, including lasers.
+    # Independent stack caps and minimum intervals keep the combined rate bounded.
+    delay /= 1.0 + powerup_fire_bonus(player, now)
     return max(2 if weapon == "laser" else 3, math.ceil(delay))
 
 
@@ -3483,6 +3544,9 @@ def finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, part
     if enemy not in enemies or enemy["hp"] > 0:
         return
     owner = process_chain_reaction_defeat(enemy, enemies, players)
+    now = pygame.time.get_ticks()
+    if owner is not None and owner.get("cryo_until", 0) > now:
+        grant_shatter(owner, now, enemy["rect"].center, particles)
     supply_boost = owner is not None and owner.get("supply_kills_left", 0) > 0
     if supply_boost:
         owner["supply_kills_left"] -= 1
@@ -3635,7 +3699,7 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
 
 
 def draw_exit_button(screen, exit_button_rect, font):
-    draw_neon_button(screen, exit_button_rect, "EXIT", font, UI_CORAL)
+    draw_neon_button(screen, exit_button_rect, "SAVE FILES", font, UI_CORAL)
 
 
 def draw_pause_button(screen, pause_button_rect, font, paused):
@@ -3685,53 +3749,59 @@ def save_browser_layout():
     for index in range(SAVE_SLOT_COUNT):
         panel = pygame.Rect(margin + index * (card_width + gap), card_top,
                             card_width, card_height)
-        new = pygame.Rect(panel.x + 20, panel.bottom - 58, panel.width - 40, 40)
-        resume = new.move(0, -50)
+        new = pygame.Rect(panel.x + 20, panel.bottom - 94, panel.width - 40, 34)
+        resume = new.move(0, -42)
+        action_width = (panel.width - 56) // 3
+        actions = [pygame.Rect(panel.x + 20 + i * (action_width + 8),
+                               panel.bottom - 48, action_width, 30) for i in range(3)]
         cards.append({"slot": index + 1, "panel": panel,
-                      "continue": resume, "new": new})
+                      "continue": resume, "new": new,
+                      "delete": actions[0], "export": actions[1], "import": actions[2]})
     back = pygame.Rect(0, 0, 220, 44)
     back.midbottom = (SCREEN_WIDTH // 2 - 122, SCREEN_HEIGHT - 32)
     quit_button = back.move(244, 0)
-    dialog = pygame.Rect(0, 0, min(650, SCREEN_WIDTH - 80), 250)
+    dialog = pygame.Rect(0, 0, min(740, SCREEN_WIDTH - 80), 300)
     dialog.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
     button_width = (dialog.width - 72) // 2
     confirm = pygame.Rect(dialog.x + 28, dialog.bottom - 76, button_width, 46)
     cancel = pygame.Rect(confirm.right + 16, confirm.y, button_width, 46)
+    path_input = pygame.Rect(dialog.x + 28, dialog.y + 94, dialog.width - 174, 42)
+    browse = pygame.Rect(path_input.right + 10, path_input.y, 108, 42)
     return {"cards": cards, "back": back, "quit": quit_button, "dialog": dialog,
-            "confirm": confirm, "cancel": cancel}
+            "confirm": confirm, "cancel": cancel, "path_input": path_input,
+            "browse": browse}
 
 
 def draw_save_browser(screen, saved_slots, title_font, button_font, font,
-                      pending_replace_slot=None, save_error=None):
-    """Three independent autosave cards; replacing a run needs a second click."""
+                      pending_replace_slot=None, save_error=None, pending_save_action=None,
+                      save_status=None):
+    """Independent save cards with confirmed replacement, deletion and transfers."""
     draw_space_background(screen, "menu")
     layout = save_browser_layout()
     draw_neon_title(screen, "SAVED RUNS", title_font,
                     (SCREEN_WIDTH // 2, round(SCREEN_HEIGHT * 0.10)), UI_CYAN)
-    subtitle = font.render("Three slots. Each run autosaves to its own file.", True, UI_TEXT)
+    subtitle = font.render(f"{SAVE_SLOT_COUNT} slots. Each run autosaves to its own file.", True, UI_TEXT)
     screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_WIDTH // 2, round(SCREEN_HEIGHT * 0.18))))
     detail_font = pygame.font.SysFont(None, 23 if SCREEN_WIDTH >= 1400 else 21)
     date_font = pygame.font.SysFont(None, 21 if SCREEN_WIDTH >= 1400 else 19)
     player_count_font = pygame.font.SysFont(None, 28 if SCREEN_WIDTH >= 1400 else 26)
+    action_font = pygame.font.SysFont(None, 22)
     for card in layout["cards"]:
         slot, panel = card["slot"], card["panel"]
         snapshot = saved_slots[slot - 1] if slot <= len(saved_slots) else None
-        try:
-            occupied = snapshot is not None or save_slot_path(slot).exists()
-        except OSError:
-            occupied = True
+        occupied = snapshot is not None or save_slot_occupied(slot)
         accent = UI_CYAN if snapshot else UI_CORAL if occupied else UI_VIOLET
         draw_neon_panel(screen, panel, accent, radius=15)
         heading = button_font.render(f"SLOT {slot:02d}", True, accent)
         screen.blit(heading, heading.get_rect(midtop=(panel.centerx, panel.top + 22)))
         if snapshot is not None:
             wave_text = button_font.render(f"WAVE {snapshot['wave']}", True, UI_TEXT)
-            screen.blit(wave_text, wave_text.get_rect(midtop=(panel.centerx, panel.top + 75)))
+            screen.blit(wave_text, wave_text.get_rect(midtop=(panel.centerx, panel.top + 67)))
             mode = "INFINITE" if snapshot["infinite_mode"] else "CAMPAIGN"
             count = snapshot["player_count"]
             player_label = player_count_font.render(
                 f"{count} PLAYER{'S' if count != 1 else ''}", True, UI_CYAN)
-            screen.blit(player_label, player_label.get_rect(midtop=(panel.centerx, panel.top + 112)))
+            screen.blit(player_label, player_label.get_rect(midtop=(panel.centerx, panel.top + 101)))
             lines = (
                 (f"SECTOR {sector_for_round(snapshot['wave']):02d}  /  {mode}", UI_GOLD),
                 (f"TEAM SCORE {sum(p['score'] for p in snapshot['pilots']):,}", UI_TEXT),
@@ -3742,14 +3812,14 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
                 if surface.get_width() > panel.width - 36:
                     surface = pygame.transform.smoothscale(surface,
                         (panel.width - 36, surface.get_height()))
-                screen.blit(surface, surface.get_rect(midtop=(panel.centerx, panel.top + 146 + index * 29)))
+                screen.blit(surface, surface.get_rect(midtop=(panel.centerx, panel.top + 133 + index * 25)))
             try:
                 saved_time = datetime.fromisoformat(snapshot["saved_at"]).astimezone()
                 date_text = saved_time.strftime("Saved %b %d, %Y  %I:%M %p")
             except (KeyError, ValueError, TypeError, OverflowError):
                 date_text = "Save time unavailable"
             date = date_font.render(date_text, True, UI_MUTED)
-            screen.blit(date, date.get_rect(midtop=(panel.centerx, panel.top + 238)))
+            screen.blit(date, date.get_rect(midtop=(panel.centerx, panel.top + 216)))
             draw_neon_button(screen, card["continue"], "CONTINUE", font, UI_MINT)
             draw_neon_button(screen, card["new"], "NEW RUN", font, UI_VIOLET)
         else:
@@ -3763,8 +3833,11 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
                 screen.blit(label, label.get_rect(center=(panel.centerx, panel.top + 180 + index * 29)))
             draw_neon_button(screen, card["new"], "REPLACE SAVE" if occupied else "NEW RUN",
                              font, UI_CORAL if occupied else UI_MINT)
-    footer = detail_font.render(save_error or "CONTINUE restarts the saved wave. Replacing a run asks for confirmation.",
-                                True, UI_CORAL if save_error else UI_MUTED)
+        draw_neon_button(screen, card["delete"], "DELETE", action_font, UI_CORAL, enabled=occupied)
+        draw_neon_button(screen, card["export"], "EXPORT", action_font, UI_CYAN, enabled=snapshot is not None)
+        draw_neon_button(screen, card["import"], "IMPORT", action_font, UI_GOLD)
+    footer = detail_font.render(save_error or save_status or "CONTINUE restarts the wave. Export/import portable JSON saves; deletion asks for confirmation.",
+                                True, UI_CORAL if save_error else UI_MINT if save_status else UI_MUTED)
     footer_y = min(layout["back"].top - 24, layout["cards"][0]["panel"].bottom + 30)
     screen.blit(footer, footer.get_rect(center=(SCREEN_WIDTH // 2, footer_y)))
     draw_neon_button(screen, layout["back"], "MAIN MENU", font, UI_VIOLET)
@@ -3778,11 +3851,170 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
         heading = button_font.render(f"REPLACE SLOT {pending_replace_slot}?", True, UI_CORAL)
         screen.blit(heading, heading.get_rect(midtop=(dialog.centerx, dialog.top + 28)))
         for index, text in enumerate(("The saved run in this slot will be replaced.",
-                                      "Your other two saves stay unchanged.")):
+                                      "Your other save slots stay unchanged.")):
             label = font.render(text, True, UI_TEXT if index == 0 else UI_MUTED)
             screen.blit(label, label.get_rect(center=(dialog.centerx, dialog.top + 96 + index * 29)))
         draw_neon_button(screen, layout["confirm"], "CONFIRM REPLACE", font, UI_CORAL)
         draw_neon_button(screen, layout["cancel"], "CANCEL", font, UI_CYAN)
+    if pending_save_action is not None:
+        draw_save_action_dialog(screen, pending_save_action, layout, button_font, font)
+
+
+def begin_save_action(kind, slot):
+    """Prepare a non-blocking dialog; no file changes happen until confirmation."""
+    path = str(Path.home() / "Downloads" / f"Neon-Frontier-slot-{slot}.json") if kind == "export" else ""
+    action = {"kind": kind, "slot": slot, "stage": "confirm" if kind == "delete" else "path",
+              "path": path, "error": None, "select_all": bool(path)}
+    if kind != "delete":
+        pygame.key.start_text_input()
+    return action
+
+
+def browse_save_transfer(action):
+    """Use an optional native picker; the in-game path entry works without Tk."""
+    window = None
+    try:
+        import tkinter
+        from tkinter import filedialog
+        window = tkinter.Tk()
+        window.withdraw()
+        window.attributes("-topmost", True)
+        options = {"parent": window, "filetypes": [("JSON saves", "*.json"), ("All files", "*.*")]}
+        if action["kind"] == "export":
+            chosen = filedialog.asksaveasfilename(
+                **options, defaultextension=".json", initialfile=f"Neon-Frontier-slot-{action['slot']}.json")
+        else:
+            chosen = filedialog.askopenfilename(**options)
+        if chosen:
+            action["path"] = chosen
+            action["select_all"] = True
+            action["error"] = None
+    except Exception:
+        action["error"] = "Picker unavailable: type/paste a path or drop a JSON file."
+    finally:
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+
+def update_save_action_input(action, event):
+    """Handle text, pasted paths and file drops without blocking the game loop."""
+    if action["stage"] != "path":
+        return
+    text = None
+    if event.type == pygame.DROPFILE:
+        text = event.file
+        action["select_all"] = True
+    elif event.type == pygame.TEXTINPUT:
+        text = event.text
+    elif event.type == pygame.KEYDOWN:
+        modifiers = getattr(event, "mod", pygame.key.get_mods())
+        if event.key == pygame.K_a and modifiers & pygame.KMOD_CTRL:
+            action["select_all"] = True
+        elif event.key == pygame.K_v and modifiers & pygame.KMOD_CTRL:
+            try:
+                if hasattr(pygame.scrap, "get_text"):
+                    text = pygame.scrap.get_text()
+                else:
+                    pygame.scrap.init()
+                    value = pygame.scrap.get(pygame.SCRAP_TEXT)
+                    text = value.decode("utf-8", errors="replace") if value else ""
+            except (pygame.error, UnicodeError):
+                action["error"] = "Paste unavailable: type the path or drop the JSON file."
+        elif event.key == pygame.K_BACKSPACE:
+            action["path"] = "" if action.get("select_all") else action["path"][:-1]
+            action["select_all"] = False
+            action["error"] = None
+    if text is not None:
+        text = "".join(character for character in str(text) if character >= " " and character != "\x7f")
+        action["path"] = (("" if action.get("select_all") else action["path"]) + text)[:4096]
+        action["select_all"] = False
+        action["error"] = None
+
+
+def confirm_save_action(action):
+    """Return (finished, message); failed actions keep their dialog open."""
+    kind, slot = action["kind"], action["slot"]
+    if kind == "delete":
+        success, message = delete_saved_slot(slot)
+    else:
+        try:
+            path = save_transfer_path(action["path"])
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            action["error"] = str(error)
+            return False, None
+        if action["stage"] == "path":
+            if kind == "import" and load_saved_run(path) is None:
+                action["error"] = "This file is unreadable or is not a supported game save."
+                return False, None
+            try:
+                needs_confirmation = save_slot_occupied(slot) if kind == "import" else path.exists()
+            except OSError:
+                action["error"] = "Cannot access that path. Choose another file or folder."
+                return False, None
+            if needs_confirmation:
+                action["stage"] = "overwrite"
+                action["error"] = None
+                pygame.key.stop_text_input()
+                return False, None
+        if kind == "import":
+            snapshot, message = import_saved_slot(slot, path, overwrite=action["stage"] == "overwrite")
+            success = snapshot is not None
+        else:
+            success, message = export_saved_slot(slot, path, overwrite=action["stage"] == "overwrite")
+    if success:
+        pygame.key.stop_text_input()
+        return True, message
+    action["error"] = message
+    return False, None
+
+
+def draw_save_action_dialog(screen, action, layout, button_font, font):
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((3, 4, 18, 225))
+    screen.blit(overlay, (0, 0))
+    dialog = layout["dialog"]
+    kind, stage, slot = action["kind"], action["stage"], action["slot"]
+    accent = UI_CORAL if kind == "delete" or stage == "overwrite" else UI_CYAN
+    draw_neon_panel(screen, dialog, accent, radius=15)
+    heading = f"DELETE SLOT {slot}?" if kind == "delete" else f"{kind.upper()} SLOT {slot}"
+    title = button_font.render(heading, True, accent)
+    screen.blit(title, title.get_rect(midtop=(dialog.centerx, dialog.y + 24)))
+    if kind == "delete":
+        lines = ("This save file will be permanently deleted.", "Your other slots and exported files stay unchanged.")
+    elif stage == "overwrite":
+        lines = (("The current save in this slot will be replaced.", "Your other slots stay unchanged.")
+                 if kind == "import" else ("A file already exists at this path.", "Overwrite it with the selected save?"))
+    else:
+        lines = ("Choose a JSON file on this computer.",)
+    for index, text in enumerate(lines):
+        line = font.render(text, True, UI_TEXT)
+        screen.blit(line, line.get_rect(center=(dialog.centerx, dialog.y + 76 + index * 30)))
+    if stage == "path":
+        field = layout["path_input"]
+        pygame.draw.rect(screen, (15, 24, 47), field, border_radius=5)
+        pygame.draw.rect(screen, UI_CYAN, field, 1, border_radius=5)
+        path_text = action["path"] or "Type a path or drop a JSON file here"
+        rendered = font.render(path_text, True, UI_TEXT if action["path"] else UI_MUTED)
+        previous_clip = screen.get_clip()
+        screen.set_clip(field.inflate(-12, -4))
+        x = field.x + 8 if rendered.get_width() <= field.width - 16 else field.right - 8 - rendered.get_width()
+        screen.blit(rendered, (x, field.centery - rendered.get_height() // 2))
+        screen.set_clip(previous_clip)
+        draw_neon_button(screen, layout["browse"], "BROWSE", font, UI_VIOLET)
+        hint = font.render("Ctrl+A selects the path; Ctrl+V pastes. Enter confirms; Esc cancels.", True, UI_MUTED)
+        screen.blit(hint, hint.get_rect(center=(dialog.centerx, dialog.y + 163)))
+    if action.get("error"):
+        error_font = pygame.font.SysFont(None, 21)
+        error = error_font.render(action["error"], True, UI_CORAL)
+        if error.get_width() > dialog.width - 40:
+            error = pygame.transform.smoothscale(error, (dialog.width - 40, error.get_height()))
+        screen.blit(error, error.get_rect(center=(dialog.centerx, dialog.bottom - 98)))
+    label = "DELETE SAVE" if kind == "delete" else "CONFIRM REPLACE" if stage == "overwrite" else kind.upper()
+    draw_neon_button(screen, layout["confirm"], label, font, accent)
+    draw_neon_button(screen, layout["cancel"], "CANCEL", font, UI_CYAN)
 
 
 def draw_start_screen(
@@ -3804,15 +4036,16 @@ def draw_start_screen(
     micro_title = player_choice_font.render("NEON FRONTIER  /  PLANETARY DEFENSE", True, UI_PINK)
     screen.blit(micro_title, micro_title.get_rect(center=(cx, int(SCREEN_HEIGHT * 0.052))))
     draw_neon_title(screen, "SPACE INVADERS", title_font, (cx, int(SCREEN_HEIGHT * 0.13)), UI_CYAN)
-    tagline = player_choice_font.render("100 WAVES. ONE PLANET. YOUR SQUAD.", True, UI_GOLD)
+    tagline = player_choice_font.render(f"{MAX_CAMPAIGN_ROUND} WAVES. ONE PLANET. YOUR SQUAD.", True, UI_GOLD)
     screen.blit(tagline, tagline.get_rect(center=(cx, int(SCREEN_HEIGHT * 0.205))))
     controls_panel, launch_panel = start_screen_panels()
     objective_panel = pygame.Rect(controls_panel.x, int(SCREEN_HEIGHT * 0.25), SCREEN_WIDTH - controls_panel.x * 2, 64)
     draw_neon_panel(screen, objective_panel, UI_VIOLET)
     objective = (
         "Clear the fleet, survive enemy fire, and face a boss every fifth wave. "
-        "Every 5 waves unlocks a retry checkpoint. Enemy HP rises only every 20 waves. "
-        "Clear all 100 waves to save Earth!"
+        f"Retry from the start of each {WAVES_PER_SECTOR}-wave sector. Tougher regular foes scale "
+        f"in {WAVES_PER_HEALTH_TIER}-wave HP tiers; bosses scale separately. "
+        f"Clear all {MAX_CAMPAIGN_ROUND} waves to save Earth!"
     )
     objective_lines = []
     current_line = ""
@@ -3841,7 +4074,7 @@ def draw_start_screen(
     screen.blit(launch_heading, launch_heading.get_rect(center=(launch_panel.centerx, launch_panel.y + 31)))
     control_labels = (
         ("W / A / S / D", "SPACE or LEFT SHIFT"),
-        ("ARROW KEYS", "RIGHT SHIFT / CTRL / NUMPAD 0 / INSERT"),
+        ("ARROW KEYS", "RIGHT SHIFT / RIGHT CTRL / NUMPAD 0 / INSERT"),
         ("I / J / K / L", "U / H / ; or :"),
         ("NUMPAD 8 / 4 / 5 / 6", "NUMPAD ENTER or NUMPAD 7"),
     )
@@ -3862,7 +4095,7 @@ def draw_start_screen(
         label = "1 PLAYER" if index == 1 else f"{index} PLAYERS"
         draw_neon_button(screen, choice_rect, label, player_choice_font, PLAYER_COLORS[index - 1], selected=player_count == index)
     if (saved_run is not None or saved_slots is not None) and continue_button_rect is not None:
-        label = (f"SAVE FILES  {sum(snapshot is not None for snapshot in saved_slots)}/{SAVE_SLOT_COUNT}"
+        label = (f"SAVE FILES  ({sum(snapshot is not None for snapshot in saved_slots)} VALID)"
                  if saved_slots is not None else
                  f"CONTINUE  WAVE {saved_run['wave']}  /  SECTOR {sector_for_round(saved_run['wave'])}")
         draw_neon_button(screen, continue_button_rect, label, player_choice_font, UI_GOLD)
@@ -3917,7 +4150,7 @@ def draw_enemy_journal(
     )
     screen.blit(page_label, page_label.get_rect(center=(SCREEN_WIDTH // 2, 110)))
     if is_powerup_page:
-        note_text = "Repeated pickups extend a buff up to twice its duration. Weapon rates scale with active players."
+        note_text = "Repeated timed pickups extend buffs up to twice their duration. Weapon rates scale with active pilots."
     elif is_mutation_page:
         note_text = "Colored outlines identify mutations. Body colors are cosmetic."
     else:
@@ -3978,8 +4211,8 @@ def draw_enemy_journal(
                 screen.blit(name_surface, (card.x + 50, card.y + 8))
                 duration = (
                     f"{POWERUP_DURATIONS[name] // 1000} SECONDS"
-                    if name in POWERUP_DURATIONS else "PERMANENT" if name == "damage_up"
-                    else "STORED UNTIL USED" if name in ("emergency_warp", "reflector", "supply_beacon")
+                    if name in POWERUP_DURATIONS else "RUN UPGRADE" if name == "damage_up"
+                    else "STORED UNTIL USED" if name in ("emergency_warp", "reflector", "supply_beacon", "missile_swarm")
                     else "INSTANT"
                 )
                 duration_surface = description_font.render(duration, True, UI_MUTED)
@@ -4054,6 +4287,8 @@ def create_player_states(player_count, player_sprites):
             "bomb_until": 0,
             "bullet_time_until": 0,
             "momentum_stacks": 0,
+            "shatter_stacks": 0,
+            "shatter_flash_until": 0,
             "momentum_generation": 0,
             "momentum_flash_until": 0,
             "piercing_until": 0,
@@ -4111,10 +4346,10 @@ def update_player_movement(keys, players):
 
         left_key, right_key, up_key, down_key, _ = PLAYER_CONTROLS[player["number"] - 1]
         move_speed = (PLAYER_SPEED + (2 if player["speed_boost_until"] > now else 0)
-                      + momentum_stacks(player, now) * BULLET_TIME_SPEED_PER_STACK)
+                      + powerup_speed_bonus(player, now))
         if player["ram_bounce_frames"] > 0:
             player["x"] = max(0, min(SCREEN_WIDTH - PLAYER_WIDTH, player["x"] + player["ram_bounce_x"]))
-            player["y"] = max(0, min(SCREEN_HEIGHT - PLAYER_HEIGHT, player["y"] + player["ram_bounce_y"]))
+            player["y"] = max(GAMEPLAY_TOP + 2, min(SCREEN_HEIGHT - PLAYER_HEIGHT, player["y"] + player["ram_bounce_y"]))
             player["ram_bounce_x"] *= 0.72
             player["ram_bounce_y"] *= 0.72
             player["ram_bounce_frames"] -= 1
@@ -4122,7 +4357,7 @@ def update_player_movement(keys, players):
         input_y = int(bool(keys[down_key])) - int(bool(keys[up_key]))
         distance = max(1, math.hypot(input_x, input_y))
         player["x"] = max(0, min(SCREEN_WIDTH - PLAYER_WIDTH, player["x"] + input_x / distance * move_speed))
-        player["y"] = max(0, min(SCREEN_HEIGHT - PLAYER_HEIGHT, player["y"] + input_y / distance * move_speed))
+        player["y"] = max(GAMEPLAY_TOP + 2, min(SCREEN_HEIGHT - PLAYER_HEIGHT, player["y"] + input_y / distance * move_speed))
         player["move_dx"] = player["x"] - previous_x
         player["move_dy"] = player["y"] - previous_y
 
@@ -4299,6 +4534,205 @@ def draw_powerup_icon(screen, powerup_type, center):
         pygame.draw.polygon(screen, WHITE, points)
 
 
+POWERUP_VISUAL_PROFILES = {
+    "life": ("petal", 5, 0.8),
+    "shield": ("hex", 6, -0.7),
+    "rapid_fire": ("dash", 3, 2.4),
+    "speed": ("comet", 4, 2.0),
+    "triple_shot": ("triad", 3, 1.1),
+    "laser": ("scan", 2, 1.8),
+    "magnet": ("orbit", 2, -0.9),
+    "bomb": ("spark", 7, 0.7),
+    "bullet_time": ("clock", 8, -0.55),
+    "piercing": ("lances", 4, 1.3),
+    "damage_up": ("crown", 4, 0.65),
+    "homing": ("reticle", 4, 0.9),
+    "lightning": ("zigzag", 5, 2.0),
+    "score_boost": ("star", 5, 1.0),
+    "cryo": ("frost", 6, -0.6),
+    "orbit_drones": ("satellite", 2, 0.8),
+    "supply_beacon": ("signal", 3, 1.2),
+    "gravity_well": ("spiral", 3, -0.7),
+    "emergency_warp": ("portal", 2, -1.5),
+    "nova_pulse": ("burst", 8, 0.9),
+    "missile_swarm": ("rockets", 3, 1.7),
+    "reflector": ("reflect", 3, -0.8),
+    "chain_reaction": ("links", 3, 1.1),
+}
+POWERUP_COLLECTION_PARTICLE_CAP = 96
+
+
+def draw_powerup_aura(surface, center, color, motif, count, phase, radius=24):
+    """Thin, deterministic silhouettes distinguish pickups beyond their colors."""
+    cx, cy = center
+
+    def point(angle, distance):
+        return (round(cx + math.cos(angle) * distance),
+                round(cy + math.sin(angle) * distance))
+
+    if motif in ("hex", "triad", "crown", "star"):
+        alternating = motif in ("star", "crown")
+        vertices = count * (2 if alternating else 1)
+        points = [point(phase + math.tau * index / vertices,
+                        radius * (0.76 if alternating and index % 2 else 1))
+                  for index in range(vertices)]
+        pygame.draw.polygon(surface, color, points, 1)
+    elif motif in ("dash", "comet", "lances", "rockets"):
+        for index in range(count):
+            angle = phase + math.tau * index / count
+            end = point(angle, radius)
+            start = point(angle - (0.32 if motif in ("dash", "comet") else 0), radius - 7)
+            pygame.draw.line(surface, color, start, end, 2 if motif == "dash" else 1)
+            if motif in ("rockets", "lances"):
+                pygame.draw.lines(surface, color, False,
+                                  [point(angle - 0.11, radius - 4), end,
+                                   point(angle + 0.11, radius - 4)], 1)
+    elif motif == "frost":
+        for index in range(count):
+            angle = phase + math.tau * index / count
+            pygame.draw.line(surface, color, point(angle, radius - 8), point(angle, radius), 1)
+            elbow = point(angle, radius - 4)
+            for side in (-1, 1):
+                pygame.draw.line(surface, color, elbow,
+                                 point(angle + side * 0.15, radius - 7), 1)
+    elif motif == "zigzag":
+        for index in range(count):
+            angle = phase + math.tau * index / count
+            pygame.draw.lines(surface, color, False,
+                              [point(angle - 0.16, radius - 6), point(angle, radius),
+                               point(angle + 0.08, radius - 5), point(angle + 0.20, radius)], 1)
+    elif motif == "spiral":
+        for arm in range(count):
+            points = [point(phase + arm * math.tau / count + step * 0.16,
+                            radius - 8 + step * 0.8) for step in range(11)]
+            pygame.draw.lines(surface, color, False, points, 1)
+    elif motif in ("burst", "spark"):
+        for index in range(count):
+            angle = phase + math.tau * index / count
+            length = 5 + (index % 3 if motif == "spark" else 2)
+            pygame.draw.line(surface, color, point(angle, radius - length), point(angle, radius), 1)
+            if motif == "spark":
+                pygame.draw.circle(surface, color, point(angle + 0.12, radius + 2), 1)
+    elif motif == "scan":
+        offset = math.sin(phase) * (radius - 4)
+        for side in (-1, 1):
+            y = round(cy + side * offset)
+            half_width = round(math.sqrt(max(0, radius * radius - offset * offset)))
+            pygame.draw.line(surface, color, (cx - half_width, y), (cx + half_width, y), 1)
+    elif motif in ("portal", "reflect", "signal"):
+        for index in range(count):
+            angle = phase + math.tau * index / count
+            ring = pygame.Rect(cx - radius, cy - radius, radius * 2, radius * 2)
+            sweep = 0.95 if motif == "reflect" else 1.55 if motif == "portal" else 0.65
+            pygame.draw.arc(surface, color, ring, angle, angle + sweep, 2 if motif == "portal" else 1)
+            if motif == "signal":
+                inner = ring.inflate(-8, -8)
+                pygame.draw.arc(surface, color, inner, angle, angle + sweep, 1)
+    elif motif == "clock":
+        for index in range(count):
+            angle = math.tau * index / count
+            pygame.draw.line(surface, color, point(angle, radius - 3), point(angle, radius), 1)
+        pygame.draw.line(surface, color, point(phase, radius - 7), point(phase, radius - 1), 2)
+    elif motif == "reticle":
+        for index in range(count):
+            angle = phase * 0.2 + math.tau * index / count
+            pygame.draw.lines(surface, color, False,
+                              [point(angle - 0.15, radius - 4), point(angle - 0.15, radius),
+                               point(angle + 0.15, radius)], 1)
+    else:
+        # Orbital bodies, linked rings and life petals each have a different orbit.
+        for index in range(count):
+            angle = phase + math.tau * index / count
+            position = point(angle, radius - (2 if motif == "petal" else 0))
+            satellite_radius = 4 if motif in ("petal", "links") else 3
+            pygame.draw.circle(surface, color, position, satellite_radius, 1)
+            if motif == "satellite":
+                pygame.draw.line(surface, color, point(angle - 0.30, radius), position, 1)
+            elif motif == "orbit":
+                pygame.draw.arc(surface, color,
+                                (cx - radius, cy - radius, radius * 2, radius * 2),
+                                angle - 0.65, angle, 1)
+
+
+def draw_world_powerup(screen, powerup, now):
+    """Render an identifiable animated pickup without changing its hitbox or RNG."""
+    key = powerup["type"]
+    color = POWERUP_COLORS.get(key, UI_CYAN)
+    motif, count, speed = POWERUP_VISUAL_PROFILES.get(key, ("hex", 6, 1.0))
+    visual_phase = powerup.get("visual_phase", POWERUP_TYPES.index(key) * 0.73
+                              if key in POWERUP_TYPES else 0)
+    phase = now / 650 * speed + visual_phase
+    surface = pygame.Surface((72, 72), pygame.SRCALPHA)
+    center = (36, 36)
+    pulse = 0.5 + 0.5 * math.sin(now / 240 + visual_phase)
+    pygame.draw.circle(surface, (*color, round(10 + pulse * 9)), center, 26)
+    pygame.draw.circle(surface, (*UI_BG, 172), center, 14)
+    pygame.draw.circle(surface, (*color, 190), center, 14, 1)
+    draw_powerup_aura(surface, center, (*color, 150), motif, count, phase,
+                      radius=round(23 + pulse * 2))
+    draw_powerup_icon(surface, key, center)
+    screen.blit(surface, (powerup["rect"].centerx - 36,
+                          powerup["rect"].centery - 36))
+
+
+def spawn_powerup_pickup_effect(player, powerup_type, particles):
+    """A small capped celebration, using the pickup's own visual identity."""
+    available = max(0, POWERUP_COLLECTION_PARTICLE_CAP
+                    - sum(p.get("kind") == "powerup_pickup" for p in particles))
+    if not available:
+        return 0
+    color = POWERUP_COLORS.get(powerup_type, UI_CYAN)
+    motif, count, _ = POWERUP_VISUAL_PROFILES.get(powerup_type, ("hex", 6, 1.0))
+    center = (player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
+    number = min(7, available)
+    for index in range(number):
+        angle = math.tau * max(0, index - 1) / max(1, number - 1)
+        particles.append({
+            "kind": "powerup_pickup", "powerup_type": powerup_type,
+            "motif": motif, "count": count, "role": "ring" if index == 0 else "spark",
+            "x": center[0], "y": center[1],
+            "dx": 0 if index == 0 else math.cos(angle) * 2.1,
+            "dy": 0 if index == 0 else math.sin(angle) * 2.1,
+            "angle": angle, "radius": 6 if index == 0 else 3,
+            "color": color, "lifetime": 24 if index == 0 else 20,
+            "max_lifetime": 24 if index == 0 else 20,
+        })
+    return number
+
+
+def draw_powerup_collection_particle(screen, particle):
+    """Lightweight alpha effects, including Frostbite's separate icy Shatter."""
+    fraction = max(0, particle["lifetime"] / max(1, particle["max_lifetime"]))
+    progress = 1 - fraction
+    color = particle["color"]
+    if particle.get("kind") == "shatter":
+        surface = pygame.Surface((18, 18), pygame.SRCALPHA)
+        angle = particle.get("angle", 0) + progress * 1.8
+        points = []
+        for index, radius in enumerate((7, 2, 7, 2)):
+            theta = angle + index * math.pi / 2
+            points.append((round(9 + math.cos(theta) * radius * fraction),
+                           round(9 + math.sin(theta) * radius * fraction)))
+        pygame.draw.polygon(surface, (*color, round(185 * fraction)), points, 1)
+        pygame.draw.line(surface, (*UI_TEXT, round(120 * fraction)), points[0], points[2], 1)
+        screen.blit(surface, (round(particle["x"]) - 9, round(particle["y"]) - 9))
+    elif particle.get("role") == "ring":
+        surface = pygame.Surface((80, 80), pygame.SRCALPHA)
+        radius = round(8 + 26 * progress)
+        draw_powerup_aura(surface, (40, 40), (*color, round(145 * fraction)),
+                          particle["motif"], particle["count"],
+                          particle.get("angle", 0) + progress * 0.8, radius)
+        screen.blit(surface, (round(particle["x"]) - 40, round(particle["y"]) - 40))
+    else:
+        surface = pygame.Surface((14, 14), pygame.SRCALPHA)
+        angle = particle.get("angle", 0)
+        end = (round(7 + math.cos(angle) * 4 * fraction),
+               round(7 + math.sin(angle) * 4 * fraction))
+        pygame.draw.line(surface, (*color, round(175 * fraction)), (7, 7), end, 1)
+        pygame.draw.circle(surface, (*UI_TEXT, round(135 * fraction)), end, 1)
+        screen.blit(surface, (round(particle["x"]) - 7, round(particle["y"]) - 7))
+
+
 def draw_scoreboard(screen, players, font, now=None, background_only=False, foreground_only=False):
     panel_width = 286
     panel_height = 78
@@ -4337,7 +4771,7 @@ def draw_scoreboard(screen, players, font, now=None, background_only=False, fore
         )
         score_rect = score_text.get_rect(midleft=(panel.x + 10, panel.y + 19))
         screen.blit(score_text, score_rect)
-        damage_text = font.render(f"DMG {1 + player.get('damage_bonus', 0)}", True, UI_GOLD)
+        damage_text = font.render(f"DMG UP +{player.get('damage_bonus', 0)}", True, UI_GOLD)
         screen.blit(damage_text, damage_text.get_rect(midright=(panel.right - 10, panel.y + 19)))
 
         if player["eliminated"]:
@@ -4399,27 +4833,227 @@ def draw_boss_laser_warning(screen, bullet, now):
     screen.blit(label, label_rect)
 
 
+def powerup_hud_entries(player, now):
+    """Return every active effect; the HUD never silently truncates the list."""
+    entries = []
+    for key, until_key in POWERUP_TIMER_KEYS.items():
+        until = player.get(until_key, 0)
+        if until > now:
+            seconds = max(1, math.ceil((until - now) / 1000))
+            entries.append((key, f"{POWERUP_TIMER_LABELS[key]} {seconds}s", POWERUP_COLORS[key]))
+    for key, value, label in (
+        ("emergency_warp", player.get("warp_ready", False), "WARP READY"),
+        ("reflector", player.get("reflector_charges", 0), f"REFLECT {player.get('reflector_charges', 0)}"),
+        ("supply_beacon", player.get("supply_kills_left", 0), f"SUPPLY {player.get('supply_kills_left', 0)}"),
+        ("missile_swarm", player.get("pending_missiles", False), "MISSILES READY"),
+    ):
+        if value:
+            entries.append((key, label, POWERUP_COLORS[key]))
+    stacks = momentum_stacks(player, now)
+    if stacks:
+        entries.append(("momentum", f"MOMENTUM x{stacks}", UI_CYAN))
+    frost_stacks = shatter_stacks(player, now)
+    if frost_stacks:
+        entries.append(("shatter", f"SHATTER x{frost_stacks}", POWERUP_COLORS["cryo"]))
+    return entries
+
+
+def powerup_hud_layout(player_number, entry_count, has_notice=False):
+    """Dock effects beside their scoreboard, away from the moving ship."""
+    width = min(286, max(180, (SCREEN_WIDTH - 48) // 2))
+    columns = 2
+    rows = math.ceil(entry_count / columns)
+    height = 26 + rows * 18 + (18 if has_notice else 0)
+    x = 16 if player_number in (1, 3) else SCREEN_WIDTH - width - 16
+    y = GAMEPLAY_TOP + 8 if player_number in (1, 2) else SCREEN_HEIGHT - 102 - height
+    panel = pygame.Rect(x, y, width, height)
+    return panel, columns, 18
+
+
+def draw_powerup_hud(screen, player, now, font):
+    """Small transparent effect dock; hostile shots are drawn over it later."""
+    entries = powerup_hud_entries(player, now)
+    notice = (player.get("powerup_notice", "")
+              if player.get("powerup_notice_until", 0) > now else "")
+    if not entries and not notice:
+        return None
+    panel, columns, row_height = powerup_hud_layout(player["number"], len(entries), bool(notice))
+    overlay = pygame.Surface(panel.size, pygame.SRCALPHA)
+    # Keep the background genuinely translucent; it must not hide a shot.
+    pygame.draw.rect(overlay, (*UI_BG, 42), overlay.get_rect(), border_radius=6)
+    pygame.draw.rect(overlay, (*player["color"], 82), overlay.get_rect(), 1, border_radius=6)
+
+    def label(text, color, position, max_width, max_height=14):
+        surface = font.render(text, True, color)
+        factor = min(1.0, max_width / max(1, surface.get_width()),
+                     max_height / max(1, surface.get_height()))
+        if factor < 1:
+            surface = pygame.transform.smoothscale(surface, (
+                max(1, round(surface.get_width() * factor)),
+                max(1, round(surface.get_height() * factor))))
+        overlay.blit(surface, position)
+
+    label(f"P{player['number']} POWERUPS ({len(entries)})", player["color"],
+          (8, 5), panel.width - 16, 13)
+    cell_width = (panel.width - 16) // columns
+    for index, (_, text, color) in enumerate(entries):
+        column, row = index % columns, index // columns
+        label(text, color, (8 + column * cell_width, 24 + row * row_height), cell_width - 5)
+    if notice:
+        label(notice, UI_TEXT, (8, panel.height - 17), panel.width - 16, 13)
+    screen.blit(overlay, panel.topleft)
+    return panel
+
+
 def draw_support_powerups(screen, player, now):
+    """Distinct, restrained active effects; all are below hostile shots."""
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
+    radius = max(64,
+                 GRAVITY_FIELD_RADIUS + 4 if player.get("gravity_until", 0) > now else 0,
+                 BULLET_TIME_RADIUS + 4 if player.get("bullet_time_until", 0) > now else 0)
+    effects = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
+    cx = cy = radius + 2
+    phase = now / 650 + player["number"] * 0.8
+
+    def color(key, alpha=135):
+        return (*POWERUP_COLORS[key], alpha)
+
+    def point(angle, distance):
+        return round(cx + math.cos(angle) * distance), round(cy + math.sin(angle) * distance)
+
     if player.get("gravity_until", 0) > now:
-        color = POWERUP_COLORS.get("gravity_well", UI_VIOLET)
-        radius = GRAVITY_FIELD_RADIUS
-        field = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
-        pygame.draw.circle(field, (*color, 13), (radius + 2, radius + 2), radius)
-        screen.blit(field, (center[0] - radius - 2, center[1] - radius - 2))
-        ring = pygame.Rect(center[0] - radius, center[1] - radius, radius * 2, radius * 2)
+        field_radius = GRAVITY_FIELD_RADIUS
+        pygame.draw.circle(effects, color("gravity_well", 7), (cx, cy), field_radius)
+        ring = pygame.Rect(cx - field_radius, cy - field_radius, field_radius * 2, field_radius * 2)
         for index in range(4):
             start = now / 700 + index * math.pi / 2
-            pygame.draw.arc(screen, color, ring, start, start + 0.9, 2)
+            pygame.draw.arc(effects, color("gravity_well", 115), ring, start, start + 0.62, 1)
+            pygame.draw.circle(effects, color("gravity_well", 155), point(-start, field_radius - 7), 2)
+    if player.get("bullet_time_until", 0) > now:
+        field_radius = BULLET_TIME_RADIUS
+        pygame.draw.circle(effects, color("bullet_time", 6), (cx, cy), field_radius)
+        pygame.draw.circle(effects, color("bullet_time", 100), (cx, cy), field_radius, 1)
+        for index in range(12):
+            angle = index * math.tau / 12 - now / 2600
+            pygame.draw.line(effects, color("bullet_time", 145),
+                             point(angle, field_radius - 5), point(angle, field_radius), 1)
+        hand_angle = -math.pi / 2 + now / 1400
+        pygame.draw.line(effects, color("bullet_time", 75), (cx, cy), point(hand_angle, 20), 1)
+    if player.get("cryo_until", 0) > now:
+        frost_stacks = shatter_stacks(player, now)
+        # Tiny snow flecks identify Frostbite even before its first kill.
+        for index in range(6):
+            angle = -phase + index * math.tau / 6
+            x, y = point(angle, 31)
+            pygame.draw.line(effects, color("cryo", 100), (x - 2, y), (x + 2, y), 1)
+            pygame.draw.line(effects, color("cryo", 100), (x, y - 2), (x, y + 2), 1)
+        # Each earned Shatter stack adds a separate orbiting ice crystal.
+        for index in range(frost_stacks):
+            angle = phase * 0.65 + index * math.tau / max(1, frost_stacks)
+            x, y = point(angle, 43)
+            pygame.draw.polygon(effects, color("cryo", 180),
+                                ((x, y - 5), (x + 3, y), (x, y + 5), (x - 3, y)), 1)
+            pygame.draw.line(effects, (*UI_TEXT, 150), (x, y - 2), (x, y + 2), 1)
+        if player.get("shatter_flash_until", 0) > now:
+            flash_radius = 23 + round((player["shatter_flash_until"] - now) / 40)
+            pygame.draw.circle(effects, color("cryo", 100), (cx, cy), flash_radius, 1)
+    if player.get("rapid_fire_until", 0) > now:
+        travel = (now // 35) % 15
+        for side in (-1, 1):
+            for step in range(3):
+                y = cy - 5 - (travel + step * 5) % 18
+                pygame.draw.line(effects, color("rapid_fire", 160 - step * 25),
+                                 (cx + side * 19, y), (cx + side * 19, y - 3), 1)
+    if player.get("speed_boost_until", 0) > now:
+        for side in (-1, 1):
+            pygame.draw.lines(effects, color("speed", 120), False,
+                              ((cx + side * 16, cy + 5),
+                               (cx + side * 21, cy + 20),
+                               (cx + side * 18, cy + 30)), 1)
+    if player.get("triple_shot_until", 0) > now:
+        for offset in (-12, 0, 12):
+            pygame.draw.line(effects, color("triple_shot", 120),
+                             (cx + offset, cy - 18), (cx + offset, cy - 24), 1)
+    if player.get("laser_until", 0) > now:
+        for offset in (-4, 4):
+            pygame.draw.line(effects, color("laser", 145),
+                             (cx + offset, cy - 11), (cx + offset, cy - 26), 1)
+    if player.get("magnet_until", 0) > now:
+        ring = pygame.Rect(cx - 34, cy - 26, 68, 52)
+        for offset in (0, math.pi):
+            pygame.draw.arc(effects, color("magnet", 100), ring,
+                            phase + offset, phase + offset + 0.65, 1)
+    if player.get("bomb_until", 0) > now:
+        for side in (-1, 1):
+            pygame.draw.circle(effects, color("bomb", 140), (cx + side * 23, cy + 8), 4, 1)
+            pygame.draw.line(effects, color("bomb", 140),
+                             (cx + side * 23, cy + 3), (cx + side * 25, cy), 1)
+    if player.get("piercing_until", 0) > now:
+        pygame.draw.lines(effects, color("piercing", 165), False,
+                          ((cx - 4, cy - 24), (cx, cy - 31), (cx + 4, cy - 24)), 1)
+    if player.get("homing_until", 0) > now:
+        target = (cx, cy - 34)
+        pygame.draw.circle(effects, color("homing", 125), target, 5, 1)
+        pygame.draw.line(effects, color("homing", 125), (cx - 8, cy - 34), (cx - 4, cy - 34), 1)
+        pygame.draw.line(effects, color("homing", 125), (cx + 4, cy - 34), (cx + 8, cy - 34), 1)
+    if player.get("lightning_until", 0) > now:
+        flicker = round(math.sin(now / 90) * 2)
+        for side in (-1, 1):
+            pygame.draw.lines(effects, color("lightning", 145), False,
+                              ((cx + side * 14, cy - 8), (cx + side * (22 + flicker), cy - 4),
+                               (cx + side * 18, cy + 2), (cx + side * 25, cy + 8)), 1)
+    if player.get("score_boost_until", 0) > now:
+        for offset in (0, math.pi):
+            x, y = point(phase * 0.7 + offset, 39)
+            pygame.draw.polygon(effects, color("score_boost", 145),
+                                ((x, y - 3), (x + 3, y), (x, y + 3), (x - 3, y)), 1)
+    if player.get("chain_reaction_until", 0) > now:
+        points = [(cx - 18, cy + 25), (cx, cy + 32), (cx + 18, cy + 25)]
+        pygame.draw.lines(effects, color("chain_reaction", 110), False, points, 1)
+        for position in points:
+            pygame.draw.circle(effects, color("chain_reaction", 145), position, 2, 1)
+    if player.get("warp_ready", False):
+        pygame.draw.arc(effects, color("emergency_warp", 110),
+                        pygame.Rect(cx - 23, cy - 31, 46, 62), 0.1, 1.2, 1)
+        pygame.draw.arc(effects, color("emergency_warp", 110),
+                        pygame.Rect(cx - 23, cy - 31, 46, 62), math.pi + 0.1, math.pi + 1.2, 1)
+    for index in range(min(3, player.get("reflector_charges", 0))):
+        angle = -math.pi / 2 + (index - 1) * 0.55
+        x, y = point(angle, 26)
+        pygame.draw.polygon(effects, color("reflector", 155),
+                            ((x, y - 4), (x + 3, y), (x, y + 4), (x - 3, y)), 1)
+    if player.get("supply_kills_left", 0):
+        for index in range(3):
+            pygame.draw.line(effects, color("supply_beacon", 125 - index * 20),
+                             (cx - 5 + index * 5, cy + 21), (cx - 5 + index * 5, cy + 25), 1)
+    if player.get("pending_missiles", False):
+        for side in (-1, 1):
+            pygame.draw.lines(effects, color("missile_swarm", 145), False,
+                              ((cx + side * 27, cy + 15), (cx + side * 27, cy + 7),
+                               (cx + side * 24, cy + 11)), 1)
+    for index in range(min(MAX_DAMAGE_BONUS, player.get("damage_bonus", 0))):
+        pygame.draw.circle(effects, color("damage_up", 160), (cx - 5 + index * 5, cy + 6), 1)
+    stacks = momentum_stacks(player, now)
+    if stacks:
+        momentum_color = blend_color(UI_CYAN, UI_VIOLET, min(1, stacks / BULLET_TIME_MAX_STACKS))
+        for segment in range(min(5, 1 + stacks // 4)):
+            travel = ((now // 48 + segment * 11) % 24)
+            pygame.draw.circle(effects, (*momentum_color, 150),
+                               (cx, cy + PLAYER_HEIGHT // 2 + 10 + travel),
+                               max(1, 3 - segment // 2), 1)
+        if player.get("momentum_flash_until", 0) > now:
+            flash_radius = 20 + round((player["momentum_flash_until"] - now) / 45)
+            pygame.draw.circle(effects, (*UI_CYAN, 100), (cx, cy), flash_radius, 1)
+    screen.blit(effects, (center[0] - cx, center[1] - cy))
     if player.get("orbit_until", 0) > now:
-        color = POWERUP_COLORS.get("orbit_drones", UI_CYAN)
+        drone_color = POWERUP_COLORS.get("orbit_drones", UI_CYAN)
         for position in orbit_drone_positions(player, now):
-            pygame.draw.line(screen, blend_color(color, UI_BG, 0.65), center, position, 1)
-            draw_soft_glow(screen, position, color, radius=12, strength=40)
+            pygame.draw.line(screen, blend_color(drone_color, UI_BG, 0.65), center, position, 1)
+            draw_soft_glow(screen, position, drone_color, radius=12, strength=35)
             drone = pygame.Rect(0, 0, 11, 9)
             drone.center = position
             pygame.draw.rect(screen, UI_BG, drone.inflate(4, 4), border_radius=3)
-            pygame.draw.rect(screen, color, drone, 2, border_radius=2)
+            pygame.draw.rect(screen, drone_color, drone, 2, border_radius=2)
             pygame.draw.circle(screen, UI_TEXT, position, 2)
 
 
@@ -4458,6 +5092,11 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
     # rather than popping in fully formed or showing through the upper UI.
     saved_clip = screen.get_clip()
     screen.set_clip(pygame.Rect(0, GAMEPLAY_TOP + 2, SCREEN_WIDTH, SCREEN_HEIGHT - GAMEPLAY_TOP - 2))
+    # Dock every effect at the edges before drawing threats. Enemies and hostile
+    # projectiles remain visible over the transparent panels and their text.
+    for player in players:
+        if not player["eliminated"]:
+            draw_powerup_hud(screen, player, now, font)
     for enemy in enemies:
         draw_animated_enemy(screen, enemy)
         if enemy_cryo_multiplier(enemy, now) < 1:
@@ -4492,20 +5131,6 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
                 True, UI_CORAL if boss_phase == 3 else UI_GOLD if boss_phase == 2 else UI_TEXT)
             screen.blit(phase_label, phase_label.get_rect(midbottom=(bar_x + bar_w // 2, bar_y - 3)))
 
-    for bullet in enemy_bullets:
-        if bullet.get("laser_state") == "warning":
-            draw_boss_laser_warning(screen, bullet, now)
-        elif bullet.get("laser_state") == "active":
-            beam_surface = pygame.Surface(bullet["rect"].size, pygame.SRCALPHA)
-            beam_surface.fill((*bullet["color"], 105))
-            screen.blit(beam_surface, bullet["rect"].topleft)
-            pygame.draw.rect(screen, bullet["color"], bullet["rect"], 2)
-        else:
-            pygame.draw.rect(screen, bullet["color"], bullet["rect"], border_radius=3)
-            if bullet["rect"].width >= 5 and bullet["rect"].height >= 5:
-                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.65),
-                                 bullet["rect"].inflate(-3, -3), border_radius=2)
-
     # Keep this clip for ALL gameplay effects; projectiles, explosions and
     # glows must never bleed into the top HUD above the divider.
     player_colors = {player["number"]: player["color"] for player in players}
@@ -4537,15 +5162,7 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
             pygame.draw.rect(screen, shot_color, rect, border_radius=2)
 
     for powerup in powerups:
-        powerup_type = powerup["type"]
-        center = powerup["rect"].center
-        powerup_color = POWERUP_COLORS[powerup_type]
-        draw_soft_glow(screen, center, powerup_color, radius=25, strength=75)
-        pygame.draw.circle(screen, (10, 17, 35), center, 13)
-        pygame.draw.circle(screen, powerup_color, center, 13, 2)
-        pygame.draw.arc(screen, UI_TEXT, powerup["rect"].inflate(7, 7),
-                        now / 350, now / 350 + 1.5, 2)
-        draw_powerup_icon(screen, powerup_type, center)
+        draw_world_powerup(screen, powerup, now)
 
     for block in bunkers:
         bunker_index = min(3, max(0, block.centerx * 4 // SCREEN_WIDTH))
@@ -4559,92 +5176,25 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
     for player in players:
         if player["eliminated"] or player["respawn_until"] > now:
             continue
-        ship_center = (int(player["x"] + PLAYER_WIDTH / 2), int(player["y"] + PLAYER_HEIGHT / 2))
         draw_support_powerups(screen, player, now)
         draw_animated_player(screen, player, now)
-        stacks = momentum_stacks(player, now)
-        if stacks:
-            # Animated orbital energy and focused engine trail communicate the
-            # growing buff without bringing back the blinking wing-side flames.
-            momentum_color = blend_color(UI_CYAN, UI_VIOLET, min(1, stacks / BULLET_TIME_MAX_STACKS))
-            tail_x = ship_center[0]
-            tail_y = round(player["y"] + PLAYER_HEIGHT + 10)
-            for segment in range(min(5, 1 + stacks // 4)):
-                travel = ((now // 48 + segment * 11) % 24)
-                pygame.draw.circle(screen, momentum_color,
-                                   (tail_x, tail_y + travel), max(1, 3 - segment // 2), 1)
-            if player.get("momentum_flash_until", 0) > now:
-                radius = 20 + round((player["momentum_flash_until"] - now) / 45)
-                pygame.draw.circle(screen, UI_CYAN, ship_center, radius, 2)
         if player["shield_until"] > now:
             draw_spawn_shield(screen, player["x"], player["y"], player["color"], now)
-        if player["bullet_time_until"] > now:
-            radius = BULLET_TIME_RADIUS
-            field_surface = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(field_surface, (*UI_VIOLET, 20), (radius, radius), radius)
-            field_center = (ship_center[0] - radius, ship_center[1] - radius)
-            screen.blit(field_surface, field_center)
-            pygame.draw.circle(screen, UI_VIOLET, ship_center, radius, 1)
-            pygame.draw.arc(screen, UI_PINK, pygame.Rect(ship_center[0] - radius, ship_center[1] - radius, radius * 2, radius * 2),
-                            now / 900, now / 900 + 1.2, 2)
-        ship_labels = []
-        stored_charges = []
-        if player.get("warp_ready", False):
-            stored_charges.append("WARP READY")
-        if player.get("reflector_charges", 0):
-            stored_charges.append(f"REFLECT {player['reflector_charges']}")
-        if player.get("supply_kills_left", 0):
-            stored_charges.append(f"SUPPLY {player['supply_kills_left']}")
-        if stored_charges:
-            ship_labels.append((" | ".join(stored_charges), UI_MINT))
-        if stacks:
-            speed_percent = round(stacks * BULLET_TIME_SPEED_PER_STACK / PLAYER_SPEED * 100)
-            fire_percent = round(stacks * BULLET_TIME_FIRE_PER_STACK * 100)
-            ship_labels.append((f"MOMENTUM x{stacks}  SPEED +{speed_percent}%  FIRE +{fire_percent}%", UI_CYAN))
-        if player["powerup_notice_until"] > now:
-            notice_color = POWERUP_COLORS.get(
-                next((key for key, label in POWERUP_LABELS.items()
-                      if label == player["powerup_notice"]), "shield"),
-            )
-            ship_labels.append((player["powerup_notice"], notice_color))
-        active_timers = []
-        for key, until_key in (
-            ("shield", "shield_until"),
-            ("rapid_fire", "rapid_fire_until"),
-            ("speed", "speed_boost_until"),
-            ("triple_shot", "triple_shot_until"),
-            ("laser", "laser_until"),
-            ("magnet", "magnet_until"),
-            ("bomb", "bomb_until"),
-            ("bullet_time", "bullet_time_until"),
-            ("piercing", "piercing_until"),
-            ("homing", "homing_until"),
-            ("score_boost", "score_boost_until"),
-            ("cryo", "cryo_until"),
-            ("orbit_drones", "orbit_until"),
-            ("gravity_well", "gravity_until"),
-            ("chain_reaction", "chain_reaction_until"),
-        ):
-            until_value = player[until_key]
-            if until_value > now:
-                seconds_left = max(1, math.ceil((until_value - now) / 1000))
-                active_timers.append((key, f"{POWERUP_TIMER_LABELS[key]} {seconds_left}s"))
-        ship_labels.extend((timer_text, POWERUP_COLORS[key]) for key, timer_text in active_timers[:3])
-        if ship_labels:
-            surfaces = [(font.render(text, True, color), color) for text, color in ship_labels]
-            row_height = font.get_height() + 8
-            block_height = row_height * len(surfaces)
-            block_width = max(surface.get_width() for surface, _ in surfaces) + 14
-            top = round(player["y"] - 12 - block_height)
-            if top < 119:
-                top = round(player["y"] + PLAYER_HEIGHT + 14)
-            label_block = pygame.Rect(0, top, block_width, block_height)
-            label_block.centerx = ship_center[0]
-            label_block.clamp_ip(pygame.Rect(12, 119, SCREEN_WIDTH - 24, SCREEN_HEIGHT - 175))
-            for index, (surface, color) in enumerate(surfaces):
-                text_rect = surface.get_rect(midtop=(label_block.centerx, label_block.y + index * row_height))
-                draw_neon_panel(screen, text_rect.inflate(12, 4), color, radius=5)
-                screen.blit(surface, text_rect)
+    # Threats are the final world layer: fields, pickup bursts, friendly beams,
+    # ships and the translucent docks cannot paint over an incoming projectile.
+    for bullet in enemy_bullets:
+        if bullet.get("laser_state") == "warning":
+            draw_boss_laser_warning(screen, bullet, now)
+        elif bullet.get("laser_state") == "active":
+            beam_surface = pygame.Surface(bullet["rect"].size, pygame.SRCALPHA)
+            beam_surface.fill((*bullet["color"], 105))
+            screen.blit(beam_surface, bullet["rect"].topleft)
+            pygame.draw.rect(screen, bullet["color"], bullet["rect"], 2)
+        else:
+            pygame.draw.rect(screen, bullet["color"], bullet["rect"], border_radius=3)
+            if bullet["rect"].width >= 5 and bullet["rect"].height >= 5:
+                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.65),
+                                 bullet["rect"].inflate(-3, -3), border_radius=2)
     screen.set_clip(saved_clip)  # Restore only before drawing HUD foreground.
     screen.blit(round_text, round_text.get_rect(center=round_badge.center))
     screen.blit(sector_text, sector_text.get_rect(center=sector_badge.center))
@@ -4811,6 +5361,8 @@ def register_player_hit(player, player_rect, particles, lives_font, lives_messag
         return lives_message
     spawn_pop_particles(player_rect.centerx, player_rect.centery, player["color"], particles)
     player["momentum_stacks"] = 0  # Losing a ship dumps its captured energy.
+    player["shatter_stacks"] = 0
+    player["shatter_flash_until"] = 0
     if player["lives"] > 0:
         player["lives"] -= 1
         if player["lives"] > 0:
@@ -5124,12 +5676,12 @@ def draw_victory_cutscene(screen, elapsed_ms, title_font, button_font, players):
 
     if elapsed_ms < 4000:
         draw_neon_title(screen, "EARTH SAVED", title_font, (SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.12)), UI_MINT)
-        subtitle = button_font.render("WAVE 100 CLEARED", True, UI_GOLD)
+        subtitle = button_font.render(f"WAVE {MAX_CAMPAIGN_ROUND} CLEARED", True, UI_GOLD)
         screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.22))))
 
     credits = (
         ("CAMPAIGN COMPLETE", UI_GOLD),
-        ("A CENTURY OF WAVES", UI_TEXT),
+        ("ALL CAMPAIGN WAVES CLEARED", UI_TEXT),
         ("CREATED BY", UI_CYAN),
         ("ASA GARVER", UI_TEXT),
         ("CO-DEVELOPER", UI_PINK),
@@ -5156,7 +5708,7 @@ def draw_completion_screen(screen, title_font, button_font, player_choice_font, 
     draw_neon_title(screen, "CAMPAIGN COMPLETE", title_font, (SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.14)), UI_MINT)
     team_score = sum(player["score"] for player in players)
     summary = button_font.render(
-        f"100 WAVES CLEARED    |    TEAM SCORE {team_score:08d}",
+        f"{MAX_CAMPAIGN_ROUND} WAVES CLEARED    |    TEAM SCORE {team_score:08d}",
         True,
         UI_GOLD,
     )
@@ -5264,7 +5816,8 @@ def save_sector_checkpoint(players, round_num):
                     "damage_bonus": p["damage_bonus"],
                     "warp_ready": p.get("warp_ready", False),
                     "reflector_charges": p.get("reflector_charges", 0),
-                    "supply_kills_left": p.get("supply_kills_left", 0)} for p in players],
+                    "supply_kills_left": p.get("supply_kills_left", 0),
+                    "pending_missiles": p.get("pending_missiles", False)} for p in players],
     }
 
 
@@ -5312,6 +5865,8 @@ def build_saved_run(round_num, players, checkpoint, infinite_mode=False, now=Non
             int(player["momentum_stacks"])
             if player["bullet_time_until"] > now else 0
         )
+        pilot["shatter_stacks"] = (int(player.get("shatter_stacks", 0))
+                                    if player.get("cryo_until", 0) > now else 0)
         pilots.append(pilot)
     return {
         "version": SAVE_FORMAT_VERSION,
@@ -5329,10 +5884,16 @@ def build_saved_run(round_num, players, checkpoint, infinite_mode=False, now=Non
 
 def write_saved_run(snapshot, filename=SAVE_FILE):
     """Save atomically; on failure keep the previous valid save untouched."""
-    temporary = filename.with_suffix(".tmp")
+    from tempfile import NamedTemporaryFile
+    temporary = None
     try:
+        filename = Path(filename)
         filename.parent.mkdir(parents=True, exist_ok=True)
-        with temporary.open("w", encoding="utf-8") as handle:
+        # Unique sibling files keep an export from clobbering an unrelated
+        # filename such as run.tmp, and allow atomic replacement on Windows.
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=filename.parent,
+                                prefix=f".{filename.name}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
             json.dump(snapshot, handle, separators=(",", ":"), allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
@@ -5340,7 +5901,8 @@ def write_saved_run(snapshot, filename=SAVE_FILE):
         return True
     except (OSError, TypeError, ValueError, RecursionError):
         try:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         except OSError:
             pass
         return False
@@ -5349,8 +5911,16 @@ def write_saved_run(snapshot, filename=SAVE_FILE):
 def save_slot_path(slot):
     """Each of the three menu slots has its own independent autosave file."""
     if type(slot) is not int or not 1 <= slot <= SAVE_SLOT_COUNT:
-        raise ValueError("Save slot must be an integer from 1 to 3")
+        raise ValueError(f"Save slot must be an integer from 1 to {SAVE_SLOT_COUNT}")
     return SAVE_FILE.parent / f"save_slot_{slot}.json"
+
+
+def save_slot_occupied(slot):
+    """Treat inaccessible slots as occupied so the menu never erases them."""
+    try:
+        return save_slot_path(slot).exists()
+    except OSError:
+        return True
 
 
 def list_saved_runs():
@@ -5471,6 +6041,9 @@ def load_saved_run(filename=SAVE_FILE):
                     or type(pilot.get("supply_kills_left", 0)) is not int
                     or not 0 <= pilot.get("supply_kills_left", 0) <= 8):
                 return None
+            if (type(pilot.get("shatter_stacks", 0)) is not int
+                    or not 0 <= pilot.get("shatter_stacks", 0) <= SHATTER_MAX_STACKS):
+                return None
             timer_keys = set(pilot["remaining_ms"])
             if (not timer_keys <= set(SAVED_TIMER_FIELDS)
                     or not set(SAVED_TIMER_FIELDS) - SAVED_OPTIONAL_TIMER_FIELDS <= timer_keys):
@@ -5504,6 +6077,65 @@ def clear_saved_run(filename=SAVE_FILE):
         return False
 
 
+def save_transfer_path(value):
+    """Accept a user-entered filename without treating an empty field as cwd."""
+    text = str(value).strip().strip('"')
+    if not text or "\x00" in text:
+        raise ValueError("Choose a JSON filename first.")
+    path = Path(text).expanduser()
+    if not path.suffix and not path.exists():
+        path = path.with_suffix(".json")
+    return path
+
+
+def export_saved_slot(slot, destination, overwrite=False):
+    """Export validated JSON, never accidentally overwrite another managed slot."""
+    snapshot = load_saved_run(save_slot_path(slot))
+    if snapshot is None:
+        return False, "EXPORT FAILED - this slot has no readable save."
+    try:
+        destination = save_transfer_path(destination)
+        managed = [SAVE_FILE, *(save_slot_path(index) for index in range(1, SAVE_SLOT_COUNT + 1))]
+        if any(destination.resolve() == filename.resolve() for filename in managed):
+            return False, "Choose an export path outside the game's managed save files."
+        if destination.exists() and not overwrite:
+            return False, "That file already exists. Confirm overwrite before exporting."
+        exported = dict(snapshot)
+        exported.pop("slot", None)
+        exported.pop("legacy_migration_id", None)
+        if not write_saved_run(exported, destination):
+            return False, "EXPORT FAILED - check the folder and available disk space."
+        return True, f"EXPORTED SLOT {slot} - {destination.name}"
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return False, "EXPORT FAILED - choose a writable JSON filename."
+
+
+def import_saved_slot(slot, source, overwrite=False):
+    """Validate before replacing just one slot, leaving bad imports untouched."""
+    destination = save_slot_path(slot)
+    try:
+        source = save_transfer_path(source)
+        snapshot = load_saved_run(source)
+        if snapshot is None:
+            return None, "IMPORT FAILED - unreadable or unsupported save file."
+        if save_slot_occupied(slot) and not overwrite:
+            return None, "This slot is occupied. Confirm replacement before importing."
+        imported = dict(snapshot, slot=slot)
+        imported.pop("legacy_migration_id", None)
+        if not write_saved_run(imported, destination):
+            return None, "IMPORT FAILED - the previous slot was kept. Check folder permissions."
+        return imported, f"IMPORTED INTO SLOT {slot} - CONTINUE to play"
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return None, "IMPORT FAILED - the previous slot was kept."
+
+
+def delete_saved_slot(slot):
+    """Delete only the selected local slot after the UI obtains confirmation."""
+    if clear_saved_run(save_slot_path(slot)):
+        return True, f"DELETED SLOT {slot} - other slots and exports are unchanged"
+    return False, "DELETE FAILED - the save file was kept. Check folder permissions."
+
+
 def restore_saved_run(snapshot, player_sprites):
     """Continue with saved pilots/buffs at the start of the recorded wave."""
     players = create_player_states(snapshot["player_count"], player_sprites)
@@ -5516,6 +6148,8 @@ def restore_saved_run(snapshot, player_sprites):
             player[field] = now + remaining if remaining else 0
         player["momentum_stacks"] = (pilot["momentum_stacks"]
                                       if pilot["remaining_ms"]["bullet_time_until"] else 0)
+        player["shatter_stacks"] = (pilot.get("shatter_stacks", 0)
+                                     if pilot["remaining_ms"].get("cryo_until", 0) else 0)
         player["powerup_notice"] = "RUN RESTORED"
         player["powerup_notice_until"] = now + 2400
     return (snapshot["wave"], players, snapshot["checkpoint"], snapshot["infinite_mode"])
@@ -5590,6 +6224,8 @@ def main():
     saved_run = None
     save_browser_open = False
     pending_replace_slot = None
+    pending_save_action = None
+    save_status = None
     save_error = None
     enemies, bunkers, enemy_bullets, player_bullets, particles, powerups, enemy_dx = reset_game_state(round_num)
     enemy_dy = 20
@@ -5625,6 +6261,40 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
 
+            if not game_started and save_browser_open and pending_save_action is not None:
+                action = pending_save_action
+                finished = False
+                message = None
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    pending_save_action = None
+                    pygame.key.stop_text_input()
+                    keyboard.discard_taps()
+                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    finished, message = confirm_save_action(action)
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    layout = save_browser_layout()
+                    if layout["cancel"].collidepoint(event.pos):
+                        pending_save_action = None
+                        pygame.key.stop_text_input()
+                    elif layout["confirm"].collidepoint(event.pos):
+                        register_ui_click(event.pos, UI_CYAN)
+                        finished, message = confirm_save_action(action)
+                    elif action["stage"] == "path" and layout["browse"].collidepoint(event.pos):
+                        browse_save_transfer(action)
+                    elif action["stage"] == "path" and layout["path_input"].collidepoint(event.pos):
+                        action["select_all"] = True
+                else:
+                    update_save_action_input(action, event)
+                if finished:
+                    saved_slots = list_saved_runs()
+                    if active_slot == action["slot"] and action["kind"] in ("delete", "import"):
+                        saved_run = saved_slots[active_slot - 1]
+                    save_error = None
+                    save_status = message
+                    pending_save_action = None
+                    keyboard.discard_taps()
+                continue
+
             if (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                     and not game_started and save_browser_open):
                 if pending_replace_slot is not None:
@@ -5653,8 +6323,12 @@ def main():
                             ui_targets = [(layout["back"], UI_CYAN), (layout["quit"], UI_CORAL)]
                             for card, snapshot in zip(layout["cards"], saved_slots):
                                 ui_targets.append((card["new"], UI_MINT))
+                                ui_targets.append((card["import"], UI_GOLD))
+                                if save_slot_occupied(card["slot"]):
+                                    ui_targets.append((card["delete"], UI_CORAL))
                                 if snapshot is not None:
                                     ui_targets.append((card["continue"], UI_GOLD))
+                                    ui_targets.append((card["export"], UI_CYAN))
                     elif enemy_journal_open:
                         ui_targets = [(journal_back_rect, UI_VIOLET)]
                         if enemy_journal_page > 0:
@@ -5695,11 +6369,23 @@ def main():
                         else:
                             for card, snapshot in zip(layout["cards"], saved_slots):
                                 slot = card["slot"]
+                                if card["import"].collidepoint(event.pos):
+                                    pending_save_action = begin_save_action("import", slot)
+                                    save_status = None
+                                    break
+                                if snapshot is not None and card["export"].collidepoint(event.pos):
+                                    pending_save_action = begin_save_action("export", slot)
+                                    save_status = None
+                                    break
+                                if save_slot_occupied(slot) and card["delete"].collidepoint(event.pos):
+                                    pending_save_action = begin_save_action("delete", slot)
+                                    save_status = None
+                                    break
                                 if snapshot is not None and card["continue"].collidepoint(event.pos):
                                     requested_run = (slot, snapshot)
                                     break
                                 if card["new"].collidepoint(event.pos):
-                                    if save_slot_path(slot).exists():
+                                    if save_slot_occupied(slot):
                                         pending_replace_slot = slot
                                     else:
                                         requested_run = (slot, None)
@@ -5729,7 +6415,7 @@ def main():
                         elif start_button_rect.collidepoint(event.pos):
                             saved_slots = list_saved_runs()
                             free_slot = next((slot for slot in range(1, SAVE_SLOT_COUNT + 1)
-                                              if not save_slot_path(slot).exists()), None)
+                                              if not save_slot_occupied(slot)), None)
                             if free_slot is None:
                                 save_browser_open = True
                                 pending_replace_slot = None
@@ -5833,6 +6519,10 @@ def main():
                                 for key, value in player.items():
                                     if key.endswith("_until") and value:
                                         player[key] = value + pause_duration
+                            for enemy in enemies:
+                                for key in ("cryo_slow_until", "next_fire_ms"):
+                                    if enemy.get(key, 0):
+                                        enemy[key] += pause_duration
                             if transitioning:
                                 transition_started_at += pause_duration
                             if lives_message is not None:
@@ -5881,6 +6571,7 @@ def main():
                     saved_slots[active_slot - 1] = saved_run
                 else:
                     saved_run = requested_snapshot
+                    save_error = None
                     round_num, players, checkpoint, infinite_mode = restore_saved_run(saved_run, player_sprites)
                     player_count = len(players)
                 enemies, bunkers, enemy_bullets, player_bullets, particles, powerups, enemy_dx = reset_game_state(
@@ -5891,6 +6582,8 @@ def main():
                 enemy_journal_open = False
                 save_browser_open = False
                 pending_replace_slot = None
+                pending_save_action = None
+                save_status = None
                 paused = False
                 paused_at = None
                 lives_message = None
@@ -5905,7 +6598,8 @@ def main():
             if save_browser_open:
                 draw_save_browser(screen, saved_slots, title_font, button_font,
                                   player_choice_font, pending_replace_slot=pending_replace_slot,
-                                  save_error=save_error)
+                                  save_error=save_error, pending_save_action=pending_save_action,
+                                  save_status=save_status)
             elif enemy_journal_open:
                 draw_enemy_journal(
                     screen,
@@ -6027,7 +6721,7 @@ def main():
                     check_player_bullet_collisions(
                         player_bullets, enemies, particles, enemy_bullets, powerups, players
                     )
-                    update_powerups(powerups, players, enemy_bullets)
+                    update_powerups(powerups, players, enemy_bullets, particles)
                     resolve_instant_powerups(players, enemies, enemy_bullets,
                                              player_bullets, powerups, particles)
                     check_bunker_collisions(bunkers, player_bullets, enemy_bullets, enemies, particles)
