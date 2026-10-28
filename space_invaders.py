@@ -117,8 +117,8 @@ BULLET_TIME_MAX_STACKS = 16
 BULLET_TIME_SPEED_PER_STACK = 0.28  # Up to +4.48 movement/frame.
 BULLET_TIME_FIRE_PER_STACK = 0.085  # Up to +136% fire rate.
 SHATTER_MAX_STACKS = 6
-SHATTER_SPEED_PER_STACK = 0.5  # Stronger per stack, but +3 max versus Momentum's +4.48.
-SHATTER_FIRE_PER_STACK = 0.15  # +90% max versus Momentum's +136%.
+SHATTER_SPEED_PER_STACK = 0.4  # Up to +2.4 movement/frame; below Momentum's +4.48.
+SHATTER_FIRE_PER_STACK = 0.12  # Up to +72% fire rate; below Momentum's +136%.
 ENEMY_AIM_LEAD_FRAMES = 4
 PLAYER_COLORS = (RED, PLAYER_BLUE, CYAN, YELLOW)
 PLAYER_CONTROLS = (
@@ -130,6 +130,8 @@ PLAYER_CONTROLS = (
 FIRE_INPUT_BUFFER_MS = 150
 EMERGENCY_WARP_SHIELD_MS = 1500
 CRYO_SLOW_MS = 2000
+NOVA_COUNTDOWN_MS = 3000
+NOVA_PULSE_RADIUS = 300
 
 
 class HeldInput:
@@ -417,7 +419,17 @@ POWERUP_TYPES = (
     "supply_beacon", "gravity_well", "emergency_warp", "nova_pulse",
     "missile_swarm", "reflector", "chain_reaction",
 )
-RARE_POWERUP_CHANCE = 0.05
+# Utility pickups appear more often than powerful weapons and defensive fields.
+# These weights total 100, so each value is also its percentage of spawned drops.
+POWERUP_SPAWN_WEIGHTS = {
+    "life": 4, "shield": 3, "rapid_fire": 3, "speed": 11,
+    "triple_shot": 3, "laser": 2, "magnet": 12, "bomb": 4,
+    "bullet_time": 2, "piercing": 5, "damage_up": 2, "homing": 4,
+    "lightning": 2, "score_boost": 14, "cryo": 3, "orbit_drones": 4,
+    "supply_beacon": 3, "gravity_well": 3, "emergency_warp": 3,
+    "nova_pulse": 3, "missile_swarm": 3, "reflector": 4, "chain_reaction": 3,
+}
+RARE_POWERUP_CHANCE = POWERUP_SPAWN_WEIGHTS["damage_up"] / sum(POWERUP_SPAWN_WEIGHTS.values())
 COMMON_POWERUP_TYPES = tuple(powerup_type for powerup_type in POWERUP_TYPES if powerup_type != "damage_up")
 POWERUP_COLORS = {
     "life": GREEN,
@@ -535,7 +547,7 @@ POWERUP_JOURNAL = (
     ("supply_beacon", "Stores eight credited-kill charges. Ordinary kills get better drop odds; boss kills spend a charge too. Drop limits still apply."),
     ("gravity_well", f"A {POWERUP_DURATIONS['gravity_well'] // 1000}-second, {GRAVITY_FIELD_RADIUS}-pixel field gently bends nearby moving hostile shots away. Boss lasers stay fixed."),
     ("emergency_warp", "Stored across waves and saves. After Reflector blocks run out, a damaging hit spends the charge to warp you to a safer spot. Duplicates grant Double Score."),
-    ("nova_pulse", "A 190-pixel blast clears enemy projectiles, including mines, and deals 3 damage to foes or 6 to bosses. Boss lasers are unaffected."),
+    ("nova_pulse", f"After 3-2-1, every foe takes 1 damage through shields. Clears shots and mines within {NOVA_PULSE_RADIUS} pixels; boss lasers stay. Life loss cancels the charge."),
     ("missile_swarm", "Stores a charge for up to six guided missiles. Fires at visible foes once there is room for support shots. Weapon buffs do not multiply the swarm."),
     ("reflector", "Stores three blocks. Each damaging hit spends a block and returns a basic bolt toward the nearest foe."),
     ("chain_reaction", f"For {POWERUP_DURATIONS['chain_reaction'] // 1000} seconds, credited kills can send up to three shards at nearby visible foes. Support shots and Nova Pulse do not start bursts."),
@@ -552,10 +564,10 @@ def journal_page_count():
 
 
 # Limit random drops with a world-pickup cap and a shared cooldown.
-NORMAL_POWERUP_DROP_CHANCE = 0.06
-MUTATED_POWERUP_DROP_CHANCE = 0.12
+NORMAL_POWERUP_DROP_CHANCE = 0.05
+MUTATED_POWERUP_DROP_CHANCE = 0.10
 MAX_WORLD_POWERUPS = 2
-POWERUP_DROP_COOLDOWN_MS = 2400
+POWERUP_DROP_COOLDOWN_MS = 2700
 _LAST_RANDOM_POWERUP_DROP_MS = -POWERUP_DROP_COOLDOWN_MS
 ENEMY_SCORE_VALUES = {
     "standard": 100,
@@ -1552,6 +1564,16 @@ def update_and_draw_particles(screen, particles, advance=True):
             pygame.draw.circle(screen, UI_TEXT, (x, y), max(1, round(2 * alpha)))
         elif p.get("kind") in ("powerup_pickup", "shatter"):
             draw_powerup_collection_particle(screen, p)
+        elif p.get("kind") == "nova_pulse":
+            progress = 1 - p["lifetime"] / p["max_lifetime"]
+            radius = max(1, round(p["radius"] * min(1, progress * 1.6)))
+            size = int(p["radius"] * 2 + 8)
+            pulse = pygame.Surface((size, size), pygame.SRCALPHA)
+            center = (size // 2, size // 2)
+            alpha = round(190 * (1 - progress))
+            pygame.draw.circle(pulse, (*p["color"], alpha), center, radius, 3)
+            pygame.draw.circle(pulse, (*UI_TEXT, alpha // 2), center, max(1, radius - 9), 1)
+            screen.blit(pulse, (round(p["x"]) - center[0], round(p["y"]) - center[1]))
         elif p.get("kind") == "ring":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             ring_radius = int(p["radius"] + progress * 28)
@@ -2080,10 +2102,10 @@ def create_enemy_projectile(x, y, dx, dy, size=8, color=RED):
     }
 
 
-def damage_enemy(enemy, damage, player_number):
+def damage_enemy(enemy, damage, player_number, *, ignore_shields=False):
     if damage <= 0:
         return 0
-    if enemy.get("shield_charges", 0) > 0:
+    if not ignore_shields and enemy.get("shield_charges", 0) > 0:
         enemy["shield_charges"] -= 1
         enemy["animation_hit"] = 6
         return 0
@@ -2265,9 +2287,9 @@ def fire_boss_burst(enemy, enemy_bullets, target_positions, max_bullets, encount
 
 
 def choose_powerup_type():
-    if random.random() < RARE_POWERUP_CHANCE:
-        return "damage_up"
-    return random.choice(COMMON_POWERUP_TYPES)
+    return random.choices(
+        POWERUP_TYPES, weights=[POWERUP_SPAWN_WEIGHTS[kind] for kind in POWERUP_TYPES], k=1,
+    )[0]
 
 
 def create_powerup(x, y):
@@ -2329,6 +2351,8 @@ def grant_powerup(player, powerup_type, enemy_bullets=None):
         player["supply_kills_left"] = 8
     elif powerup_type == "nova_pulse":
         player["pending_nova"] = True
+        # A second pickup refreshes one charge instead of banking extra blasts.
+        player["nova_charge_until"] = now + NOVA_COUNTDOWN_MS
     elif powerup_type == "missile_swarm":
         player["pending_missiles"] = True
     elif powerup_type in POWERUP_TIMER_KEYS:
@@ -3443,31 +3467,48 @@ def consume_support_powerups(player, players, enemies, player_bullets):
     pending.clear()
 
 
+def nova_countdown(player, now):
+    """Show one second each of 3, 2 and 1 before the charged pulse fires."""
+    if (not player.get("pending_nova", False) or player.get("eliminated", False)
+            or player.get("respawn_until", 0) > now):
+        return 0
+    remaining = player.get("nova_charge_until", 0) - now
+    return min(NOVA_COUNTDOWN_MS // 1000, max(0, math.ceil(remaining / 1000)))
+
+
 def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, powerups, particles):
-    """Apply instant pickups with full collision/reward context on collection."""
+    """Resolve charged Nova pulses and stored missiles with reward context."""
     now = pygame.time.get_ticks()
     for player in players:
         if player.get("eliminated") or player.get("respawn_until", 0) > now:
             continue
         center = (player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
         if player.get("pending_nova"):
-            player["pending_nova"] = False
-            particles.append({"kind": "ring", "x": center[0], "y": center[1],
-                              "dx": 0, "dy": 0, "radius": 162, "color": UI_CYAN,
-                              "lifetime": 24, "max_lifetime": 24})
-            for enemy in enemies[:]:
-                if enemy["hp"] <= 0 or math.dist(center, enemy["rect"].center) > 190:
-                    continue
-                damage_enemy(enemy, 6 if enemy.get("is_boss") else 3, player["number"])
-                if enemy["hp"] <= 0:
-                    enemy["no_chain_reaction"] = True
-                    finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, particles)
-            # Clear after rewards/death bursts so a volatile foe cannot refill
-            # the safe area during the same defensive blast.
-            for shot in enemy_bullets[:]:
-                if (shot.get("laser_state") is None
-                        and math.dist(center, shot["rect"].center) <= 190):
-                    enemy_bullets.remove(shot)
+            if not player.get("nova_charge_until", 0):
+                # Also accept an older in-memory pending flag as a fresh charge.
+                player["nova_charge_until"] = now + NOVA_COUNTDOWN_MS
+            if now >= player["nova_charge_until"]:
+                player["pending_nova"] = False
+                player["nova_charge_until"] = 0
+                particles.append({"kind": "nova_pulse", "x": center[0], "y": center[1],
+                                  "dx": 0, "dy": 0, "radius": NOVA_PULSE_RADIUS,
+                                  "color": POWERUP_COLORS["nova_pulse"],
+                                  "lifetime": 30, "max_lifetime": 30})
+                # The damaging shock reaches every foe; projectile clearing
+                # is local to the larger circle centered on the pilot.
+                for enemy in enemies[:]:
+                    if enemy["hp"] <= 0:
+                        continue
+                    damage_enemy(enemy, 1, player["number"], ignore_shields=True)
+                    if enemy["hp"] <= 0:
+                        enemy["no_chain_reaction"] = True
+                        finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, particles)
+                # Clear after rewards/death bursts so a volatile foe cannot
+                # refill the safe area during this same defensive blast.
+                for shot in enemy_bullets[:]:
+                    if (shot.get("laser_state") is None
+                            and math.dist(center, shot["rect"].center) <= NOVA_PULSE_RADIUS):
+                        enemy_bullets.remove(shot)
         if player.get("pending_missiles"):
             targets = sorted((enemy for enemy in enemies
                               if enemy["hp"] > 0 and enemy_is_visible(enemy)),
@@ -4213,6 +4254,7 @@ def draw_enemy_journal(
                     f"{POWERUP_DURATIONS[name] // 1000} SECONDS"
                     if name in POWERUP_DURATIONS else "RUN UPGRADE" if name == "damage_up"
                     else "STORED UNTIL USED" if name in ("emergency_warp", "reflector", "supply_beacon", "missile_swarm")
+                    else "3-2-1 COUNTDOWN" if name == "nova_pulse"
                     else "INSTANT"
                 )
                 duration_surface = description_font.render(duration, True, UI_MUTED)
@@ -4304,6 +4346,7 @@ def create_player_states(player_count, player_sprites):
             "gravity_until": 0,
             "chain_reaction_until": 0,
             "pending_nova": False,
+            "nova_charge_until": 0,
             "pending_missiles": False,
             "pending_reflections": [],
             "pending_chain_shots": [],
@@ -4849,6 +4892,9 @@ def powerup_hud_entries(player, now):
     ):
         if value:
             entries.append((key, label, POWERUP_COLORS[key]))
+    nova_seconds = nova_countdown(player, now)
+    if nova_seconds:
+        entries.append(("nova_pulse", f"NOVA {nova_seconds}", POWERUP_COLORS["nova_pulse"]))
     stacks = momentum_stacks(player, now)
     if stacks:
         entries.append(("momentum", f"MOMENTUM x{stacks}", UI_CYAN))
@@ -4905,8 +4951,39 @@ def draw_powerup_hud(screen, player, now, font):
     return panel
 
 
+def draw_nova_countdown(screen, player, now):
+    """A faint clear-radius guide and readable countdown follow the pilot."""
+    seconds = nova_countdown(player, now)
+    if not seconds:
+        return
+    center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
+    radius = NOVA_PULSE_RADIUS
+    size = radius * 2 + 8
+    effects = pygame.Surface((size, size), pygame.SRCALPHA)
+    local_center = (size // 2, size // 2)
+    accent = POWERUP_COLORS["nova_pulse"]
+    pygame.draw.circle(effects, (*accent, 4), local_center, radius)
+    ring = pygame.Rect(4, 4, radius * 2, radius * 2)
+    for index in range(12):
+        angle = index * math.tau / 12 + now / 2200
+        pygame.draw.arc(effects, (*accent, 90), ring, angle, angle + 0.15, 1)
+    progress = 1 - max(0, player["nova_charge_until"] - now) / NOVA_COUNTDOWN_MS
+    pygame.draw.circle(effects, (*accent, 110), local_center, round(24 + progress * 23), 1)
+    screen.blit(effects, (center[0] - local_center[0], center[1] - local_center[1]))
+    font = pygame.font.SysFont(None, 38)
+    label = font.render(f"NOVA {seconds}", True, accent)
+    outline = font.render(f"NOVA {seconds}", True, UI_BG)
+    label_rect = label.get_rect(midbottom=(center[0], center[1] - 35))
+    label_rect.clamp_ip(pygame.Rect(4, GAMEPLAY_TOP + 4, SCREEN_WIDTH - 8,
+                                  SCREEN_HEIGHT - GAMEPLAY_TOP - 8))
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        screen.blit(outline, label_rect.move(dx, dy))
+    screen.blit(label, label_rect)
+
+
 def draw_support_powerups(screen, player, now):
     """Distinct, restrained active effects; all are below hostile shots."""
+    draw_nova_countdown(screen, player, now)
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
     radius = max(64,
                  GRAVITY_FIELD_RADIUS + 4 if player.get("gravity_until", 0) > now else 0,
@@ -5363,6 +5440,8 @@ def register_player_hit(player, player_rect, particles, lives_font, lives_messag
     player["momentum_stacks"] = 0  # Losing a ship dumps its captured energy.
     player["shatter_stacks"] = 0
     player["shatter_flash_until"] = 0
+    player["pending_nova"] = False
+    player["nova_charge_until"] = 0
     if player["lives"] > 0:
         player["lives"] -= 1
         if player["lives"] > 0:
@@ -5845,9 +5924,9 @@ SAVED_OPTIONAL_PILOT_DEFAULTS = {"warp_ready": False, "reflector_charges": 0,
                                  "supply_kills_left": 0, "pending_missiles": False}
 SAVED_PILOT_FIELDS = ("score", "kills", "lives", "damage_bonus", "eliminated",
                       *SAVED_OPTIONAL_PILOT_DEFAULTS)
-SAVED_OPTIONAL_TIMER_FIELDS = frozenset(("cryo_until", "orbit_until", "gravity_until", "chain_reaction_until"))
+SAVED_OPTIONAL_TIMER_FIELDS = frozenset(("cryo_until", "orbit_until", "gravity_until", "chain_reaction_until", "nova_charge_until"))
 SAVED_TIMER_FIELDS = tuple(dict.fromkeys((
-    *POWERUP_TIMER_KEYS.values(), "shield_until", "respawn_until",
+    *POWERUP_TIMER_KEYS.values(), "shield_until", "respawn_until", "nova_charge_until",
 )))
 
 
@@ -5861,6 +5940,12 @@ def build_saved_run(round_num, players, checkpoint, infinite_mode=False, now=Non
         pilot["remaining_ms"] = {
             key: max(0, int(player.get(key, 0) - now)) for key in SAVED_TIMER_FIELDS
         }
+        # Only a live charge is portable. A due pulse retains one millisecond
+        # so Continue resolves it once rather than dropping it or restarting it.
+        pilot["remaining_ms"]["nova_charge_until"] = (
+            max(1, min(NOVA_COUNTDOWN_MS, int(player.get("nova_charge_until", 0) - now)))
+            if player.get("pending_nova", False) and not player["eliminated"] else 0
+        )
         pilot["momentum_stacks"] = (
             int(player["momentum_stacks"])
             if player["bullet_time_until"] > now else 0
@@ -6051,6 +6136,8 @@ def load_saved_run(filename=SAVE_FILE):
             if any(type(pilot["remaining_ms"].get(k, 0)) is not int or
                    not 0 <= pilot["remaining_ms"].get(k, 0) <= 180_000 for k in SAVED_TIMER_FIELDS):
                 return None
+            if pilot["remaining_ms"].get("nova_charge_until", 0) > NOVA_COUNTDOWN_MS:
+                return None
         for pilot in cp["pilots"]:
             if (not isinstance(pilot, dict) or
                 any(type(pilot.get(k)) is not int for k in ("score", "kills", "damage_bonus")) or
@@ -6146,6 +6233,7 @@ def restore_saved_run(snapshot, player_sprites):
         for field in SAVED_TIMER_FIELDS:
             remaining = pilot["remaining_ms"].get(field, 0)
             player[field] = now + remaining if remaining else 0
+        player["pending_nova"] = bool(pilot["remaining_ms"].get("nova_charge_until", 0))
         player["momentum_stacks"] = (pilot["momentum_stacks"]
                                       if pilot["remaining_ms"]["bullet_time_until"] else 0)
         player["shatter_stacks"] = (pilot.get("shatter_stacks", 0)
@@ -6797,5 +6885,4 @@ def main():
 
     pygame.quit()
     sys.exit()
-
 main()
