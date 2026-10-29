@@ -9,6 +9,10 @@ from pathlib import Path
 import math
 import random
 import sys
+
+# Let SDL request a native-resolution window on Windows HiDPI monitors instead
+# of allowing desktop bitmap scaling to blur the entire game.
+os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
 import pygame 
 
 # Screen Setup Constants
@@ -126,6 +130,9 @@ class DisplayManager:
         self._ui_key = None
         self._presentation = None
         self._presentation_size = None
+        self._layer_targets = {}
+        self._display_size = None
+        self.mode_epoch = 0
         self.settings_error = None
         self._preferences_changed_at = None
 
@@ -133,36 +140,47 @@ class DisplayManager:
         flags = pygame.FULLSCREEN if self.preferences["fullscreen"] else pygame.RESIZABLE
         size = (0, 0) if self.preferences["fullscreen"] else tuple(self.preferences["window_size"])
         self.display = pygame.display.set_mode(size, flags)
+        self._display_size = self.display.get_size()
+        self.mode_epoch += 1
         self._invalidate()
         return self.display
+
+    def _sync_display_surface(self):
+        """Use SDL's current drawable after a mode, monitor or DPI change."""
+        current = pygame.display.get_surface()
+        if current is None:
+            return False
+        self.display = current
+        size = current.get_size()
+        if size == self._display_size:
+            return False
+        self._display_size = size
+        self._invalidate()
+        return True
 
     def _invalidate(self):
         self._ui_key = None
         self._presentation = None
         self._presentation_size = None
+        self._layer_targets.clear()
 
     @property
     def viewport(self):
-        width, height = self.display.get_size()
-        factor = min(width / WORLD_SIZE[0], height / WORLD_SIZE[1])
-        size = (max(1, round(WORLD_SIZE[0] * factor)), max(1, round(WORLD_SIZE[1] * factor)))
-        return pygame.Rect((width - size[0]) // 2, (height - size[1]) // 2, *size)
+        # Map both simulation axes to the window. Aspect-fit margins used to
+        # reserve unreachable strips above/below the arena on 16:10 and 4:3
+        # displays. All four world edges now reach the corresponding screen edge.
+        return self.display.get_rect()
 
     @property
     def effective_gui_zoom(self):
-        viewport = self.viewport
-        world_scale = min(viewport.width / WORLD_SIZE[0], viewport.height / WORLD_SIZE[1])
-        automatic = min(2.0, max(1.0, 1 / world_scale))
-        return min(2.5, automatic * self.preferences["gui_scale"])
+        return self.preferences["gui_scale"]
 
     def ui_size(self, arena=False):
-        zoom = self.effective_gui_zoom
-        if arena:
-            return (max(640, round(WORLD_SIZE[0] / zoom)), max(360, round(WORLD_SIZE[1] / zoom)))
-        viewport = self.viewport
-        factor = min(viewport.width / WORLD_SIZE[0], viewport.height / WORLD_SIZE[1]) * zoom
+        self._sync_display_surface()
         width, height = self.display.get_size()
-        factor = min(factor, width / 640, height / 360)
+        # Auto uses one GUI pixel per display pixel. Manual zoom receives one
+        # antialiased presentation pass, rather than a trip through world pixels.
+        factor = min(self.effective_gui_zoom, width / 640, height / 360)
         return (max(640, round(width / factor)), max(360, round(height / factor)))
 
     def activate(self, arena=False):
@@ -199,13 +217,23 @@ class DisplayManager:
                 and (force or pygame.time.get_ticks() - self._preferences_changed_at >= 300)):
             self._save()
 
-    def resize(self, size):
+    def resize(self, size, *, from_event=False):
+        # SDL can deliver notifications from the previous fullscreen/windowed
+        # mode after a toggle. They describe history, not the current drawable.
+        # SDL2 already resizes display surfaces for genuine window changes.
+        changed = self._sync_display_surface() if from_event else False
         if self.preferences["fullscreen"]:
-            return False
+            return changed
+        if from_event:
+            size = self.display.get_size()
         size = (max(320, min(7680, int(size[0]))), max(240, min(4320, int(size[1]))))
+        if (from_event and size == tuple(self.preferences["window_size"])
+                and not changed):
+            return False
         self.preferences["window_size"] = list(size)
         if self.display.get_size() != size:
             self.display = pygame.display.set_mode(size, pygame.RESIZABLE)
+        self._display_size = self.display.get_size()
         self._invalidate()
         self._preferences_changed_at = pygame.time.get_ticks()
         return True
@@ -233,7 +261,21 @@ class DisplayManager:
         self._invalidate()
         self._save()
 
-    def present(self, surface, arena=False):
+    def _present_layer(self, surface, region, name):
+        if surface is None:
+            return
+        if surface.get_size() == region.size:
+            self.display.blit(surface, region)
+            return
+        target = self._layer_targets.get(name)
+        if target is None or target.get_size() != region.size:
+            target = pygame.Surface(region.size, pygame.SRCALPHA)
+            self._layer_targets[name] = target
+        pygame.transform.smoothscale(surface, region.size, target)
+        self.display.blit(target, region)
+
+    def present(self, surface, arena=False, ui_underlay=None, ui_overlay=None,
+                threat_surface=None):
         region = self.viewport if arena else self.display.get_rect()
         self.display.fill((3, 7, 20))
         if surface.get_size() == region.size:
@@ -242,8 +284,11 @@ class DisplayManager:
             if self._presentation_size != region.size:
                 self._presentation = pygame.Surface(region.size)
                 self._presentation_size = region.size
-            pygame.transform.scale(surface, region.size, self._presentation)
+            pygame.transform.smoothscale(surface, region.size, self._presentation)
             self.display.blit(self._presentation, region)
+        self._present_layer(ui_underlay, region, "underlay")
+        self._present_layer(threat_surface, region, "threats")
+        self._present_layer(ui_overlay, region, "overlay")
         pygame.display.flip()
 
 
@@ -251,11 +296,7 @@ class DisplayManager:
 def gameplay_display_button_rect(pause_button, exit_button=None, paused=False):
     """Keep display controls in the clear central channel of compact HUDs."""
     button = pygame.Rect(0, 0, 48 if SCREEN_WIDTH < 700 else 104, 28)
-    if SCREEN_WIDTH < 1000:
-        above = exit_button if paused and exit_button is not None else pause_button
-        button.midbottom = (pause_button.centerx, above.top - 8)
-    else:
-        button.midright = (pause_button.left - 10, pause_button.centery)
+    button.midbottom = (pause_button.centerx, pause_button.top - 8)
     return button
 
 
@@ -269,10 +310,12 @@ def display_settings_layout():
     controls = [pygame.Rect(panel.x + 20 + i * (button_width + gap), y, button_width, 42)
                 for i in range(3)]
     mode = pygame.Rect(panel.x + 20, y + 56, panel.width - 40, 42)
-    close = pygame.Rect(0, 0, min(240, panel.width - 40), 42)
-    close.midbottom = (panel.centerx, panel.bottom - 18)
+    close = pygame.Rect(0, 0, (panel.width - 52) // 2, 42)
+    close.bottomright = (panel.right - 20, panel.bottom - 18)
+    keyboard = close.copy()
+    keyboard.bottomleft = (panel.left + 20, panel.bottom - 18)
     return {"panel": panel, "smaller": controls[0], "auto": controls[1],
-            "larger": controls[2], "mode": mode, "close": close}
+            "larger": controls[2], "mode": mode, "close": close, "keyboard": keyboard}
 
 
 @ui_scene
@@ -297,12 +340,13 @@ def draw_display_settings(screen, manager, font, small_font):
         hint = pygame.transform.smoothscale(hint, (panel.width - 36, max(1, round(hint.get_height() * (panel.width - 36) / hint.get_width()))))
     hint_rect = hint.get_rect(midtop=(panel.centerx, layout["mode"].bottom + 12))
     screen.blit(hint, hint_rect)
-    wheel_hint = small_font.render("Ctrl + mouse wheel also changes GUI size.", True, UI_MUTED)
+    wheel_hint = small_font.render("Ctrl + wheel: GUI size / F9: keyboard controls", True, UI_MUTED)
     screen.blit(wheel_hint, wheel_hint.get_rect(midtop=(panel.centerx, hint_rect.bottom + 3)))
     if manager.settings_error:
         warning = pygame.font.SysFont(None, 17).render("Settings apply; preference file could not be saved.", True, UI_CORAL)
         screen.blit(warning, warning.get_rect(midbottom=(panel.centerx, layout["close"].top - 5)))
     draw_neon_button(screen, layout["close"], "DONE", small_font, UI_MINT)
+    draw_neon_button(screen, layout["keyboard"], "KEYBOARD", small_font, UI_CYAN)
 
 # Colors
 BLACK = (0, 0, 0)
@@ -349,7 +393,9 @@ COLS = 11
 ENEMY_WIDTH = 35
 ENEMY_HEIGHT = 25
 PADDING = 15
-OFFSET_Y = 145
+# Status docks no longer reserve a strip of the arena. Start the fleet closer
+# to the real top edge so the front rank leaves enough room to react to fire.
+OFFSET_Y = 70
 MARGIN = 50
 GAMEPLAY_TOP = 0  # The whole screen is playable; HUD elements are transparent overlays.
 HUD_TOP_HEIGHT = 108  # Keeps edge status docks clear of the score readouts.
@@ -370,12 +416,13 @@ SPLITTER_FRAGMENT_COUNT = 2
 SPLITTER_REGROW_FRAMES = 480  # Eight seconds at 60 FPS, independently per fragment.
 SPLITTER_REGROW_STAGGER_FRAMES = 24
 SPLITTER_SHARD_SPEED_MULTIPLIER = 1.15
-# Sectors are five-wave CHECKPOINTS; only health tiers (not sectors) increase
-# ordinary enemy HP at waves 21, 41, 61 and 81.
+# Checkpoints and combat pacing do not add health. Ordinary enemies receive
+# only one health-tier bonus, starting after wave 50, including infinite mode.
 WAVES_PER_SECTOR = 5
-WAVES_PER_HEALTH_TIER = 20
+ENEMY_HEALTH_INCREASE_WAVE = 51
+WAVES_PER_COMBAT_TIER = 20
 # Fast, fragile foes remain fragile throughout the run. Armored mutations can
-# still add their own armor, but the 20-wave blanket HP upgrades skip these.
+# still add their own armor, but the single health-tier increase skips these.
 HEALTH_SCALING_EXEMPT_TYPES = frozenset((
     "speedy", "scout", "swarmer", "shardling", "blink", "phantom",
 ))
@@ -392,6 +439,7 @@ BOSS_ENCOUNTER_RECOVERY_FRAMES = 48
 # Player Configuration Constants
 PLAYER_WIDTH = 30
 PLAYER_HEIGHT = 24
+PLAYER_SPAWN_BOTTOM_MARGIN = 20
 PLAYER_SPEED = 3.5
 BASE_SHOT_COOLDOWN = 27
 COOP_FIRE_COOLDOWN_STEP = 0.65  # A modest team boost; each pilot still fires slower than solo.
@@ -432,9 +480,13 @@ PLAYER_CONTROLS = (
     (pygame.K_j, pygame.K_l, pygame.K_i, pygame.K_k, (pygame.K_u, pygame.K_SEMICOLON, pygame.K_h)),
     (pygame.K_KP4, pygame.K_KP6, pygame.K_KP8, pygame.K_KP5, (pygame.K_KP_ENTER, pygame.K_KP7)),
 )
+DEFAULT_PLAYER_CONTROLS = PLAYER_CONTROLS
+PLAYER_AUTOFIRE = (False, False, False, False)
 FIRE_INPUT_BUFFER_MS = 150
 EMERGENCY_WARP_SHIELD_MS = 1500
 CRYO_SLOW_MS = 2000
+FROSTBITE_ENEMY_SPEED_MULTIPLIER = 0.35
+FROSTBITE_BOSS_SPEED_MULTIPLIER = 0.75
 NOVA_COUNTDOWN_MS = 3000
 NOVA_PULSE_RADIUS = 300
 
@@ -498,6 +550,227 @@ class HeldInput:
         # Alternative fire keys belong to one action, not separate volleys.
         for key in shoot_keys:
             self.fire_deadlines.pop(key, None)
+
+
+KEYBOARD_ACTIONS = ("LEFT", "RIGHT", "UP", "DOWN", "FIRE")
+KEYBOARD_RESERVED_KEYS = frozenset((pygame.K_ESCAPE, pygame.K_F6, pygame.K_F7,
+                                   pygame.K_F8, pygame.K_F9, pygame.K_F11))
+
+
+def keyboard_preferences_path():
+    return display_preferences_path().with_name("keyboard_settings.json")
+
+
+def default_keyboard_preferences():
+    return {"bindings": [[*row[:4], list(row[4])] for row in DEFAULT_PLAYER_CONTROLS],
+            "auto_fire": [False] * 4}
+
+
+def validate_keyboard_preferences(data):
+    """Reject an invalid mapping as a whole; never let two pilots share a key."""
+    if not isinstance(data, dict):
+        return None
+    rows, auto_fire = data.get("bindings"), data.get("auto_fire")
+    if (not isinstance(rows, list) or len(rows) != 4
+            or not isinstance(auto_fire, list) or len(auto_fire) != 4
+            or any(type(value) is not bool for value in auto_fire)):
+        return None
+    allowed = {value for name, value in vars(pygame).items()
+               if name.startswith("K_") and type(value) is int and value != pygame.K_UNKNOWN}
+    seen, result = set(), []
+    for row in rows:
+        if (not isinstance(row, list) or len(row) != 5
+                or not isinstance(row[4], list) or not 1 <= len(row[4]) <= 8):
+            return None
+        keys = [*row[:4], *row[4]]
+        if any(type(key) is not int or key not in allowed or key in KEYBOARD_RESERVED_KEYS
+               or key in seen for key in keys) or len(keys) != len(set(keys)):
+            return None
+        seen.update(keys)
+        result.append([*row[:4], list(row[4])])
+    return {"bindings": result, "auto_fire": list(auto_fire)}
+
+
+def load_keyboard_preferences(filename=None):
+    filename = keyboard_preferences_path() if filename is None else Path(filename)
+    try:
+        if filename.exists() and filename.stat().st_size <= 8192:
+            validated = validate_keyboard_preferences(json.loads(filename.read_text(encoding="utf-8")))
+            if validated is not None:
+                return validated
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    return default_keyboard_preferences()
+
+
+def apply_keyboard_preferences(preferences):
+    global PLAYER_CONTROLS, PLAYER_AUTOFIRE
+    PLAYER_CONTROLS = tuple((*row[:4], tuple(row[4])) for row in preferences["bindings"])
+    PLAYER_AUTOFIRE = tuple(preferences["auto_fire"])
+
+
+def control_key_label(key):
+    names = {pygame.K_LEFT: "LEFT", pygame.K_RIGHT: "RIGHT", pygame.K_UP: "UP",
+             pygame.K_DOWN: "DOWN", pygame.K_LSHIFT: "L SHIFT", pygame.K_RSHIFT: "R SHIFT",
+             pygame.K_LCTRL: "L CTRL", pygame.K_RCTRL: "R CTRL",
+             pygame.K_KP_ENTER: "NUM ENTER", pygame.K_SEMICOLON: ";"}
+    return names.get(key, pygame.key.name(key).upper().replace("[", "NUM ").replace("]", ""))
+
+
+def player_control_labels(index):
+    left, right, up, down, fire = PLAYER_CONTROLS[index]
+    movement = " / ".join(control_key_label(key) for key in (up, left, down, right))
+    firing = " / ".join(control_key_label(key) for key in fire)
+    if PLAYER_AUTOFIRE[index]:
+        firing = "AUTO FIRE ON"
+    return movement, firing
+
+
+@ui_layout
+def keyboard_controls_layout():
+    panel = pygame.Rect(0, 0, min(700, SCREEN_WIDTH - 24), min(400, SCREEN_HEIGHT - 24))
+    panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+    gap = 10
+    inner = panel.width - 32
+    tabs = [pygame.Rect(panel.x + 16 + index * ((inner + gap) // 4), panel.y + 43,
+                        (inner - gap * 3) // 4, 28) for index in range(4)]
+    width = (inner - gap) // 2
+    cells = [pygame.Rect(panel.x + 16 + index % 2 * (width + gap),
+                         panel.y + 84 + index // 2 * 40, width, 32) for index in range(6)]
+    footer_y = panel.y + 214
+    return {"panel": panel, "tabs": tabs, "actions": cells[:5], "auto_fire": cells[5],
+            "reset": pygame.Rect(panel.x + 16, footer_y, width, 32),
+            "done": pygame.Rect(panel.x + 16 + width + gap, footer_y, width, 32),
+            "help": pygame.Rect(panel.x + 16, panel.y + 258, inner, 19),
+            "status": pygame.Rect(panel.x + 16, panel.y + 280, inner, 19),
+            "held": pygame.Rect(panel.x + 16, panel.y + 302, inner, 19)}
+
+
+class KeyboardControls:
+    """Remap received keys and test rollover; hardware omissions stay unrecoverable."""
+
+    def __init__(self, settings_file=None):
+        self.settings_file = keyboard_preferences_path() if settings_file is None else Path(settings_file)
+        self.preferences = load_keyboard_preferences(self.settings_file)
+        self.player = 0
+        self.waiting_action = None
+        self.held = set()
+        self.status = "Click an action, then press a key. Escape cancels a change."
+        apply_keyboard_preferences(self.preferences)
+
+    def begin(self):
+        self.held.clear()
+        self.waiting_action = None
+        self.status = "Click an action, then press a key. Escape cancels a change."
+
+    def _save(self):
+        apply_keyboard_preferences(self.preferences)
+        # The shared atomic JSON writer does not touch any run-save files.
+        if not save_display_preferences(self.preferences, self.settings_file):
+            self.status = "Controls apply now; the settings file could not be saved."
+            return False
+        return True
+
+    def bind(self, action, key):
+        if type(action) is not int or not 0 <= action < 5:
+            return False
+        if key in KEYBOARD_RESERVED_KEYS:
+            self.status = "That key is reserved for menus or display controls."
+            return False
+        candidate = {"bindings": [[*row[:4], list(row[4])] for row in self.preferences["bindings"]],
+                     "auto_fire": list(self.preferences["auto_fire"])}
+        for player, row in enumerate(candidate["bindings"]):
+            for other_action, keys in enumerate((*[(value,) for value in row[:4]], tuple(row[4]))):
+                if key in keys and (player != self.player or other_action != action):
+                    self.status = f"{control_key_label(key)} is already P{player + 1} {KEYBOARD_ACTIONS[other_action]}."
+                    return False
+        candidate["bindings"][self.player][action] = [key] if action == 4 else key
+        if validate_keyboard_preferences(candidate) is None:
+            self.status = "That key cannot be used. Try a different key."
+            return False
+        self.preferences = candidate
+        self.status = f"P{self.player + 1} {KEYBOARD_ACTIONS[action]} is now {control_key_label(key)}."
+        self._save()
+        return True
+
+    def process_event(self, event):
+        """Consume modal input; return True when the modal should close."""
+        if event.type in (pygame.WINDOWFOCUSLOST,):
+            self.held.clear()
+        elif event.type == pygame.KEYUP:
+            self.held.discard(event.key)
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_F9:
+                return True
+            if event.key == pygame.K_ESCAPE:
+                if self.waiting_action is None:
+                    return True
+                self.waiting_action = None
+                self.status = "Change canceled. Previous controls kept."
+            else:
+                self.held.add(event.key)
+                if self.waiting_action is not None and not getattr(event, "repeat", False):
+                    if self.bind(self.waiting_action, event.key):
+                        self.waiting_action = None
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            layout = keyboard_controls_layout()
+            for index, tab in enumerate(layout["tabs"]):
+                if tab.collidepoint(event.pos):
+                    self.player, self.waiting_action = index, None
+                    return False
+            for index, rect in enumerate(layout["actions"]):
+                if rect.collidepoint(event.pos):
+                    self.waiting_action = index
+                    self.status = f"Press a key for P{self.player + 1} {KEYBOARD_ACTIONS[index]}."
+                    return False
+            if layout["auto_fire"].collidepoint(event.pos):
+                self.waiting_action = None
+                self.preferences["auto_fire"][self.player] = not self.preferences["auto_fire"][self.player]
+                self.status = "Auto-fire reduces the number of keys held during a fight."
+                self._save()
+            elif layout["reset"].collidepoint(event.pos):
+                self.preferences = default_keyboard_preferences()
+                self.waiting_action = None
+                self.status = "Default controls restored for all four pilots."
+                self._save()
+            elif layout["done"].collidepoint(event.pos):
+                return True
+        return False
+
+    def draw(self, screen, font, small_font):
+        with ui_dimensions(screen.get_size()):
+            self._draw(screen, font, small_font)
+
+    def _draw(self, screen, font, small_font):
+        overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+        overlay.fill((2, 4, 15, 225))
+        screen.blit(overlay, (0, 0))
+        layout = keyboard_controls_layout()
+        panel = layout["panel"]
+        color = PLAYER_COLORS[self.player]
+        draw_neon_panel(screen, panel, color)
+        draw_fitted_text(screen, "KEYBOARD CONTROLS / F9", font, color,
+                         pygame.Rect(panel.x + 16, panel.y + 10, panel.width - 32, 25))
+        for index, rect in enumerate(layout["tabs"]):
+            draw_neon_button(screen, rect, f"P{index + 1}", small_font, PLAYER_COLORS[index],
+                             selected=index == self.player)
+        for action, rect in enumerate(layout["actions"]):
+            keys = self.preferences["bindings"][self.player][action]
+            label = " / ".join(control_key_label(key) for key in keys) if action == 4 else control_key_label(keys)
+            if self.waiting_action == action:
+                label = "PRESS A KEY..."
+            draw_neon_button(screen, rect, f"{KEYBOARD_ACTIONS[action]}: {label}", small_font, color,
+                             selected=self.waiting_action == action)
+        auto = "ON" if self.preferences["auto_fire"][self.player] else "OFF"
+        draw_neon_button(screen, layout["auto_fire"], f"AUTO-FIRE: {auto}", small_font, UI_MINT)
+        draw_neon_button(screen, layout["reset"], "RESTORE ALL DEFAULTS", small_font, UI_GOLD)
+        draw_neon_button(screen, layout["done"], "DONE", small_font, UI_CYAN)
+        draw_fitted_text(screen, "Missing held keys? Try Auto-fire or remap. Keyboard hardware limits still apply.",
+                         small_font, UI_MUTED, layout["help"])
+        draw_fitted_text(screen, self.status, small_font, UI_TEXT, layout["status"])
+        held = " / ".join(control_key_label(key) for key in sorted(self.held)) or "none"
+        draw_fitted_text(screen, f"RECEIVED KEYS ({len(self.held)}): {held}", small_font, UI_MINT,
+                         layout["held"])
 
 # Transition Constants
 TRANSITION_DURATION = 120  # 2 seconds at 60 FPS
@@ -574,6 +847,95 @@ BOSS_ART = [
     "X X   X X"
 ]
 
+# Campaign landmarks have their own hulls rather than scaled regular-boss art.
+# Silhouettes remain inside the single physical collision body; decorative
+# rings and fins below never become invisible extra hitboxes.
+MILESTONE_BOSSES = {
+    25: {
+        "kind": "bulwark", "name": "IRON CITADEL",
+        "reward": "rapid_fire",
+        "subtitle": "ARMORED QUARTER GUARDIAN", "color": UI_GOLD,
+        "hp_multiplier": 1.25, "size": (126, 82),
+        "art": (
+            " XX             XX ",
+            "XXXX  XXXXXXX  XXXX",
+            "XXXXXXXXXXXXXXXXXXX",
+            "XXX XX XXXXX XX XXX",
+            "XXX XX XXXXX XX XXX",
+            "XXXXXXXXXXXXXXXXXXX",
+            " XXX  X  X  X  XXX ",
+            "  XX  XXXXXXX  XX  ",
+            "  XX   XXXXX   XX  ",
+            "       X X X       ",
+        ),
+    },
+    50: {
+        "kind": "helix", "name": "HELIX MATRIARCH",
+        "reward": "homing",
+        "subtitle": "TWIN-SPIRAL QUARTER GUARDIAN", "color": UI_MINT,
+        "hp_multiplier": 1.30, "size": (136, 94),
+        "art": (
+            "  XX           XX  ",
+            " XXX   XXXXX   XXX ",
+            "XXXX  XXXXXXX  XXXX",
+            " XXX XXXXXXXX XXX  ",
+            "  XXXXXXXXXXXXXXX  ",
+            "   XXX XX XX XXX   ",
+            "  XXXX XXXXX XXXX  ",
+            " XXX  XXXXXXX  XXX ",
+            " XX    XXXXX    XX ",
+            "  X  XXX   XXX  X  ",
+            "     XX     XX     ",
+        ),
+    },
+    75: {
+        "kind": "tempest", "name": "TEMPEST ARCHON",
+        "reward": "bullet_time",
+        "subtitle": "STORM QUARTER GUARDIAN", "color": UI_CYAN,
+        "hp_multiplier": 1.35, "size": (148, 102),
+        "art": (
+            "X        X        X",
+            "XX      XXX      XX",
+            " XXX   XXXXX   XXX ",
+            " XXXXX XXXXX XXXXX ",
+            "  XXXXXXXXXXXXXXX  ",
+            " XXXX XX XX XX XXXX",
+            "XXX  XXXXXXXXX  XXX",
+            "XX    XXXXXXX    XX",
+            "X   XXX XXX XXX   X",
+            "     XX  X  XX     ",
+            "      X     X      ",
+        ),
+    },
+    100: {
+        "kind": "eclipse", "name": "ECLIPSE SOVEREIGN",
+        "reward": "emergency_warp",
+        "subtitle": "FINAL BOSS", "color": UI_PINK,
+        "hp_multiplier": 1.50, "size": (190, 126),
+        "art": (
+            "   XX     XXX     XX   ",
+            "  XXXX   XXXXX   XXXX  ",
+            " XXX XXXXXXXXXXXXX XXX ",
+            "XXX XXXXXXXXXXXXXXX XXX",
+            "XX XXX   XXXXX   XXX XX",
+            "XXXXX  XX XXX XX  XXXXX",
+            "XXXX  XXX XXX XXX  XXXX",
+            "XXXXX  XX XXX XX  XXXXX",
+            "XX XXX   XXXXX   XXX XX",
+            "XXX XXXXXXXXXXXXXXX XXX",
+            " XXX XXXXXXXXXXXXX XXX ",
+            "  XXXX  XXXXXXX  XXXX  ",
+            "   XX  XXX X XXX  XX   ",
+            "       XX  X  XX       ",
+        ),
+    },
+}
+
+
+def milestone_boss_profile(round_num):
+    """Only the four campaign landmarks receive unique single-boss encounters."""
+    return MILESTONE_BOSSES.get(round_num)
+
 # Lookup lists for individual enemy visual randomization
 STANDARD_VARIATIONS = [
     {"color": (91, 242, 169), "art": STANDARD_ART_V1},
@@ -631,6 +993,12 @@ VISUAL_VARIATIONS = {
     "phantom": enemy_color_variants(PHANTOM_ART, (195, 171, 255), (139, 211, 255), (247, 164, 220)),
 }
 
+VISUAL_VARIATIONS.update({
+    profile["name"].lower().replace(" ", "_"): [
+        {"color": profile["color"], "art": profile["art"]}]
+    for profile in MILESTONE_BOSSES.values()
+})
+
 ENEMY_JOURNAL = (
     ("Standard", "Basic enemy that travels with the formation."),
     ("Shooter", "Periodically fires straight downward shots."),
@@ -664,7 +1032,11 @@ ENEMY_JOURNAL = (
     ("Orbit", "Sweeps in broad arcs while moving across the screen."),
     ("Scatterer", "Fires a wide spread of shots to cover more space."),
     ("Phantom", "Fires a wavering projectile that sways as it travels."),
-    ("Boss", "Appears every fifth wave with changing attacks. Later encounters can pair two bosses."),
+    ("Boss", "One boss appears every fifth wave. Waves 25, 50 and 75 feature stronger quarter guardians; wave 100 has a unique final boss."),
+    ("Iron Citadel", "Wave 25: marked Iron Gate openings and split Hammer Fans. Defeat grants every pilot Rapid Fire automatically."),
+    ("Helix Matriarch", "Wave 50: mirrored wing ribbons and rotating Prism Blooms. Defeat grants every pilot Homing Shots automatically."),
+    ("Tempest Archon", "Wave 75: warned changing Storm Channels and outward Crosswind rain. Defeat grants every pilot Bullet Time automatically."),
+    ("Eclipse Sovereign", "Wave 100 final boss: gates and Corona escalate into lances and Horizon rain. Defeat grants every pilot Emergency Warp automatically."),
 )
 ENEMY_MUTATIONS = (
     (
@@ -851,7 +1223,7 @@ POWERUP_JOURNAL = (
     ("homing", "Normal shots and bombs steer toward foes; lasers add a weaker guided arc while keeping their main beam. Extends Lightning's reach."),
     ("lightning", f"Main shots, bombs and laser pulses arc for reduced damage. First hop needs a foe in range; later chances are {', '.join(f'{chance:.0%}' for chance in LIGHTNING_HOP_CHANCES[1:])}. Up to {1 + len(LIGHTNING_HOP_CHANCES)} foes total. Homing extends reach."),
     ("score_boost", "Doubles the score you earn from defeating enemies while active."),
-    ("cryo", f"Hits slow foes for {CRYO_SLOW_MS // 1000}s. Credited kills grant Shatter: +{SHATTER_SPEED_PER_STACK:g} speed and +{SHATTER_FIRE_PER_STACK:.0%} fire per stack, max {SHATTER_MAX_STACKS}. Stronger per stack, weaker at max than Momentum; bonuses do not add."),
+    ("cryo", f"Hits slow regular foes 65% and bosses 25% for {CRYO_SLOW_MS // 1000}s. Kills grant Shatter: +{SHATTER_SPEED_PER_STACK:g} speed and +{SHATTER_FIRE_PER_STACK:.0%} fire per stack, max {SHATTER_MAX_STACKS}. Below full Momentum; bonuses do not add."),
     ("orbit_drones", f"Two helpers fire for {POWERUP_DURATIONS['orbit_drones'] // 1000}s. Shots match your weapon's base damage plus Damage Up, without blasts, heavy one-shot bonuses or fire-rate buffs."),
     ("supply_beacon", "Stores eight credited-kill charges. Ordinary kills get better drop odds; boss kills spend a charge too. Drop limits still apply."),
     ("gravity_well", f"A {POWERUP_DURATIONS['gravity_well'] // 1000}-second, {GRAVITY_FIELD_RADIUS}-pixel field gently bends nearby moving hostile shots away. Boss lasers stay fixed."),
@@ -1716,6 +2088,68 @@ def draw_animated_enemy(screen, enemy):
     if warp:
         for center in (rect.center, enemy.get("animation_warp_origin", rect.center)):
             pygame.draw.circle(screen, UI_CYAN, center, 6 + (16 - warp) * 2, 2)
+    if enemy.get("milestone_kind"):
+        draw_milestone_boss_hull(screen, enemy, tick)
+
+
+def draw_milestone_boss_hull(screen, enemy, tick):
+    """Distinct landmark hulls use a bounded number of pure geometric accents."""
+    rect = enemy["rect"]
+    x, y = rect.center
+    color = enemy["color"]
+    pulse = (1 + math.sin(tick / 11)) / 2
+    light = blend_color(color, UI_TEXT, .32 + pulse * .34)
+    core = max(5, rect.height // 10)
+    kind = enemy["milestone_kind"]
+    if kind == "bulwark":
+        # Four armor pylons flank a furnace aperture; no shield/invulnerability.
+        for side in (-1, 1):
+            for level in (-1, 1):
+                anchor = (x + side * (rect.width // 2 - 6), y + level * rect.height // 4)
+                end = (anchor[0] + side * 9, anchor[1] + level * 5)
+                pygame.draw.line(screen, color, anchor, end, 3)
+                pygame.draw.circle(screen, light, end, 3)
+        aperture = pygame.Rect(x - core, y - core, core * 2, core * 2)
+        pygame.draw.rect(screen, UI_BG, aperture.inflate(5, 5), border_radius=3)
+        pygame.draw.rect(screen, light, aperture, 2, border_radius=2)
+        pygame.draw.line(screen, light, (x - core + 3, y), (x + core - 3, y), 2)
+    elif kind == "helix":
+        # Two opposed, counter-rotating strands give this organic hull its name.
+        ellipse = rect.inflate(16, 8)
+        pygame.draw.ellipse(screen, blend_color(color, UI_BG, .35), ellipse, 1)
+        for index in range(4):
+            angle = tick / 38 * (1 if index % 2 == 0 else -1) + index * math.pi / 2
+            node = (round(x + math.cos(angle) * ellipse.width / 2),
+                    round(y + math.sin(angle) * ellipse.height / 2))
+            pygame.draw.circle(screen, light if index % 2 else color, node, 3)
+        pygame.draw.circle(screen, UI_BG, (x, y), core + 3)
+        pygame.draw.circle(screen, light, (x, y), core, 2)
+    elif kind == "tempest":
+        # Angular turbine fins and short charged traces stay close to the hull.
+        for side in (-1, 1):
+            points = [(x + side * rect.width // 4, y - rect.height // 5),
+                      (x + side * (rect.width // 2 + 8), y),
+                      (x + side * (rect.width // 2 - 4), y + 5),
+                      (x + side * (rect.width // 2 + 3), y + rect.height // 4)]
+            pygame.draw.lines(screen, light, False, points, 2)
+        diamond = ((x, y - core - 3), (x + core, y),
+                   (x, y + core + 3), (x - core, y))
+        pygame.draw.polygon(screen, UI_BG, diamond)
+        pygame.draw.polygon(screen, light, diamond, 2)
+    elif kind == "eclipse":
+        # A broken orbital crown surrounds a dark, pulsating central eclipse.
+        crown = pygame.Rect(0, 0, rect.width - 12, rect.height + 22)
+        crown.center = rect.center
+        angle = tick / 90
+        for index in range(3):
+            start = angle + index * math.tau / 3
+            pygame.draw.arc(screen, light, crown, start, start + 1.5, 2)
+            node = (round(x + math.cos(start) * crown.width / 2),
+                    round(y - math.sin(start) * crown.height / 2))
+            pygame.draw.circle(screen, color, node, 3)
+        pygame.draw.circle(screen, UI_BG, (x, y), core + 5)
+        pygame.draw.circle(screen, light, (x, y), core + 5, 2)
+        pygame.draw.circle(screen, color, (x, y), core + 9, 1)
 
 
 def enemy_animation_style(enemy_type):
@@ -1912,9 +2346,9 @@ def update_and_draw_particles(screen, particles, advance=True):
 
 def create_bosses(round_num):
     enemies = []
-    # Later paired encounters share a projectile cap and stagger their volleys;
-    # their combined health is tuned separately from a single boss.
-    boss_count = 2 if round_num >= 40 and round_num % 20 == 0 else 1
+    milestone = milestone_boss_profile(round_num)
+    # Every encounter has one opponent, including the four unique guardians.
+    boss_count = 1
     progress = boss_difficulty_progress(round_num)
     tier = enemy_health_tier(round_num)
     solo_boss_hp = round((140 + 210 * progress + 40 * progress ** 2) * 1.12)
@@ -1922,10 +2356,14 @@ def create_bosses(round_num):
     # projectile ceiling or shortening the laser's reaction window.
     solo_boss_hp += round(2.5 * max(0, round_num - MAX_CAMPAIGN_ROUND))
     hp_per_boss = scale_enemy_health(round(solo_boss_hp * (0.61 if boss_count > 1 else 1.0)))
+    if milestone is not None:
+        hp_per_boss = round(hp_per_boss * milestone["hp_multiplier"])
 
     scale_multiplier = 2.5 if boss_count == 1 else 1.8
     b_width = int(ENEMY_WIDTH * scale_multiplier)
     b_height = int(ENEMY_HEIGHT * scale_multiplier)
+    if milestone is not None:
+        b_width, b_height = milestone["size"]
 
     spacing = SCREEN_WIDTH // (boss_count + 1)
     attack_level = max(1, round_num // 5)
@@ -1946,8 +2384,9 @@ def create_bosses(round_num):
             weights=[BOSS_ATTACKS[pattern][1] for pattern in unlocked_patterns],
             k=1,
         )[0]
-        boss_color = BOSS_ATTACKS[attack_pattern][0]
-        sprite = generate_pixel_sprite(BOSS_ART, boss_color, b_width, b_height)
+        boss_color = milestone["color"] if milestone is not None else BOSS_ATTACKS[attack_pattern][0]
+        boss_art = milestone["art"] if milestone is not None else BOSS_ART
+        sprite = generate_pixel_sprite(boss_art, boss_color, b_width, b_height)
 
         boss_data = {
             "type": "boss",
@@ -1973,7 +2412,11 @@ def create_bosses(round_num):
             "max_hp": hp_per_boss,
             "speed_mult": 1.5,
         }
-        attach_ship_animation(boss_data, BOSS_ART, boss_color, b_width, b_height, "heavy")
+        if milestone is not None:
+            boss_data.update(milestone_kind=milestone["kind"], boss_name=milestone["name"],
+                             boss_subtitle=milestone["subtitle"], milestone_wave=round_num,
+                             signature_index=0, signature_warning=None)
+        attach_ship_animation(boss_data, boss_art, boss_color, b_width, b_height, "heavy")
         enemies.append(boss_data)
 
     return enemies
@@ -2056,12 +2499,17 @@ def sector_start_round(round_num):
 
 
 def enemy_health_tier(round_num):
-    """Enemy HP upgrades every TWENTY waves, independent of checkpoints."""
-    return (max(1, int(round_num)) - 1) // WAVES_PER_HEALTH_TIER + 1
+    """Base health through wave 50, then one permanent increase from wave 51."""
+    return 2 if int(round_num) >= ENEMY_HEALTH_INCREASE_WAVE else 1
+
+
+def enemy_combat_tier(round_num):
+    """Keep existing firing and aiming progression separate from health."""
+    return (max(1, int(round_num)) - 1) // WAVES_PER_COMBAT_TIER + 1
 
 
 def health_tier_bonus(enemy_type, round_num):
-    """Only non-fragile types gain extra HP at 20-wave boundaries."""
+    """Non-fragile types receive at most one health-tier bonus, after wave 50."""
     if enemy_type in HEALTH_SCALING_EXEMPT_TYPES:
         return 0
     return enemy_health_tier(round_num) - 1
@@ -2164,7 +2612,7 @@ def create_enemies(round_num, infinite_mode=False):
                 2 if type_key in ("splitter", "warden", "artillery") else
                 2 if mutation == "armored" else 1
             )
-            # Every 20 waves, sturdy enemies gain HP, but nimble/fragile
+            # Once after wave 50, sturdy enemies gain HP, but nimble/fragile
             # archetypes remain quick kills even in late sectors.
             enemy_hp += health_tier_bonus(type_key, round_num)
             enemy_hp = scale_enemy_health(enemy_hp)
@@ -2255,7 +2703,8 @@ def move_enemy_down(enemy, distance):
 def enemy_cryo_multiplier(enemy, now=None):
     now = pygame.time.get_ticks() if now is None else now
     if enemy.get("cryo_slow_until", 0) > now:
-        return 0.85 if enemy.get("is_boss", False) else 0.60
+        return (FROSTBITE_BOSS_SPEED_MULTIPLIER if enemy.get("is_boss", False)
+                else FROSTBITE_ENEMY_SPEED_MULTIPLIER)
     return 1.0
 
 
@@ -2580,7 +3029,7 @@ def predicted_boss_targets(players, fallback_targets, round_num):
     Aim prediction is capped so reversing direction or passing through a gap
     remains a viable dodge. It gets a little smarter at later boss waves.
     """
-    lead_frames = min(14, 6 + 2 * (enemy_health_tier(round_num) - 1))
+    lead_frames = min(14, 6 + 2 * (enemy_combat_tier(round_num) - 1))
     positions = []
     for player in players:
         if player.get("eliminated") or player.get("respawn_until", 0) > 0:
@@ -2642,6 +3091,185 @@ def fire_boss_burst(enemy, enemy_bullets, target_positions, max_bullets, encount
         if other is not enemy and other.get("is_boss"):
             other["attack_cooldown"] = max(other["attack_cooldown"],
                                            BOSS_ENCOUNTER_RECOVERY_FRAMES)
+
+
+def milestone_boss_phase(enemy):
+    """Three readable stages, with the same full warning window in every stage."""
+    fraction = enemy["hp"] / max(1, enemy["max_hp"])
+    return 3 if fraction <= .35 else 2 if fraction <= .65 else 1
+
+
+def plan_milestone_attack(enemy):
+    """Commit the whole signature before its tell; no tracking or surprise aim."""
+    kind = enemy["milestone_kind"]
+    phase = milestone_boss_phase(enemy)
+    cursor = enemy.get("signature_index", 0)
+    color = enemy["color"]
+    origin_x, origin_y = enemy["rect"].midbottom
+    shots, beams = [], []
+    safe_gap = None
+    cycles = {"bulwark": ("gates", "hammer"),
+              "helix": ("helix", "bloom"),
+              "tempest": ("channels", "crosswind"),
+              "eclipse": ("eclipse_gates", "corona", "lances", "horizon")}
+    options = cycles[kind]
+    if kind == "eclipse":
+        options = options[:phase + 1]
+    pattern = options[cursor % len(options)]
+    names = {"gates": "IRON GATES", "hammer": "HAMMER FAN",
+             "helix": "DOUBLE HELIX", "bloom": "PRISM BLOOM",
+             "channels": "STORM CHANNELS", "crosswind": "CROSSWIND",
+             "eclipse_gates": "ECLIPSE GATES", "corona": "SOLAR CORONA",
+             "lances": "SINGULARITY LANCES", "horizon": "EVENT HORIZON"}
+
+    if pattern in ("gates", "eclipse_gates"):
+        # A broad wall has one deliberate, generous opening. Alternate its
+        # position between volleys; the displayed gate never moves during a tell.
+        gate_fraction = (.28, .72, .5)[(cursor // 2) % 3]
+        gap_width = 220 if kind == "bulwark" else 200
+        safe_gap = pygame.Rect(round(SCREEN_WIDTH * gate_fraction - gap_width / 2),
+                               origin_y, gap_width, SCREEN_HEIGHT - origin_y)
+        count = 18 if kind == "bulwark" else 22
+        for index in range(count):
+            x = 36 + index * (SCREEN_WIDTH - 72) / (count - 1)
+            if safe_gap.left - 16 <= x <= safe_gap.right + 16:
+                continue
+            shots.append((x, origin_y, 0, 4.5 + .2 * phase, 18, color))
+    elif pattern == "hammer":
+        # Wide heavy arcs, with a central corridor instead of an aimed burst.
+        for index in range(12):
+            angle = -1.0 + 2.0 * index / 11
+            if abs(angle) < .22:
+                continue
+            speed = 4.3 + .15 * phase
+            shots.append((origin_x, origin_y, math.sin(angle) * speed,
+                          math.cos(angle) * speed, 23, color))
+    elif pattern == "helix":
+        # Two mirrored ribbons originate at the visible wing beacons. Their
+        # headings alternate between cycles, and remain fixed after launch.
+        tilt = .12 if (cursor // 2) % 2 else -.12
+        for side in (-1, 1):
+            x = max(30, min(SCREEN_WIDTH - 30,
+                           origin_x + side * enemy["rect"].width * .48))
+            for index in range(6):
+                angle = -.78 + 1.56 * index / 5 + side * tilt
+                speed = 4.5 + .15 * phase
+                shots.append((x, origin_y, math.sin(angle) * speed,
+                              math.cos(angle) * speed, 12, color))
+    elif pattern in ("bloom", "corona"):
+        count = 16 if pattern == "bloom" else 22
+        rotation = (cursor // 2) * .19
+        for index in range(count):
+            angle = math.tau * index / count + rotation
+            speed = (4.0 if pattern == "bloom" else 4.5) + .15 * phase
+            shots.append((origin_x, origin_y, math.cos(angle) * speed,
+                          math.sin(angle) * speed, 12, color))
+    elif pattern in ("channels", "lances"):
+        if pattern == "channels":
+            # Alternate the middle and edge lanes, with the same full warning.
+            # Neither central parking nor a permanent corner solves the fight.
+            channel_sets = ((.3, .7), (.18, .5), (.025, .975), (.5, .82))
+            fractions = channel_sets[(cursor // 2) % len(channel_sets)]
+        else:
+            fractions = (.18, .5, .82)
+        width = (64 if pattern == "channels" else 58) + 4 * (phase - 1)
+        shift = (0 if pattern == "channels" else
+                 .045 * SCREEN_WIDTH * (1 if (cursor // 2) % 2 else -1))
+        for fraction in fractions:
+            x = max(8, min(SCREEN_WIDTH - width - 8,
+                           round(SCREEN_WIDTH * fraction + shift - width / 2)))
+            beams.append(pygame.Rect(x, origin_y, width, SCREEN_HEIGHT - origin_y))
+    else:
+        count = 12 if pattern == "crosswind" else 16
+        direction = 1 if (cursor // 2) % 2 else -1
+        for index in range(count):
+            x = 60 + index * (SCREEN_WIDTH - 120) / (count - 1)
+            # Each half follows one wind direction; this opens a large middle
+            # channel rather than filling every lane with converging bullets.
+            side = -1 if x < SCREEN_WIDTH / 2 else 1
+            dx = side * (1.15 if pattern == "crosswind" else 1.5)
+            if direction > 0:
+                dx *= .7
+            shots.append((x, origin_y, dx, 4.4 + .15 * phase, 14, color))
+
+    return {"name": names[pattern], "pattern": pattern, "shots": shots,
+            "beams": beams, "safe_gap": safe_gap,
+            "remaining_frames": BOSS_LASER_WARNING_FRAMES,
+            "warning_frames": BOSS_LASER_WARNING_FRAMES, "phase": phase}
+
+
+def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets):
+    """One fully telegraphed signature at a time, within the ordinary cap."""
+    warning = enemy.get("signature_warning")
+    if warning is not None:
+        warning["remaining_frames"] -= 1
+        if warning["remaining_frames"] > 0:
+            return
+        available = max(0, max_bullets - len(enemy_bullets))
+        # Never release half a planned wall and change its announced geometry.
+        required = len(warning["shots"]) + len(warning["beams"])
+        if required > available:
+            warning["remaining_frames"] = 1
+            return
+        animate_ship_fire(enemy)
+        for x, y, dx, dy, size, color in warning["shots"]:
+            projectile = create_enemy_projectile(x, y, dx, dy, size, color)
+            projectile["milestone_signature"] = warning["pattern"]
+            enemy_bullets.append(projectile)
+        for rect in warning["beams"]:
+            enemy_bullets.append({"rect": rect.copy(), "dx": 0, "dy": 0,
+                                  "color": enemy["color"], "laser_state": "active",
+                                  "remaining_frames": BOSS_LASER_ACTIVE_FRAMES + 1,
+                                  "milestone_signature": warning["pattern"]})
+        enemy["signature_warning"] = None
+        enemy["signature_index"] = enemy.get("signature_index", 0) + 1
+        enemy["attack_cooldown"] = max(96, 156 - warning["phase"] * 15
+                                       - (12 if enemy["milestone_kind"] == "eclipse" else 0))
+        return
+    # The beam and its escape lanes finish before the next warning can begin.
+    if any(shot.get("laser_state") for shot in enemy_bullets):
+        return
+    enemy["attack_cooldown"] -= 1
+    if enemy["attack_cooldown"] > 0:
+        return
+    # Let previous waves disperse. There is no extra aimed/homing stream hiding
+    # behind the signature, even during the final boss's last phase.
+    if len(enemy_bullets) > max_bullets // 3:
+        enemy["attack_cooldown"] = 15
+        return
+    warning = plan_milestone_attack(enemy)
+    enemy["signature_warning"] = warning
+    enemy["attack_pattern"] = warning["pattern"]
+    enemy["last_attack_pattern"] = warning["pattern"]
+
+
+def draw_milestone_attack_warning(screen, enemy):
+    """Pure, lightweight tells use the exact committed launch geometry."""
+    warning = enemy.get("signature_warning")
+    if warning is None:
+        return
+    color = enemy["color"]
+    elapsed = warning["warning_frames"] - warning["remaining_frames"]
+    bright = blend_color(color, UI_TEXT, .3 + .2 * math.sin(elapsed * .2))
+    for rect in warning["beams"]:
+        pygame.draw.rect(screen, color, rect, 2)
+        pygame.draw.line(screen, bright, rect.midtop, rect.midbottom, 1)
+        for y in range(rect.top + (elapsed * 2) % 32, rect.bottom, 32):
+            pygame.draw.line(screen, color, (rect.left + 3, y),
+                             (rect.right - 3, min(rect.bottom, y + 12)), 1)
+    safe_gap = warning["safe_gap"]
+    if safe_gap is not None:
+        pygame.draw.line(screen, UI_MINT, safe_gap.topleft, safe_gap.bottomleft, 2)
+        pygame.draw.line(screen, UI_MINT, safe_gap.topright, safe_gap.bottomright, 2)
+    for x, y, dx, dy, size, _ in warning["shots"]:
+        speed = max(.01, math.hypot(dx, dy))
+        end = (round(x + dx / speed * 90), round(y + dy / speed * 90))
+        pygame.draw.circle(screen, color, (round(x), round(y)), max(4, size // 2), 1)
+        pygame.draw.line(screen, bright, (round(x), round(y)), end, 1)
+    label = hud_font(22).render(warning["name"], True, bright)
+    label_rect = label.get_rect(midtop=(SCREEN_WIDTH // 2,
+                                       max(110, enemy["rect"].bottom + 24)))
+    screen.blit(label, label_rect)
 
 
 def choose_powerup_type():
@@ -2969,8 +3597,8 @@ def enemy_fire_probability(enemy_type, round_num, player_count):
         "ricochet": .0026, "prism": .0015, "pulse": .0013,
         "charger": .0030, "scatterer": .0014, "phantom": .0022,
     }.get(enemy_type, .0030)
-    # Ordinary firing chances rise gently with each 20-wave health tier.
-    sector_factor = min(1.15, .94 + .025 * (enemy_health_tier(round_num) - 1))
+    # Firing progression is independent of the single health increase.
+    sector_factor = min(1.15, .94 + .025 * (enemy_combat_tier(round_num) - 1))
     coop_factor = 1 + .12 * max(0, min(4, player_count) - 1)
     pressure_factor = .65 if enemy_type in AIMED_ENEMY_TYPES else .80
     return min(.012, base * 1.55 * sector_factor * coop_factor * pressure_factor)
@@ -3044,6 +3672,9 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
             continue
 
         if enemy.get("is_boss", False):
+            if enemy.get("milestone_kind"):
+                update_milestone_boss_attack(enemy, enemy_bullets, max_bullets)
+                continue
             # One boss owns the current volley. Beams reserve their entire
             # warning/active window so a partner cannot hide the escape route.
             if (any(shot.get("laser_state") for shot in enemy_bullets)
@@ -3077,7 +3708,7 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
             pattern = random.choices(
                 available_patterns,
                 weights=[BOSS_ATTACKS[name][1] * (1.10 if
-                         enemy_health_tier(round_num) >= 4 and name in
+                         enemy_combat_tier(round_num) >= 4 and name in
                          ("aimed", "fan", "crossfire", "pincer", "triple_burst", "triad", "sniper")
                          else 1.0) for name in available_patterns],
                 k=1,
@@ -3750,8 +4381,10 @@ def update_player_projectiles(keys, players, player_count, player_bullets, enemi
         else:
             pending_reflections.clear()
         shoot_keys = PLAYER_CONTROLS[player["number"] - 1][4]
-        fire_pressed = is_active and (keys.fire_requested(shoot_keys, now)
-            if isinstance(keys, HeldInput) else any(keys[key] for key in shoot_keys))
+        auto_fire = PLAYER_AUTOFIRE[player["number"] - 1] and (
+            not isinstance(keys, HeldInput) or keys.focused)
+        fire_pressed = is_active and (auto_fire or (keys.fire_requested(shoot_keys, now)
+            if isinstance(keys, HeldInput) else any(keys[key] for key in shoot_keys)))
         if not is_active and isinstance(keys, HeldInput):
             keys.consume_fire(shoot_keys)
 
@@ -4087,12 +4720,20 @@ def finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, part
     origin_x, origin_y = enemy["rect"].center
     spawn_pop_particles(origin_x, origin_y, enemy["color"], particles)
     if enemy.get("is_boss", False):
-        # Exactly one pickup once ALL bosses are dead; never one per boss or
-        # one per player. Life rewards remain handled at wave completion.
+        # Guardians grant their themed reward directly to every pilot. Regular
+        # bosses retain one shared pickup. Life rewards happen at wave completion.
         if sum(bool(other.get("is_boss", False)) for other in enemies) == 1:
-            maybe_drop_powerup(powerups, origin_x, origin_y, guaranteed=True)
-            spawn_enemy_death_burst(enemy, enemies, players, enemy_bullets,
-                                   12, 5, 10, WHITE)
+            milestone = next((profile for profile in MILESTONE_BOSSES.values()
+                              if profile["kind"] == enemy.get("milestone_kind")), None)
+            if milestone is None:
+                maybe_drop_powerup(powerups, origin_x, origin_y, guaranteed=True)
+                spawn_enemy_death_burst(enemy, enemies, players, enemy_bullets,
+                                       12, 5, 10, WHITE)
+            else:
+                # A cleared guardian cannot immediately consume a freshly
+                # awarded defense or take away a timed reward on its last shot.
+                enemy_bullets.clear()
+                grant_milestone_rewards(players, milestone["reward"], enemy_bullets, particles)
     else:
         chance = (MUTATED_POWERUP_DROP_CHANCE if enemy.get("mutation")
                   else NORMAL_POWERUP_DROP_CHANCE)
@@ -4103,6 +4744,19 @@ def finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, part
         spawn_enemy_death_burst(enemy, enemies, players, enemy_bullets,
                                8, 4.5, 8, PINK)
     defeat_enemy(enemy, enemies, players)
+
+
+def grant_milestone_rewards(players, reward, enemy_bullets, particles):
+    """Every pilot earns a guardian reward; no race for a falling pickup."""
+    now = pygame.time.get_ticks()
+    for player in players:
+        # A stored Warp cannot stack. Match ordinary pickup overflow behavior
+        # and clearly name the actual fallback awarded to an already charged pilot.
+        actual = "score_boost" if reward == "emergency_warp" and player.get("warp_ready") else reward
+        grant_powerup(player, reward, enemy_bullets)
+        player["powerup_notice"] = f"GUARDIAN REWARD: {POWERUP_LABELS[actual]}"
+        player["powerup_notice_until"] = now + 3000
+        spawn_powerup_pickup_effect(player, actual, particles)
 
 
 def lightning_chain(bullet, origin_enemy, enemies, players, powerups,
@@ -4283,7 +4937,7 @@ def draw_pause_overlay(screen, font, save_error=None):
     overlay.fill((3, 4, 18, 185))
     screen.blit(overlay, (0, 0))
     panel = pygame.Rect(0, 0, min(560, SCREEN_WIDTH - 40), 172)
-    panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+    panel.center = (SCREEN_WIDTH // 2, max(panel.height // 2 + 12, SCREEN_HEIGHT // 2 - 32))
     draw_neon_panel(screen, panel, UI_VIOLET)
     draw_neon_title(screen, "PAUSED", font, (panel.centerx, panel.y + 46), UI_CYAN)
     note_font = pygame.font.SysFont(None, 24)
@@ -4378,8 +5032,8 @@ def menu_control_layout():
     previous = journal_back.move(-nav_width - 12, 0)
     following = journal_back.move(nav_width + 12, 0)
     exit_rect = pygame.Rect(0, 0, 124, 32)
-    exit_rect.midtop = (cx, SCREEN_HEIGHT - 84)
-    pause = exit_rect.move(0, 40)
+    exit_rect.midtop = (cx, SCREEN_HEIGHT - 124)
+    pause = pygame.Rect(cx - 62, SCREEN_HEIGHT - 44, 124, 32)
     if SCREEN_WIDTH < 700:
         pause.width = 48
         pause.centerx = cx
@@ -4829,8 +5483,8 @@ def draw_start_screen(
     draw_neon_panel(screen, objective_panel, UI_VIOLET)
     objective = (
         "Clear the fleet, survive enemy fire, and face a boss every fifth wave. "
-        f"Retry from the start of each {WAVES_PER_SECTOR}-wave sector. Tougher regular foes scale "
-        f"in {WAVES_PER_HEALTH_TIER}-wave HP tiers; bosses scale separately. "
+        f"Retry from the start of each {WAVES_PER_SECTOR}-wave sector. Regular enemy HP increases "
+        "only once, after wave 50; bosses scale separately. "
         f"Clear all {MAX_CAMPAIGN_ROUND} waves to save Earth!"
     )
     objective_lines = []
@@ -4858,12 +5512,7 @@ def draw_start_screen(
     screen.blit(controls_heading, (controls_panel.x + 24, controls_panel.y + 21))
     launch_heading = player_choice_font.render("ASSEMBLE YOUR SQUAD", True, UI_PINK)
     screen.blit(launch_heading, launch_heading.get_rect(center=(launch_panel.centerx, launch_panel.y + 31)))
-    control_labels = (
-        ("W / A / S / D", "SPACE or LEFT SHIFT"),
-        ("ARROW KEYS", "RIGHT SHIFT / RIGHT CTRL / NUMPAD 0 / INSERT"),
-        ("I / J / K / L", "U / H / ; or :"),
-        ("NUMPAD 8 / 4 / 5 / 6", "NUMPAD ENTER or NUMPAD 7"),
-    )
+    control_labels = tuple(player_control_labels(index) for index in range(4))
     control_font = pygame.font.SysFont(None, 21 if SCREEN_WIDTH < 1400 else 23)
     row_height = min(76, (controls_panel.height - 82) // 4)
     for index, (movement, firing) in enumerate(control_labels):
@@ -4873,10 +5522,10 @@ def draw_start_screen(
         pygame.draw.rect(screen, color if active else (50, 59, 83), (controls_panel.x + 20, row_y, 4, row_height - 12), border_radius=2)
         badge = player_choice_font.render(f"P{index + 1}", True, color if active else UI_MUTED)
         screen.blit(badge, (controls_panel.x + 36, row_y + 1))
-        move = control_font.render(f"MOVE   {movement}", True, UI_TEXT if active else UI_MUTED)
-        fire = control_font.render(f"FIRE     {firing}", True, color if active else UI_MUTED)
-        screen.blit(move, (controls_panel.x + 86, row_y))
-        screen.blit(fire, (controls_panel.x + 86, row_y + 24))
+        draw_fitted_text(screen, f"MOVE   {movement}", control_font, UI_TEXT if active else UI_MUTED,
+                         pygame.Rect(controls_panel.x + 86, row_y, controls_panel.width - 106, 24), "left")
+        draw_fitted_text(screen, f"FIRE     {firing}", control_font, color if active else UI_MUTED,
+                         pygame.Rect(controls_panel.x + 86, row_y + 24, controls_panel.width - 106, 24), "left")
     for index, choice_rect in enumerate(choice_button_rects, start=1):
         label = "1 PLAYER" if index == 1 else f"{index} PLAYERS"
         draw_neon_button(screen, choice_rect, label, player_choice_font, PLAYER_COLORS[index - 1], selected=player_count == index)
@@ -4916,12 +5565,9 @@ def draw_compact_start_screen(screen, title_font, button_font, font, player_coun
     small_font = pygame.font.SysFont(None, 19 if low else 22)
     draw_fitted_text(screen, "FLIGHT CONTROLS — MOVE / FIRE", small_font, UI_CYAN,
                      pygame.Rect(controls.x + 12, controls.y + 4, controls.width - 24, 21))
-    controls_text = (
-        "P1  W A S D  /  SPACE or LEFT SHIFT",
-        "P2  ARROWS  /  RIGHT SHIFT, RIGHT CTRL, NUMPAD 0 or INSERT",
-        "P3  I J K L  /  U, H or SEMICOLON",
-        "P4  NUMPAD 8 4 5 6  /  NUMPAD ENTER or 7",
-    )
+    controls_text = tuple(f"P{index + 1}  {move}  /  {fire}"
+                          for index in range(4)
+                          for move, fire in (player_control_labels(index),))
     for index, text in enumerate(controls_text):
         draw_fitted_text(screen, text, small_font,
                          PLAYER_COLORS[index] if index < player_count else UI_MUTED,
@@ -5178,6 +5824,11 @@ def draw_responsive_journal(screen, page, title_font, button_font, entry_font,
                          enabled=enabled)
 
 
+def player_spawn_y():
+    """Place new, restored and respawning pilots close to the playable bottom."""
+    return max(GAMEPLAY_TOP + 2, SCREEN_HEIGHT - PLAYER_HEIGHT - PLAYER_SPAWN_BOTTOM_MARGIN)
+
+
 def create_player_states(player_count, player_sprites):
     total_width = player_count * PLAYER_WIDTH + (player_count - 1) * 70
     start_x = (SCREEN_WIDTH - total_width) // 2
@@ -5193,7 +5844,7 @@ def create_player_states(player_count, player_sprites):
             "sprite": player_sprites[index],
             "x": spawn_x,
             "spawn_x": spawn_x,
-            "y": SCREEN_HEIGHT - 100,
+            "y": player_spawn_y(),
             "lives": STARTING_LIVES,
             "cooldown": 0,
             "ram_bounce_x": 0.0,
@@ -5253,7 +5904,7 @@ def reset_player_positions(players):
     for index, player in enumerate(players):
         player["spawn_x"] = start_x + index * (PLAYER_WIDTH + 70)
         player["x"] = player["spawn_x"]
-        player["y"] = SCREEN_HEIGHT - 100
+        player["y"] = player_spawn_y()
         player["ram_bounce_x"] = 0
         player["ram_bounce_y"] = 0
         player["ram_bounce_frames"] = 0
@@ -6218,6 +6869,9 @@ def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=
         compact = SCREEN_WIDTH < 900 or SCREEN_HEIGHT < 500
         round_label = f"W{round_num}" if compact else (
             f"BOSS WAVE {round_num}" if round_num % 5 == 0 else f"WAVE {round_num}")
+        profile = milestone_boss_profile(round_num)
+        if profile is not None and not compact:
+            round_label = f"{profile['name']} / W{round_num}"
         round_font = hud_font(21) if compact else font
         round_text = round_font.render(round_label, True, round_color)
         round_badge = round_text.get_rect(midtop=(SCREEN_WIDTH // 2, 10)).inflate(
@@ -6237,8 +6891,9 @@ def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=
         for index in range(5):
             dot = pygame.Rect(SCREEN_WIDTH // 2 - meter_width // 2 + index * (tick_width + tick_gap),
                               meter_y, tick_width, 3)
-            completed = index < ((round_num - 1) % WAVES_PER_SECTOR)
-            pygame.draw.rect(screen, UI_MINT if completed else (42, 62, 94), dot, border_radius=2)
+            reached = index <= ((round_num - 1) % WAVES_PER_SECTOR)
+            meter_color = UI_CORAL if round_num % WAVES_PER_SECTOR == 0 else UI_MINT
+            pygame.draw.rect(screen, meter_color if reached else (42, 62, 94), dot, border_radius=2)
         draw_scoreboard(screen, players, font, now)
         if save_error:
             cell = pygame.Rect(12, meter_y + 10, SCREEN_WIDTH - 24, 18)
@@ -6290,17 +6945,42 @@ def composite_gameplay_ui(screen, ui_surface, bounds=None):
     screen.blit(_GAMEPLAY_UI_SCALE_TARGET, (0, 0))
 
 
-def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, particles, powerups, players, exit_button_rect, pause_button_rect, font, paused=False, paused_at=None, time_override=None, round_num=1, save_error=None, ui_surface=None, defer_ui_overlay=False):
+def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
+    """Draw threats without updating them, so native HUDs cannot obscure shots."""
+    for enemy in enemies:
+        if enemy.get("milestone_kind"):
+            draw_milestone_attack_warning(screen, enemy)
+    for bullet in enemy_bullets:
+        draw_aimed_projectile_trail(screen, bullet)
+        if bullet.get("laser_state") == "warning":
+            draw_boss_laser_warning(screen, bullet, now)
+        elif bullet.get("laser_state") == "active":
+            beam_surface = pygame.Surface(bullet["rect"].size, pygame.SRCALPHA)
+            beam_surface.fill((*bullet["color"], 105))
+            screen.blit(beam_surface, bullet["rect"].topleft)
+            pygame.draw.rect(screen, bullet["color"], bullet["rect"], 2)
+        elif bullet.get("homing"):
+            draw_homing_projectile(screen, bullet, bullet["color"], hostile=True)
+        else:
+            pygame.draw.rect(screen, bullet["color"], bullet["rect"], border_radius=3)
+            if bullet["rect"].width >= 5 and bullet["rect"].height >= 5:
+                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.65),
+                                 bullet["rect"].inflate(-3, -3), border_radius=2)
+
+
+def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, particles, powerups, players, exit_button_rect, pause_button_rect, font, paused=False, paused_at=None, time_override=None, round_num=1, save_error=None, ui_surface=None, defer_ui_overlay=False, defer_native_ui=False):
     now = paused_at if paused and paused_at is not None else pygame.time.get_ticks()
     if time_override is not None:
         now = time_override
     draw_space_background(screen, "gameplay", now)
     if ui_surface is None:
-        draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error)
+        if not defer_native_ui:
+            draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error)
     else:
         ui_surface.fill((0, 0, 0, 0))
         draw_gameplay_ui_underlay(ui_surface, players, font, now, round_num, save_error)
-        composite_gameplay_ui(screen, ui_surface)
+        if not defer_native_ui:
+            composite_gameplay_ui(screen, ui_surface)
     for enemy in enemies:
         draw_animated_enemy(screen, enemy)
         if enemy_cryo_multiplier(enemy, now) < 1:
@@ -6334,6 +7014,11 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
                 f"PHASE {boss_phase}" if bar_w > 72 else f"P{boss_phase}",
                 True, UI_CORAL if boss_phase == 3 else UI_GOLD if boss_phase == 2 else UI_TEXT)
             screen.blit(phase_label, phase_label.get_rect(midbottom=(bar_x + bar_w // 2, bar_y - 3)))
+            if enemy.get("boss_name"):
+                name = hud_font(22).render(enemy["boss_name"], True, enemy["color"])
+                name_rect = name.get_rect(midbottom=(enemy["rect"].centerx, bar_y - 20))
+                name_rect.clamp_ip(screen.get_rect().inflate(-8, -8))
+                screen.blit(name, name_rect)
 
     # Projectiles and effects remain visible across the entire screen.
     player_colors = {player["number"]: player["color"] for player in players}
@@ -6385,27 +7070,13 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
         draw_animated_player(screen, player, now)
         if player["shield_until"] > now:
             draw_spawn_shield(screen, player["x"], player["y"], player["color"], now)
-    # Threats are the final world layer: fields, pickup bursts, friendly beams,
-    # ships and the translucent docks cannot paint over an incoming projectile.
-    for bullet in enemy_bullets:
-        draw_aimed_projectile_trail(screen, bullet)
-        if bullet.get("laser_state") == "warning":
-            draw_boss_laser_warning(screen, bullet, now)
-        elif bullet.get("laser_state") == "active":
-            beam_surface = pygame.Surface(bullet["rect"].size, pygame.SRCALPHA)
-            beam_surface.fill((*bullet["color"], 105))
-            screen.blit(beam_surface, bullet["rect"].topleft)
-            pygame.draw.rect(screen, bullet["color"], bullet["rect"], 2)
-        elif bullet.get("homing"):
-            draw_homing_projectile(screen, bullet, bullet["color"], hostile=True)
-        else:
-            pygame.draw.rect(screen, bullet["color"], bullet["rect"], border_radius=3)
-            if bullet["rect"].width >= 5 and bullet["rect"].height >= 5:
-                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.65),
-                                 bullet["rect"].inflate(-3, -3), border_radius=2)
-    if ui_surface is None:
+    # Native presentation adds threats above the native status layer, avoiding
+    # a GUI-to-world-to-window round trip. Legacy direct draws keep their order.
+    if not defer_native_ui:
+        draw_hostile_projectiles(screen, enemy_bullets, now, enemies)
+    if ui_surface is None and not defer_native_ui:
         draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, paused, save_error)
-    elif not defer_ui_overlay:
+    elif ui_surface is not None and not defer_ui_overlay and not defer_native_ui:
         ui_surface.fill((0, 0, 0, 0))
         draw_gameplay_ui_overlay(ui_surface, exit_button_rect, pause_button_rect, font, paused, save_error)
         composite_gameplay_ui(screen, ui_surface, ui_surface.get_bounding_rect())
@@ -6415,7 +7086,9 @@ def draw_round_transition(screen, round_num, round_font, transition_timer):
     alpha = int((transition_timer / TRANSITION_DURATION) * 255)
     alpha = max(0, min(255, alpha))
 
-    text_str = f"BOSS WAVE {round_num}" if round_num % 5 == 0 else f"WAVE {round_num}"
+    profile = milestone_boss_profile(round_num)
+    text_str = (profile["name"] if profile is not None else
+                f"BOSS WAVE {round_num}" if round_num % 5 == 0 else f"WAVE {round_num}")
     color = UI_CORAL if round_num % 5 == 0 else UI_CYAN
     text_surf = round_font.render(text_str, True, color)
     panel_width = max(420, text_surf.get_width() + 86)
@@ -6434,6 +7107,8 @@ def draw_round_transition(screen, round_num, round_font, transition_timer):
     caption = (f"CHECKPOINT REACHED  |  SECTOR {sector_for_round(round_num):02d}"
                if round_num == sector_start_round(round_num)
                else f"SECTOR {sector_for_round(round_num):02d}  |  ENEMY HP TIER {enemy_health_tier(round_num)}")
+    if profile is not None:
+        caption = f"WAVE {round_num}  |  {profile['subtitle']}"
     caption_font = pygame.font.SysFont(None, 27)
     caption_surface = caption_font.render(caption, True, UI_GOLD)
     caption_surface.set_alpha(alpha)
@@ -6968,8 +7643,9 @@ def draw_victory_cutscene(screen, elapsed_ms, title_font, button_font, players):
 
     if elapsed_ms < 4000:
         draw_neon_title(screen, "EARTH SAVED", title_font, (SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.12)), UI_MINT)
-        subtitle = button_font.render(f"WAVE {MAX_CAMPAIGN_ROUND} CLEARED", True, UI_GOLD)
-        screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.22))))
+        draw_fitted_text(screen, f"WAVE {MAX_CAMPAIGN_ROUND} CLEARED / ALL PILOTS REWARDED",
+                         button_font, UI_GOLD,
+                         pygame.Rect(20, int(SCREEN_HEIGHT * 0.22) - 20, SCREEN_WIDTH - 40, 40))
 
     credits = (
         ("CAMPAIGN COMPLETE", UI_GOLD),
@@ -7090,8 +7766,14 @@ def grant_boss_clear_life(players):
             reset_player_animation(player)
         else:
             player["lives"] = min(player_life_capacity(player), player["lives"] + 1)
-        player["powerup_notice"] = "BOSS CLEAR +1 LIFE" if gained_life else "BOSS CLEAR - MAX LIVES"
-        player["powerup_notice_until"] = now + 2300
+        guardian_notice = (player.get("powerup_notice", "").startswith("GUARDIAN REWARD:")
+                           and player.get("powerup_notice_until", 0) > now)
+        if guardian_notice:
+            player["powerup_notice"] += " / +1 LIFE" if gained_life else " / MAX LIVES"
+            player["powerup_notice_until"] = max(player["powerup_notice_until"], now + 2300)
+        else:
+            player["powerup_notice"] = "BOSS CLEAR +1 LIFE" if gained_life else "BOSS CLEAR - MAX LIVES"
+            player["powerup_notice_until"] = now + 2300
 
 
 def revive_eliminated_teammates(players):
@@ -7547,6 +8229,8 @@ def main():
     journal_font = pygame.font.SysFont(None, 20)
     round_font = pygame.font.SysFont(None, 72)
     lives_font = pygame.font.SysFont(None, 36)
+    native_ui_underlay = None
+    native_threats = pygame.Surface(WORLD_SIZE, pygame.SRCALPHA)
 
     player_sprites = [
         generate_pixel_sprite(PLAYER_ART, color, PLAYER_WIDTH, PLAYER_HEIGHT)
@@ -7572,6 +8256,7 @@ def main():
 
     clock = pygame.time.Clock()
     keyboard = HeldInput()
+    keyboard_controls = KeyboardControls()
     game_started = False
     enemy_journal_open = False
     enemy_journal_page = 0
@@ -7590,6 +8275,7 @@ def main():
     transition_started_at = pygame.time.get_ticks()
 
     settings_open = False
+    keyboard_controls_open = False
     settings_resume_after_close = False
 
     def set_game_paused(value):
@@ -7633,11 +8319,24 @@ def main():
         return arena, surface, layout
 
     def close_display_settings():
-        nonlocal settings_open, settings_resume_after_close
+        nonlocal settings_open, keyboard_controls_open, settings_resume_after_close
         settings_open = False
+        keyboard_controls_open = False
+        keyboard.clear()
         if settings_resume_after_close:
             set_game_paused(False)
         settings_resume_after_close = False
+
+    def open_keyboard_controls():
+        nonlocal settings_open, keyboard_controls_open, settings_resume_after_close
+        if not settings_open:
+            settings_resume_after_close = arena and not paused
+        settings_open = False
+        keyboard_controls_open = True
+        keyboard_controls.begin()
+        keyboard.clear()
+        if settings_resume_after_close:
+            set_game_paused(True)
 
     running = True
 
@@ -7650,15 +8349,32 @@ def main():
         screen = display_manager.world_surface if arena else ui_surface
         enemy_journal_page = max(0, min(enemy_journal_page, journal_page_count() - 1))
         pending_events = pygame.event.get()
+        batch_mode_epoch = display_manager.mode_epoch
         resize_types = (pygame.VIDEORESIZE, getattr(pygame, "WINDOWRESIZED", -1),
                         getattr(pygame, "WINDOWSIZECHANGED", -2))
         last_resize = next((event for event in reversed(pending_events) if event.type in resize_types), None)
         for raw_event in pending_events:
             if raw_event.type in resize_types:
-                if raw_event is last_resize:
+                if raw_event is last_resize and display_manager.mode_epoch == batch_mode_epoch:
                     size = (getattr(raw_event, "w", getattr(raw_event, "x", display_manager.display.get_width())),
                             getattr(raw_event, "h", getattr(raw_event, "y", display_manager.display.get_height())))
-                    display_manager.resize(size)
+                    display_manager.resize(size, from_event=True)
+                continue
+            arena, ui_surface, controls = activate_frame_ui()
+            event = display_manager.map_event(raw_event, arena)
+            if event.type == pygame.QUIT:
+                running = False
+                continue
+            if event.type in (pygame.WINDOWFOCUSLOST, pygame.WINDOWFOCUSGAINED, pygame.ACTIVEEVENT):
+                keyboard.process_event(event)
+            if keyboard_controls_open:
+                if keyboard_controls.process_event(event):
+                    close_display_settings()
+                keyboard.clear()
+                continue
+            if (event.type == pygame.KEYDOWN and event.key == pygame.K_F9
+                    and pending_save_action is None and pending_replace_slot is None):
+                open_keyboard_controls()
                 continue
             if raw_event.type == pygame.KEYDOWN and raw_event.key in (pygame.K_F6, pygame.K_F7, pygame.K_F8, pygame.K_F11):
                 if raw_event.key == pygame.K_F6:
@@ -7677,11 +8393,6 @@ def main():
                     display_manager.adjust_gui_scale(1 if raw_event.y > 0 else -1)
                 keyboard.discard_taps()
                 continue
-            arena, ui_surface, controls = activate_frame_ui()
-            event = display_manager.map_event(raw_event, arena)
-            if event.type == pygame.QUIT:
-                running = False
-                continue
             if settings_open:
                 if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
                     close_display_settings()
@@ -7697,6 +8408,8 @@ def main():
                         display_manager.toggle_fullscreen()
                     elif settings_layout["close"].collidepoint(event.pos):
                         close_display_settings()
+                    elif settings_layout["keyboard"].collidepoint(event.pos):
+                        open_keyboard_controls()
                 keyboard.discard_taps()
                 continue
             if (event.type == pygame.MOUSEBUTTONDOWN and pending_save_action is None
@@ -8140,7 +8853,7 @@ def main():
                     if (not transitioning and player["respawn_until"]
                             and now >= player["respawn_until"]):
                         player["x"] = player["spawn_x"]
-                        player["y"] = SCREEN_HEIGHT - 100
+                        player["y"] = player_spawn_y()
                         player["respawn_until"] = 0
                         player["shield_until"] = now + SPAWN_SHIELD_DURATION
                         reset_player_animation(player)
@@ -8223,6 +8936,9 @@ def main():
             if not paused:
                 update_ship_animations(players, enemies)
 
+            if (native_ui_underlay is None
+                    or native_ui_underlay.get_size() != ui_surface.get_size()):
+                native_ui_underlay = pygame.Surface(ui_surface.get_size(), pygame.SRCALPHA)
             draw_gameplay(
                 screen,
                 enemies,
@@ -8240,9 +8956,18 @@ def main():
                 transition_started_at if transitioning else None,
                 round_num=round_num,
                 save_error=save_error,
-                ui_surface=ui_surface,
+                ui_surface=native_ui_underlay,
                 defer_ui_overlay=True,
+                defer_native_ui=True,
             )
+            native_threats.fill((0, 0, 0, 0))
+            threat_now = (paused_at if paused and paused_at is not None
+                          else transition_started_at if transitioning
+                          else pygame.time.get_ticks())
+            has_native_threats = bool(enemy_bullets) or any(
+                enemy.get("signature_warning") for enemy in enemies)
+            if has_native_threats:
+                draw_hostile_projectiles(native_threats, enemy_bullets, threat_now, enemies=enemies)
 
             if transitioning and not paused:
                 draw_round_transition(screen, round_num, round_font, transition_timer)
@@ -8269,7 +8994,8 @@ def main():
                 draw_ui_feedback(ui_surface)
                 if settings_open:
                     draw_display_settings(ui_surface, display_manager, button_font, player_choice_font)
-            composite_gameplay_ui(screen, ui_surface, ui_surface.get_bounding_rect())
+                if keyboard_controls_open:
+                    keyboard_controls.draw(ui_surface, button_font, journal_font)
         else:
             with ui_dimensions(screen.get_size()):
                 if pending_save_action is None and pending_replace_slot is None:
@@ -8278,8 +9004,15 @@ def main():
                 draw_ui_feedback(screen)
                 if settings_open:
                     draw_display_settings(screen, display_manager, button_font, player_choice_font)
+                if keyboard_controls_open:
+                    keyboard_controls.draw(screen, button_font, journal_font)
         display_manager.flush_preferences()
-        display_manager.present(screen, arena)
+        if arena:
+            display_manager.present(screen, arena, ui_underlay=native_ui_underlay,
+                                    ui_overlay=ui_surface,
+                                    threat_surface=native_threats if has_native_threats else None)
+        else:
+            display_manager.present(screen, arena)
 
     display_manager.flush_preferences(force=True)
     _UI_LAYOUT_SIZE = None
@@ -8288,4 +9021,5 @@ def main():
     pygame.quit()
     sys.exit()
 
-main()
+if __name__ == "__main__":
+    main()
