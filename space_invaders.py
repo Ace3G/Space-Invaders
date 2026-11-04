@@ -76,21 +76,25 @@ def reset_animation_graphics(players=(), enemies=(), clear_caches=True):
 
 
 def update_adaptive_quality(frame_ms):
-    """Temporarily cut cosmetics after sustained low FPS; never change simulation or hitboxes."""
+    """Reduce only visuals when sustained frame-time spikes are detected."""
     global _ADAPTIVE_LOW_EFFECTS, _ADAPTIVE_BAD_FRAMES, _ADAPTIVE_GOOD_FRAMES
-    if frame_ms >= 20:
-        _ADAPTIVE_BAD_FRAMES += 2
+    if _POTATO_MODE:
+        return
+    if frame_ms >= 24:
+        _ADAPTIVE_BAD_FRAMES += 1
         _ADAPTIVE_GOOD_FRAMES = 0
-    elif frame_ms <= 17:
+        if _ADAPTIVE_BAD_FRAMES >= 8 and not _ADAPTIVE_LOW_EFFECTS:
+            _ADAPTIVE_LOW_EFFECTS = True
+            reset_animation_graphics(clear_caches=True)
+    elif frame_ms <= 18:
         _ADAPTIVE_GOOD_FRAMES += 1
         _ADAPTIVE_BAD_FRAMES = 0
+        if _ADAPTIVE_GOOD_FRAMES >= 180 and _ADAPTIVE_LOW_EFFECTS:
+            _ADAPTIVE_LOW_EFFECTS = False
+            reset_animation_graphics(clear_caches=True)
     else:
         _ADAPTIVE_BAD_FRAMES = max(0, _ADAPTIVE_BAD_FRAMES - 1)
         _ADAPTIVE_GOOD_FRAMES = max(0, _ADAPTIVE_GOOD_FRAMES - 1)
-    if not _ADAPTIVE_LOW_EFFECTS and _ADAPTIVE_BAD_FRAMES >= 10:
-        _ADAPTIVE_LOW_EFFECTS = True
-    elif _ADAPTIVE_LOW_EFFECTS and _ADAPTIVE_GOOD_FRAMES >= 90:
-        _ADAPTIVE_LOW_EFFECTS = False
 
 
 def build_enemy_spatial_grid(enemies, cell_size=192):
@@ -379,9 +383,9 @@ class DisplayManager:
         mode = self.preferences.get("fps_mode", "auto")
         if mode == 30:
             return 30
-        if mode == 60:
-            return 60
-        return 30 if (_POTATO_MODE or _ADAPTIVE_LOW_EFFECTS) else 60
+        if mode == "auto" and (_POTATO_MODE or _ADAPTIVE_LOW_EFFECTS):
+            return 30
+        return 60
 
     def cycle_fps_mode(self):
         current = self.preferences.get("fps_mode", "auto")
@@ -527,7 +531,7 @@ def draw_display_settings(screen, manager, font, small_font):
     potato_label = "POTATO MODE  ON" if manager.preferences.get("potato_mode", False) else "POTATO MODE  OFF"
     draw_neon_button(screen, layout["potato"], potato_label, small_font, UI_MINT)
     fps_mode = manager.preferences.get("fps_mode", "auto")
-    fps_label = "FPS  AUTO (30/60)" if fps_mode == "auto" else f"FPS  {int(fps_mode)}"
+    fps_label = "FPS  AUTO (60)" if fps_mode == "auto" else f"FPS  {int(fps_mode)}"
     draw_neon_button(screen, layout["fps"], fps_label, small_font, UI_GOLD)
     hint = small_font.render("F6 smaller / F7 larger / F8 auto / F11 display", True, UI_MUTED)
     if hint.get_width() > panel.width - 36:
@@ -610,7 +614,14 @@ ENEMY_SPEED_CAP = 1.25
 ENEMY_SPEED_CAP_ROUND = 11
 ENEMY_HEALTH_MULTIPLIER = 0.75
 SPLITTER_FRAGMENT_COUNT = 2
-MAX_ACTIVE_ENEMIES = 300  # Hard fleet safety cap; stronger enemy behavior is preferred over 1,000-way scans.
+MAX_ACTIVE_ENEMIES = 200  # Campaign hard fleet cap; infinite mode after wave 100 uncaps and grows from this limit.
+
+
+def active_enemy_cap(round_num, infinite_mode=False):
+    """Campaign modes stop the fleet at 200; post-100 infinite waves grow without a hard cap."""
+    if infinite_mode and round_num > MAX_CAMPAIGN_ROUND:
+        return None
+    return MAX_ACTIVE_ENEMIES
 SPLITTER_REGROW_FRAMES = 480  # Eight seconds at 60 FPS, independently per fragment.
 SPLITTER_REGROW_STAGGER_FRAMES = 24
 SPLITTER_SHARD_SPEED_MULTIPLIER = 1.15
@@ -688,7 +699,9 @@ CRYO_SLOW_MS = 2000
 FROSTBITE_ENEMY_SPEED_MULTIPLIER = 0.35
 FROSTBITE_BOSS_SPEED_MULTIPLIER = 0.75
 NOVA_COUNTDOWN_MS = 3000
-NOVA_PULSE_RADIUS = 300
+NOVA_PULSE_RADIUS = 300  # Retained for save compatibility; Nova damage now covers the full screen.
+NOVA_SWEEP_MS = 900
+NOVA_MAX_RADIUS = math.ceil(math.hypot(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2))
 
 
 class HeldInput:
@@ -1191,6 +1204,12 @@ VISUAL_VARIATIONS = {
     "orbit": enemy_color_variants(ORBIT_ART, (137, 242, 234), (147, 181, 255), (210, 158, 255)),
     "scatterer": enemy_color_variants(SCATTERER_ART, (255, 192, 100), (255, 125, 165), (177, 222, 125)),
     "phantom": enemy_color_variants(PHANTOM_ART, (195, 171, 255), (139, 211, 255), (247, 164, 220)),
+    "marauder": enemy_color_variants(CHARGER_ART, (255, 112, 92), (255, 166, 92), (228, 112, 255)),
+    "catapult": enemy_color_variants(ARTILLERY_ART, (255, 195, 82), (230, 132, 255), (255, 123, 147)),
+    "stormglass": enemy_color_variants(PRISM_ART, (94, 211, 255), (164, 153, 255), (255, 145, 210)),
+    "devastator": enemy_color_variants(TANK_ART, (255, 128, 92), (206, 151, 255), (255, 210, 118)),
+    "echo": enemy_color_variants(RICOCHET_ART, (116, 229, 255), (152, 176, 255), (226, 146, 255)),
+    "sentinel": enemy_color_variants(WARDEN_ART, (112, 255, 205), (120, 194, 255), (220, 255, 152)),
 }
 
 VISUAL_VARIATIONS.update({
@@ -1232,6 +1251,12 @@ ENEMY_JOURNAL = (
     ("Orbit", "Sweeps in broad arcs while moving across the screen."),
     ("Scatterer", "Fires a wide spread of shots to cover more space."),
     ("Phantom", "Fires a wavering projectile that sways as it travels."),
+    ("Marauder", "Late-game swift attacker that zigzags faster than a normal Charger and fires a three-shot aimed fan."),
+    ("Catapult", "Late-game siege unit that drops paired mines; each mine detonates into a wider close-range ring."),
+    ("Stormglass", "Late-game prism fighter that fires a split projectile which becomes a large seven-shot burst."),
+    ("Devastator", "Late-game armored unit with a slow heavy shell that detonates into eight projectiles."),
+    ("Echo", "Late-game edge fighter that sends paired aimed shots capable of bouncing twice off arena walls."),
+    ("Sentinel", "Late-game support unit that starts with two shield charges and fires one careful aimed bolt."),
     ("Boss", "One every fifth wave. Large orbs pulse then burst eight ways after 1.4s. Lasers pierce Durability. Waves 25/50/75 have guardians; 100 is final."),
     ("Iron Citadel", "Wave 25: solid gates, Hammer Fans, Anvil beams and Siege Cross. Use the green gate opening. Every pilot automatically earns Rapid Fire."),
     ("Helix Matriarch", "Wave 50: Double Helix, Prism Bloom, Braided Cross and locked Orbit Break shots. Every pilot automatically earns Homing Shots."),
@@ -1304,7 +1329,7 @@ POWERUP_SPAWN_WEIGHTS = {
     "bullet_time": 6, "piercing": 15, "damage_up": 3, "health_up": 3, "homing": 12,
     "lightning": 6, "score_boost": 42, "cryo": 9, "orbit_drones": 12,
     "supply_beacon": 9, "gravity_well": 9, "emergency_warp": 9,
-    "nova_pulse": 9,     "missile_swarm": 9, "reflector": 12, "chain_reaction": 9, "revive": 8,
+    "nova_pulse": 4,     "missile_swarm": 9, "reflector": 12, "chain_reaction": 9, "revive": 8,
 }
 RARE_POWERUP_CHANCE = POWERUP_SPAWN_WEIGHTS["damage_up"] / sum(POWERUP_SPAWN_WEIGHTS.values())
 COMMON_POWERUP_TYPES = tuple(powerup_type for powerup_type in POWERUP_TYPES
@@ -1430,7 +1455,7 @@ POWERUP_JOURNAL = (
     ("supply_beacon", "Stores eight credited-kill charges. Ordinary kills get better drop odds; boss kills spend a charge too. Drop limits still apply."),
     ("gravity_well", f"A {POWERUP_DURATIONS['gravity_well'] // 1000}-second, {GRAVITY_FIELD_RADIUS}-pixel field gently bends ordinary moving hostile shots away. Lasers and energy gates are unaffected."),
     ("emergency_warp", "Stored across waves and saves. After Reflector, warps only when a hit would cost a life. Nonlethal Durability hits keep the charge; lasers and gates count as lethal. Duplicates grant Double Score."),
-    ("nova_pulse", f"After 3-2-1, every foe takes 1 damage through shields. Clears ordinary shots and mines within {NOVA_PULSE_RADIUS} pixels; lasers and energy gates stay. Life loss cancels the charge."),
+    ("nova_pulse", f"After 3-2-1, the screen fills with expanding warning pulses, then a final expanding shock wave crosses the whole arena. Every foe touched by the wave takes 1 damage through shields. Ordinary shots and mines in its path clear; lasers and energy gates stay. Life loss cancels the charge. Rare pickup."),
     ("missile_swarm", "Stores up to six guided missiles. Each one-shots an unshielded regular foe; bosses take 1 damage. Shields block a hit; weapon buffs do not multiply the swarm."),
     ("reflector", "Stores three blocks. Each damaging hit spends a block and returns a basic bolt toward the nearest foe."),
     ("chain_reaction", f"For {POWERUP_DURATIONS['chain_reaction'] // 1000} seconds, credited kills can send up to three shards at nearby visible foes. Support shots and Nova Pulse do not start bursts."),
@@ -1482,6 +1507,12 @@ ENEMY_SCORE_VALUES = {
     "orbit": 230,
     "scatterer": 250,
     "phantom": 260,
+    "marauder": 520,
+    "catapult": 540,
+    "stormglass": 560,
+    "devastator": 650,
+    "echo": 530,
+    "sentinel": 600,
     "boss": 0,
 }
 ENEMY_TYPE_UNLOCK_ROUNDS = {
@@ -1512,6 +1543,12 @@ ENEMY_TYPE_UNLOCK_ROUNDS = {
     "orbit": 69,
     "scatterer": 74,
     "phantom": 79,
+    "marauder": 82,
+    "catapult": 85,
+    "stormglass": 88,
+    "devastator": 91,
+    "echo": 94,
+    "sentinel": 97,
 }
 ENEMY_TYPE_SPAWN_WEIGHTS = {
     "swarmer": 6,
@@ -1541,20 +1578,30 @@ ENEMY_TYPE_SPAWN_WEIGHTS = {
     "orbit": 0.85,
     "scatterer": 0.9,
     "phantom": 0.85,
+    "marauder": 0.95,
+    "catapult": 0.65,
+    "stormglass": 0.75,
+    "devastator": 0.55,
+    "echo": 0.8,
+    "sentinel": 0.6,
 }
 ENEMY_SINGLE_SPAWN_TYPES = frozenset({
     "sniper", "tank", "bulwark", "warden", "artillery",
     "mine_layer", "prism", "pulse", "medic",
+    "catapult", "stormglass", "devastator", "sentinel",
 })
 # Extra variety comes from different abilities, with limits on dangerous repeats.
 ENEMY_WAVE_TYPE_CAPS = {
     "splitter": 2, "bomber": 2, "scatterer": 2, "seeker": 3,
     "ricochet": 3, "phantom": 3, "striker": 3, "diver": 4,
+    "marauder": 4, "catapult": 1, "stormglass": 1,
+    "devastator": 1, "echo": 3, "sentinel": 1,
 }
 ENEMY_SLOW_HEALTH_RAMP_TYPES = frozenset({
     "swarmer", "speedy", "scout", "shardling",
     "volley", "mine_layer", "seeker", "ricochet", "prism", "pulse",
     "blink", "charger", "medic", "orbit", "scatterer", "phantom",
+    "marauder", "stormglass", "echo",
 })
 MUTATION_SCORE_MULTIPLIERS = {
     "armored": 1.5,
@@ -1567,7 +1614,7 @@ def blend_color(first, second, amount):
 
 
 def draw_soft_glow(screen, center, color, radius=18, strength=35):
-    if _POTATO_MODE:
+    if low_effects_mode():
         return
     key = (tuple(color), radius, strength)
     glow = _GLOW_SPRITES.get(key)
@@ -1640,7 +1687,7 @@ def draw_space_background(screen, style="menu", now=None):
         _SPACE_BACKGROUNDS[key] = entry
     background, stars = entry
     screen.blit(background, (0, 0))
-    if _POTATO_MODE:
+    if low_effects_mode():
         return
     if now is None:
         now = pygame.time.get_ticks()
@@ -2385,9 +2432,9 @@ def draw_milestone_boss_hull(screen, enemy, tick):
 
 
 def enemy_animation_style(enemy_type):
-    if enemy_type in ("tank", "bulwark", "artillery", "bomber", "boss", "pulse"):
+    if enemy_type in ("tank", "bulwark", "artillery", "bomber", "boss", "pulse", "catapult", "devastator", "sentinel"):
         return "heavy"
-    if enemy_type in ("speedy", "scout", "swarmer", "diver", "charger", "seeker", "shardling"):
+    if enemy_type in ("speedy", "scout", "swarmer", "diver", "charger", "seeker", "shardling", "marauder", "echo"):
         return "fast"
     return "alien"
 
@@ -2750,10 +2797,13 @@ def enemy_combat_tier(round_num):
 
 
 def health_tier_bonus(enemy_type, round_num):
-    """Non-fragile types receive at most one health-tier bonus, after wave 50."""
+    """Non-fragile types gain later durability; the new late archetypes gain a second tier at round 100."""
     if enemy_type in HEALTH_SCALING_EXEMPT_TYPES:
         return 0
-    return enemy_health_tier(round_num) - 1
+    bonus = enemy_health_tier(round_num) - 1
+    if enemy_type in ("marauder", "catapult", "stormglass", "devastator", "echo", "sentinel") and int(round_num) >= 100:
+        bonus += 1
+    return bonus
 
 
 def scale_enemy_health(base_hp):
@@ -2845,12 +2895,13 @@ def create_enemies(round_num, infinite_mode=False):
             )
             visual = random.choice(VISUAL_VARIATIONS[type_key])
             is_speedy = type_key in (
-                "speedy", "diver", "scout", "swarmer", "blink", "charger",
+                "speedy", "diver", "scout", "swarmer", "blink", "charger", "marauder",
             ) or mutation == "swift"
             enemy_hp = (
                 4 if type_key == "bulwark" else
-                3 if type_key == "tank" else
-                2 if type_key in ("splitter", "warden", "artillery") else
+                4 if type_key == "devastator" else
+                3 if type_key in ("tank", "sentinel") else
+                2 if type_key in ("splitter", "warden", "artillery", "catapult", "stormglass", "echo") else
                 2 if mutation == "armored" else 1
             )
             # Once after wave 50, sturdy enemies gain HP, but nimble/fragile
@@ -2858,9 +2909,9 @@ def create_enemies(round_num, infinite_mode=False):
             enemy_hp += health_tier_bonus(type_key, round_num)
             enemy_hp = scale_enemy_health(enemy_hp)
             enemy_scale = (
-                1.3 if type_key == "bulwark" else
-                1.2 if type_key == "tank" else
-                1.15 if type_key == "artillery" else
+                1.3 if type_key in ("bulwark", "devastator") else
+                1.2 if type_key in ("tank", "sentinel") else
+                1.15 if type_key in ("artillery", "catapult") else
                 0.75 if type_key == "swarmer" else
                 0.85 if type_key == "scout" else 1
             )
@@ -2879,6 +2930,7 @@ def create_enemies(round_num, infinite_mode=False):
                     "shooter", "sniper", "bomber", "striker", "lancer", "bulwark", "artillery",
                     "volley", "mine_layer", "seeker", "ricochet", "prism", "pulse",
                     "charger", "scatterer", "phantom",
+                    "marauder", "catapult", "stormglass", "devastator", "echo", "sentinel",
                 ),
                 "is_speedy": is_speedy,
                 "rect": pygame.Rect(int(x), int(y), enemy_width, enemy_height),
@@ -2887,10 +2939,11 @@ def create_enemies(round_num, infinite_mode=False):
                 "dx": 1,
                 "hp": enemy_hp,
                 "max_hp": enemy_hp,
-                "shield_charges": 0,
+                "shield_charges": 2 if type_key == "sentinel" else 0,
                 "speed_mult": (
                     1.2 if type_key == "swarmer" else
                     3.1 if type_key == "diver" else
+                    3.0 if type_key == "marauder" else
                     2.8 if type_key == "scout" or mutation == "swift" else
                     1.8
                 ),
@@ -2904,9 +2957,12 @@ def create_enemies(round_num, infinite_mode=False):
                 "dive_phase": 0.0,
                 "dive_origin_y": float(y),
             }
+            enemy_data["_enemy_round_num"] = round_num
+            enemy_data["_enemy_infinite_mode"] = infinite_mode
             attach_ship_animation(enemy_data, visual["art"], visual["color"],
                                   enemy_width, enemy_height, enemy_animation_style(type_key))
-            if len(enemies) < MAX_ACTIVE_ENEMIES:
+            enemy_limit = active_enemy_cap(round_num, infinite_mode)
+            if enemy_limit is None or len(enemies) < enemy_limit:
                 enemies.append(enemy_data)
 
     wardens = [enemy for enemy in enemies if enemy["type"] == "warden"]
@@ -2957,7 +3013,7 @@ def apply_cryo_hit(enemy, bullet):
         enemy["cryo_slow_until"] = pygame.time.get_ticks() + CRYO_SLOW_MS
 
 
-def update_enemies(enemies, fleet_dx, enemy_dy, round_num):
+def update_enemies(enemies, fleet_dx, enemy_dy, round_num, infinite_mode=False):
     # Independent shardling timers: destroying one fragment does not prevent
     # its surviving siblings from becoming separate Splitters.
     for fragment in enemies[:]:
@@ -2976,8 +3032,11 @@ def update_enemies(enemies, fleet_dx, enemy_dy, round_num):
         original["animation_fire"] = 0
         original["animation_last_center"] = new_rect.center
         original.pop("damage_by_player", None)
+        fragment_round = fragment.get("_enemy_round_num", round_num)
+        fragment_infinite = fragment.get("_enemy_infinite_mode", infinite_mode)
         enemies.remove(fragment)
-        if len(enemies) < MAX_ACTIVE_ENEMIES:
+        enemy_limit = active_enemy_cap(fragment_round, fragment_infinite)
+        if enemy_limit is None or len(enemies) < enemy_limit:
             enemies.append(original)
 
     speed_cap = ENEMY_SPEED_CAP + max(0, round_num - MAX_CAMPAIGN_ROUND) * 0.005
@@ -2988,10 +3047,10 @@ def update_enemies(enemies, fleet_dx, enemy_dy, round_num):
 
     # Movement identities are exclusive: Swift adds pace to a weave rather
     # than applying a second independent horizontal move in the same frame.
-    fleet_enemies = [e for e in enemies if not e["is_speedy"] and e["type"] not in ("diver", "weaver", "orbit")]
-    speedy_enemies = [e for e in enemies if e["is_speedy"] and e["type"] not in ("diver", "weaver", "orbit")]
+    fleet_enemies = [e for e in enemies if not e["is_speedy"] and e["type"] not in ("diver", "weaver", "orbit", "stormglass")]
+    speedy_enemies = [e for e in enemies if e["is_speedy"] and e["type"] not in ("diver", "weaver", "orbit", "stormglass")]
     diving_enemies = [e for e in enemies if e["type"] == "diver"]
-    weaving_enemies = [e for e in enemies if e["type"] in ("weaver", "orbit")]
+    weaving_enemies = [e for e in enemies if e["type"] in ("weaver", "orbit", "stormglass")]
 
     fleet_move = fleet_dx * min(speed_boost, PLAYER_SPEED)
 
@@ -3190,7 +3249,9 @@ def award_enemy_score(enemy, players):
         player["score"] += score
 
 
-def defeat_enemy(enemy, enemies, players):
+def defeat_enemy(enemy, enemies, players, round_num=1, infinite_mode=False):
+    round_num = enemy.get("_enemy_round_num", round_num)
+    infinite_mode = enemy.get("_enemy_infinite_mode", infinite_mode)
     award_enemy_score(enemy, players)
     enemies.remove(enemy)
     if enemy.get("type") != "splitter":
@@ -3211,13 +3272,16 @@ def defeat_enemy(enemy, enemies, players):
     group_width = width + spacing * (SPLITTER_FRAGMENT_COUNT - 1)
     group_left = max(MARGIN, min(SCREEN_WIDTH - MARGIN - group_width,
                                  enemy["rect"].centerx - group_width / 2))
+    enemy_limit = active_enemy_cap(round_num, infinite_mode)
     for index in range(SPLITTER_FRAGMENT_COUNT):
-        if len(enemies) >= MAX_ACTIVE_ENEMIES:
+        if enemy_limit is not None and len(enemies) >= enemy_limit:
             break
         x = group_left + index * spacing
         y = enemy["rect"].centery - height // 2
         enemies.append({
             "type": "shardling",
+            "_enemy_round_num": round_num,
+            "_enemy_infinite_mode": infinite_mode,
             "is_boss": False,
             "formation": enemy.get("formation", "grid"),
             "mutation": None,
@@ -4060,12 +4124,16 @@ def collect_bullet_momentum(bullet, player, now, particles=None):
 # Special salvo sizes are larger than ordinary shots; reserve enough space
 # BEFORE firing instead of clipping the volley and making it look broken.
 ENEMY_SALVO_SIZES = {"volley": 3, "mine_layer": 2, "pulse": 6,
-                     "scatterer": 5, "lancer": 2}
+                     "scatterer": 5, "lancer": 2,
+                     "marauder": 3, "catapult": 2, "stormglass": 7,
+                     "devastator": 8, "echo": 2, "sentinel": 1}
 ENEMY_HEAVY_SHOOTERS = frozenset(("volley", "mine_layer", "pulse",
-                                  "scatterer", "prism", "bomber"))
+                                  "scatterer", "prism", "bomber",
+                                  "catapult", "stormglass", "devastator"))
 AIMED_ENEMY_TYPES = frozenset(("volley", "seeker", "ricochet", "prism",
                                "charger", "phantom", "sniper", "artillery",
-                               "striker", "lancer"))
+                               "striker", "lancer", "marauder", "catapult",
+                               "stormglass", "devastator", "echo", "sentinel"))
 AIMED_BOSS_PATTERNS = frozenset(("aimed", "double_lance", "heavy_orb", "crossfire",
                                 "pincer", "triple_burst", "homing", "wave_shot",
                                 "splitter", "sniper", "bouncer", "ricochet",
@@ -4080,10 +4148,15 @@ def boss_difficulty_progress(round_num):
 
 
 def enemy_bullet_cap(player_count, is_boss=False, round_num=1):
-    return (BASE_ENEMY_BULLET_CAP
-            + max(0, min(4, player_count) - 1) * (6 if is_boss else ENEMY_BULLET_CAP_PER_EXTRA_PLAYER)
-            + (BOSS_BULLET_CAP_BONUS + round(BOSS_LATE_EXTRA_BULLET_CAP
-               * boss_difficulty_progress(round_num)) if is_boss else 0))
+    cap = (BASE_ENEMY_BULLET_CAP
+           + max(0, min(4, player_count) - 1) * (6 if is_boss else ENEMY_BULLET_CAP_PER_EXTRA_PLAYER)
+           + (BOSS_BULLET_CAP_BONUS + round(BOSS_LATE_EXTRA_BULLET_CAP
+              * boss_difficulty_progress(round_num)) if is_boss else 0))
+    if _POTATO_MODE:
+        cap = min(cap, 12)
+    elif _ADAPTIVE_LOW_EFFECTS:
+        cap = min(cap, 18)
+    return cap
 
 
 def enemy_fire_probability(enemy_type, round_num, player_count):
@@ -4099,6 +4172,8 @@ def enemy_fire_probability(enemy_type, round_num, player_count):
         "volley": .0018, "mine_layer": .0011, "seeker": .0021,
         "ricochet": .0026, "prism": .0015, "pulse": .0013,
         "charger": .0030, "scatterer": .0014, "phantom": .0022,
+        "marauder": .0028, "catapult": .0012, "stormglass": .0014,
+        "devastator": .0010, "echo": .0020, "sentinel": .0018,
     }.get(enemy_type, .0030)
     # Firing progression is independent of the single health increase.
     sector_factor = min(1.15, .94 + .025 * (enemy_combat_tier(round_num) - 1))
@@ -4608,6 +4683,47 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
                     )
                     mine["mine_timer"] = 90
                     enemy_bullets.append(mine)
+                elif enemy["type"] == "marauder":
+                    velocity_x, velocity_y = aimed_velocity(origin_x, origin_y, target_positions, 7.5)
+                    for spread in (-0.18, 0, 0.18):
+                        dx = velocity_x * math.cos(spread) - velocity_y * math.sin(spread)
+                        dy = velocity_x * math.sin(spread) + velocity_y * math.cos(spread)
+                        enemy_bullets.append(create_enemy_projectile(
+                            origin_x, origin_y, dx, dy, 8, enemy["color"]
+                        ))
+                elif enemy["type"] == "catapult":
+                    for shot_offset in (-38, 38):
+                        mine = create_enemy_projectile(
+                            origin_x + shot_offset, origin_y, 0, 2.5, 13, enemy["color"]
+                        )
+                        mine["mine_timer"] = 105
+                        mine["mine_count"] = 6
+                        enemy_bullets.append(mine)
+                elif enemy["type"] == "stormglass":
+                    dx, dy = aimed_velocity(origin_x, origin_y, target_positions, 5.0)
+                    shot = create_enemy_projectile(origin_x, origin_y, dx, dy, 13, enemy["color"])
+                    shot["split_timer"] = 65
+                    shot["split_count"] = 7
+                    enemy_bullets.append(shot)
+                elif enemy["type"] == "devastator":
+                    dx, dy = aimed_velocity(origin_x, origin_y, target_positions, 4.5)
+                    mine = create_enemy_projectile(origin_x, origin_y, dx, dy, 18, enemy["color"])
+                    mine["mine_timer"] = 78
+                    mine["mine_count"] = 8
+                    enemy_bullets.append(mine)
+                elif enemy["type"] == "echo":
+                    for shot_offset in (-18, 18):
+                        dx, dy = aimed_velocity(origin_x + shot_offset, origin_y, target_positions, 7)
+                        shot = create_enemy_projectile(
+                            origin_x + shot_offset, origin_y, dx, dy, 9, enemy["color"]
+                        )
+                        shot["bounces_left"] = 2
+                        enemy_bullets.append(shot)
+                elif enemy["type"] == "sentinel":
+                    dx, dy = aimed_velocity(origin_x, origin_y, target_positions, 7)
+                    enemy_bullets.append(create_enemy_projectile(
+                        origin_x, origin_y, dx, dy, 10, enemy["color"]
+                    ))
                 else:
                     enemy_bullets.append(create_enemy_projectile(
                         origin_x, origin_y, 0, 5, color=enemy["color"]
@@ -5149,25 +5265,53 @@ def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, po
             if now >= player["nova_charge_until"]:
                 player["pending_nova"] = False
                 player["nova_charge_until"] = 0
-                particles.append({"kind": "nova_pulse", "x": center[0], "y": center[1],
-                                  "dx": 0, "dy": 0, "radius": NOVA_PULSE_RADIUS,
+                player["nova_sweep_start"] = now
+                player["nova_sweep_until"] = now + NOVA_SWEEP_MS
+                player["nova_sweep_previous_radius"] = 0
+
+        if player.get("nova_sweep_until", 0) > now:
+            sweep_duration = max(1, player["nova_sweep_until"] - player["nova_sweep_start"])
+            elapsed = max(0, now - player["nova_sweep_start"])
+            progress = min(1.0, elapsed / sweep_duration)
+            screen_center = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
+            current_radius = NOVA_MAX_RADIUS * progress
+            previous_radius = player.get("nova_sweep_previous_radius", 0)
+            sweep_id = (player["number"], player["nova_sweep_start"])
+
+            if elapsed <= 16 or not player.get("nova_sweep_particle_added", False):
+                player["nova_sweep_particle_added"] = True
+                particles.append({"kind": "nova_pulse", "x": screen_center[0], "y": screen_center[1],
+                                  "dx": 0, "dy": 0, "radius": NOVA_MAX_RADIUS,
                                   "color": POWERUP_COLORS["nova_pulse"],
-                                  "lifetime": 30, "max_lifetime": 30})
-                # The damaging shock reaches every foe; projectile clearing
-                # is local to the larger circle centered on the pilot.
-                for enemy in enemies[:]:
-                    if enemy["hp"] <= 0:
+                                  "lifetime": max(30, NOVA_SWEEP_MS // 16),
+                                  "max_lifetime": max(30, NOVA_SWEEP_MS // 16)})
+
+            for enemy in enemies[:]:
+                if enemy["hp"] <= 0:
+                    continue
+                distance = math.dist(screen_center, enemy["rect"].center)
+                if previous_radius < distance <= current_radius:
+                    if enemy.get("nova_hit_id") == sweep_id:
                         continue
+                    enemy["nova_hit_id"] = sweep_id
                     damage_enemy(enemy, 1, player["number"], ignore_shields=True)
                     if enemy["hp"] <= 0:
                         enemy["no_chain_reaction"] = True
                         finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, particles)
-                # Clear after rewards/death bursts so a volatile foe cannot
-                # refill the safe area during this same defensive blast.
-                for shot in enemy_bullets[:]:
-                    if (shot.get("laser_state") is None and not shot.get("milestone_wall")
-                            and math.dist(center, shot["rect"].center) <= NOVA_PULSE_RADIUS):
-                        enemy_bullets.remove(shot)
+
+            for shot in enemy_bullets[:]:
+                if shot.get("laser_state") is not None or shot.get("milestone_wall"):
+                    continue
+                distance = math.dist(screen_center, shot["rect"].center)
+                if previous_radius < distance <= current_radius:
+                    enemy_bullets.remove(shot)
+
+            player["nova_sweep_previous_radius"] = current_radius
+        elif player.get("nova_sweep_until", 0):
+            player["nova_sweep_until"] = 0
+            player["nova_sweep_previous_radius"] = 0
+            player["nova_sweep_start"] = 0
+            player["nova_sweep_particle_added"] = False
         if player.get("pending_missiles"):
             targets = sorted((enemy for enemy in enemies
                               if enemy["hp"] > 0 and enemy_is_visible(enemy)),
@@ -5307,10 +5451,12 @@ def lightning_chain(bullet, origin_enemy, enemies, players, powerups,
         return
     radius = 210 if bullet.get("homing") else 145
     source = origin_enemy["rect"].center
+    enemy_grid = build_enemy_spatial_grid(enemies, 128)
     visited = set(bullet.get("hit_enemies", ()))
     visited.add(id(origin_enemy))
     for hop, chance in enumerate(LIGHTNING_HOP_CHANCES):
-        choices = [e for e in enemies if id(e) not in visited and e["hp"] > 0
+        choices = [e for e in nearby_enemy_candidates(enemy_grid, source[0], source[1], radius + 128, 128)
+                   if id(e) not in visited and e["hp"] > 0
                    and math.dist(source, e["rect"].center) <= radius]
         if not choices or (hop > 0 and random.random() >= chance):
             break
@@ -5380,6 +5526,7 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
                     damage = max(1, damage - 1)
                 key = (beam.get("owner"), id(boss))
                 laser_boss_damage[key] = max(laser_boss_damage.get(key, 0), damage)
+    enemy_grid = build_enemy_spatial_grid(enemies, 128)
     for bullet in player_bullets[:]:
         if bullet not in player_bullets:
             continue
@@ -5390,8 +5537,11 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
             if not bullet.get("damage_ready", False):
                 continue
             bullet["damage_ready"] = False
-        for enemy in enemies[:]:
-            if id(enemy) not in active_enemy_ids:
+        candidates = nearby_enemy_candidates(
+            enemy_grid, rect.centerx, rect.centery,
+            max(rect.width, rect.height) // 2 + 128, 128)
+        for enemy in candidates:
+            if enemy not in enemies or id(enemy) not in active_enemy_ids:
                 continue
             if isinstance(bullet, dict) and id(enemy) in bullet.get("hit_enemies", ()):
                 continue
@@ -5406,8 +5556,11 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
                     player_bullets.remove(bullet)
                 spawn_pop_particles(*center, color, particles)
                 hit_ids = bullet.setdefault("volley_hits", set())
-                for other in enemies[:]:
-                    if id(other) not in active_enemy_ids or id(other) in hit_ids:
+                blast_radius = bullet.get("blast_radius", BOMB_BLAST_RADIUS)
+                blast_candidates = nearby_enemy_candidates(
+                    enemy_grid, center[0], center[1], blast_radius + 128, 128)
+                for other in blast_candidates:
+                    if other not in enemies or id(other) not in active_enemy_ids or id(other) in hit_ids:
                         continue
                     if math.dist(center, other["rect"].center) > bullet.get("blast_radius", BOMB_BLAST_RADIUS):
                         continue
@@ -6427,6 +6580,10 @@ def create_player_states(player_count, player_sprites):
             "chain_reaction_until": 0,
             "pending_nova": False,
             "nova_charge_until": 0,
+            "nova_sweep_start": 0,
+            "nova_sweep_until": 0,
+            "nova_sweep_previous_radius": 0,
+            "nova_sweep_particle_added": False,
             "pending_missiles": False,
             "pending_reflections": [],
             "pending_chain_shots": [],
@@ -7205,24 +7362,25 @@ def draw_powerup_hud(screen, player, now, font):
 
 
 def draw_nova_countdown(screen, player, now):
-    """A faint clear-radius guide and readable countdown follow the pilot."""
+    """Show screen-wide countdown pulses instead of a small radius field."""
     seconds = nova_countdown(player, now)
     if not seconds:
         return
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
-    radius = NOVA_PULSE_RADIUS
-    size = radius * 2 + 8
-    effects = pygame.Surface((size, size), pygame.SRCALPHA)
-    local_center = (size // 2, size // 2)
     accent = POWERUP_COLORS["nova_pulse"]
-    pygame.draw.circle(effects, (*accent, 4), local_center, radius)
-    ring = pygame.Rect(4, 4, radius * 2, radius * 2)
-    for index in range(12):
-        angle = index * math.tau / 12 + now / 2200
-        pygame.draw.arc(effects, (*accent, 90), ring, angle, angle + 0.15, 1)
-    progress = 1 - max(0, player["nova_charge_until"] - now) / NOVA_COUNTDOWN_MS
-    pygame.draw.circle(effects, (*accent, 110), local_center, round(24 + progress * 23), 1)
-    screen.blit(effects, (center[0] - local_center[0], center[1] - local_center[1]))
+    screen_center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+    remaining = max(0, player["nova_charge_until"] - now)
+    progress = 1 - remaining / NOVA_COUNTDOWN_MS
+    if not _POTATO_MODE:
+        for ring_index in range(3):
+            phase = (progress * 2.5 + ring_index / 3) % 1
+            radius = max(20, round(40 + (NOVA_MAX_RADIUS - 40) * phase))
+            pygame.draw.circle(screen, (*accent[:3], 255), screen_center, radius, 1)
+            if ring_index == 0 and radius > 120:
+                pygame.draw.circle(screen, (*accent, 255), screen_center, radius, 1)
+    else:
+        radius = round(40 + (NOVA_MAX_RADIUS - 40) * ((progress * 2) % 1))
+        pygame.draw.circle(screen, accent, screen_center, radius, 2)
     label_key = (seconds, tuple(accent))
     labels = _NOVA_LABEL_SPRITES.get(label_key)
     if labels is None:
@@ -7924,6 +8082,10 @@ def register_player_hit(player, player_rect, particles, lives_font, lives_messag
     player["shatter_flash_until"] = 0
     player["pending_nova"] = False
     player["nova_charge_until"] = 0
+    player["nova_sweep_start"] = 0
+    player["nova_sweep_until"] = 0
+    player["nova_sweep_previous_radius"] = 0
+    player["nova_sweep_particle_added"] = False
     if player["lives"] > 0:
         player["lives"] -= 1
         if player["lives"] > 0:
@@ -9062,8 +9224,8 @@ def main():
 
     while running:
         _UI_FRAME += 1
-        clock.tick(display_manager.target_fps())
-        update_adaptive_quality(max(1, clock.get_rawtime()))
+        frame_ms = clock.tick(display_manager.target_fps())
+        update_adaptive_quality(frame_ms)
         keyboard.begin_frame()
 
         arena, ui_surface, controls = activate_frame_ui()
@@ -9625,7 +9787,7 @@ def main():
                     resolve_instant_powerups(players, enemies, enemy_bullets,
                                              player_bullets, powerups, particles)
                     check_bunker_collisions(bunkers, player_bullets, enemy_bullets, enemies, particles)
-                    enemy_dx = update_enemies(enemies, enemy_dx, enemy_dy, round_num)
+                    enemy_dx = update_enemies(enemies, enemy_dx, enemy_dy, round_num, infinite_mode)
                     check_player_ram_collisions(
                         enemies, particles, enemy_bullets, powerups, players
                     )
