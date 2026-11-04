@@ -20,8 +20,8 @@ SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
-FPS_STEPS = (30, 60)
-FPS_MODES = ("auto", 30, 60)
+FPS_STEPS = (30, 60, 120, 240)
+FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
 DISPLAY_SETTINGS_FILE = Path.home() / ".neon_frontier" / "display_settings.json"
 _POTATO_MODE = False
 _ADAPTIVE_LOW_EFFECTS = False
@@ -381,8 +381,16 @@ class DisplayManager:
 
     def target_fps(self):
         mode = self.preferences.get("fps_mode", "auto")
-        if mode == 30:
-            return 30
+        if mode == "infinite":
+            return 0
+        if mode in (30, 60, 120, 240):
+            if mode == 30:
+                return 30
+            if mode == 60:
+                return 60
+            if mode == 120:
+                return 120
+            return 240
         if mode == "auto" and (_POTATO_MODE or _ADAPTIVE_LOW_EFFECTS):
             return 30
         return 60
@@ -531,7 +539,12 @@ def draw_display_settings(screen, manager, font, small_font):
     potato_label = "POTATO MODE  ON" if manager.preferences.get("potato_mode", False) else "POTATO MODE  OFF"
     draw_neon_button(screen, layout["potato"], potato_label, small_font, UI_MINT)
     fps_mode = manager.preferences.get("fps_mode", "auto")
-    fps_label = "FPS  AUTO (60)" if fps_mode == "auto" else f"FPS  {int(fps_mode)}"
+    if fps_mode == "auto":
+        fps_label = "FPS  AUTO (60)"
+    elif fps_mode == "infinite":
+        fps_label = "FPS  INFINITE"
+    else:
+        fps_label = f"FPS  {int(fps_mode)}"
     draw_neon_button(screen, layout["fps"], fps_label, small_font, UI_GOLD)
     hint = small_font.render("F6 smaller / F7 larger / F8 auto / F11 display", True, UI_MUTED)
     if hint.get_width() > panel.width - 36:
