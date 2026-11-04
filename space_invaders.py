@@ -246,6 +246,16 @@ class DisplayManager:
         self.mode_epoch = 0
         self.settings_error = None
         self._preferences_changed_at = None
+        self._auto_fps_cap = None
+        self._auto_warmup_started_at = pygame.time.get_ticks()
+        self._auto_warmup_samples = []
+        self._auto_observation_samples = []
+        self._auto_last_probe_at = self._auto_warmup_started_at
+        self._auto_probe_started_at = None
+        self._auto_probe_samples = []
+        self._auto_probe_duration_ms = 1500
+        self._auto_warmup_duration_ms = 3000
+        self._auto_probe_interval_ms = 12000
 
     def open(self):
         flags = pygame.FULLSCREEN if self.preferences["fullscreen"] else pygame.RESIZABLE
@@ -384,21 +394,89 @@ class DisplayManager:
         if mode == "infinite":
             return 0
         if mode in (30, 60, 120, 240):
-            if mode == 30:
-                return 30
-            if mode == 60:
-                return 60
-            if mode == 120:
-                return 120
-            return 240
-        if mode == "auto" and (_POTATO_MODE or _ADAPTIVE_LOW_EFFECTS):
-            return 30
-        return 60
+            return mode
+        if self._auto_probe_started_at is not None:
+            return 0
+        if self._auto_fps_cap is None:
+            return 0
+        return self._auto_fps_cap
+
+    def reset_auto_fps(self):
+        now = pygame.time.get_ticks()
+        self._auto_fps_cap = None
+        self._auto_warmup_started_at = now
+        self._auto_warmup_samples = []
+        self._auto_observation_samples = []
+        self._auto_last_probe_at = now
+        self._auto_probe_started_at = None
+        self._auto_probe_samples = []
+
+    @staticmethod
+    def _trimmed_average(values):
+        if not values:
+            return None
+        ordered = sorted(max(1.0, min(360.0, value)) for value in values if value > 0)
+        if len(ordered) < 5:
+            return sum(ordered) / len(ordered)
+        trim = max(1, len(ordered) // 10)
+        middle = ordered[trim:-trim] if len(ordered) - 2 * trim >= 3 else ordered
+        return sum(middle) / len(middle)
+
+    def observe_auto_fps(self, frame_ms, now=None):
+        """Build an initial FPS average, then keep the auto cap within actual performance."""
+        if self.preferences.get("fps_mode", "auto") != "auto":
+            return
+        if frame_ms <= 0:
+            return
+        if now is None:
+            now = pygame.time.get_ticks()
+        fps = 1000.0 / frame_ms
+        fps = max(15.0, min(360.0, fps))
+
+        if self._auto_fps_cap is None:
+            self._auto_warmup_samples.append(fps)
+            elapsed = now - self._auto_warmup_started_at
+            if elapsed >= self._auto_warmup_duration_ms:
+                average = self._trimmed_average(self._auto_warmup_samples)
+                if average is not None:
+                    self._auto_fps_cap = max(1, min(360, round(average)))
+                    self._auto_observation_samples = []
+                    self._auto_last_probe_at = now
+                else:
+                    self._auto_warmup_started_at = now
+            return
+
+        if self._auto_probe_started_at is not None:
+            self._auto_probe_samples.append(fps)
+            if now - self._auto_probe_started_at >= self._auto_probe_duration_ms:
+                measured = self._trimmed_average(self._auto_probe_samples)
+                if measured is not None:
+                    measured_cap = max(1, min(360, round(measured)))
+                    self._auto_fps_cap = measured_cap
+                self._auto_probe_started_at = None
+                self._auto_probe_samples = []
+                self._auto_last_probe_at = now
+                return
+
+        self._auto_observation_samples.append(fps)
+        if len(self._auto_observation_samples) > 180:
+            self._auto_observation_samples.pop(0)
+
+        if now - self._auto_last_probe_at >= self._auto_probe_interval_ms:
+            self._auto_probe_started_at = now
+            self._auto_probe_samples = []
+
+    def auto_fps_label(self):
+        if self.preferences.get("fps_mode", "auto") != "auto":
+            return None
+        return "FPS  AUTO"
 
     def cycle_fps_mode(self):
         current = self.preferences.get("fps_mode", "auto")
         index = FPS_MODES.index(current) if current in FPS_MODES else 0
         self.preferences["fps_mode"] = FPS_MODES[(index + 1) % len(FPS_MODES)]
+        if self.preferences["fps_mode"] == "auto":
+            self.reset_auto_fps()
         self._preferences_changed_at = pygame.time.get_ticks()
         return self.preferences["fps_mode"]
 
@@ -540,7 +618,7 @@ def draw_display_settings(screen, manager, font, small_font):
     draw_neon_button(screen, layout["potato"], potato_label, small_font, UI_MINT)
     fps_mode = manager.preferences.get("fps_mode", "auto")
     if fps_mode == "auto":
-        fps_label = "FPS  AUTO (60)"
+        fps_label = manager.auto_fps_label()
     elif fps_mode == "infinite":
         fps_label = "FPS  INFINITE"
     else:
@@ -9159,6 +9237,8 @@ def main():
 
     clock = pygame.time.Clock()
     smoothed_fps = 60.0
+    simulation_accumulator = 0.0
+    simulation_step_ms = 1000.0 / 60.0
     keyboard = HeldInput()
     keyboard_controls = KeyboardControls()
     game_started = False
@@ -9248,7 +9328,12 @@ def main():
         _UI_FRAME += 1
         frame_ms = clock.tick(display_manager.target_fps())
         if frame_ms > 0:
+            if not game_started or transitioning or paused or campaign_complete or game_over:
+                simulation_accumulator = 0.0
+            else:
+                simulation_accumulator = min(250.0, simulation_accumulator + frame_ms)
             smoothed_fps = smoothed_fps * 0.90 + (1000.0 / frame_ms) * 0.10
+        display_manager.observe_auto_fps(frame_ms)
         update_adaptive_quality(frame_ms)
         keyboard.begin_frame()
 
@@ -9801,54 +9886,54 @@ def main():
 
                 if not transitioning and not campaign_complete:
                     keys = keyboard
-                    update_durability(players, now)
-                    update_player_movement(keys, players)
-                    update_player_projectiles(keys, players, player_count, player_bullets, enemies)
-                    check_player_bullet_collisions(
-                        player_bullets, enemies, particles, enemy_bullets, powerups, players
-                    )
-                    update_powerups(powerups, players, enemy_bullets, particles)
-                    resolve_instant_powerups(players, enemies, enemy_bullets,
-                                             player_bullets, powerups, particles)
-                    check_bunker_collisions(bunkers, player_bullets, enemy_bullets, enemies, particles)
-                    enemy_dx = update_enemies(enemies, enemy_dx, enemy_dy, round_num, infinite_mode)
-                    check_player_ram_collisions(
-                        enemies, particles, enemy_bullets, powerups, players
-                    )
-                    targets = [
-                        (
-                            max(
-                                0,
-                                min(
-                                    SCREEN_WIDTH,
-                                    player["x"] + PLAYER_WIDTH / 2
-                                    + player["move_dx"] * ENEMY_AIM_LEAD_FRAMES,
-                                ),
-                            ),
-                            max(
-                                0,
-                                min(
-                                    SCREEN_HEIGHT,
-                                    player["y"] + PLAYER_HEIGHT / 2
-                                    + player["move_dy"] * ENEMY_AIM_LEAD_FRAMES,
-                                ),
-                            ),
+                    while simulation_accumulator >= simulation_step_ms:
+                        update_durability(players, now)
+                        update_player_movement(keys, players)
+                        update_player_projectiles(keys, players, player_count, player_bullets, enemies)
+                        check_player_bullet_collisions(
+                            player_bullets, enemies, particles, enemy_bullets, powerups, players
                         )
-                        for player in players
-                        if not player["eliminated"] and player["respawn_until"] == 0
-                    ]
-                    update_enemy_projectiles(enemies, enemy_bullets, targets, players, particles, round_num)
-                    game_over, lives_message = death(
-                        enemies, enemy_bullets, particles, players, lives_font, lives_message
-                    )
-                    if game_over:
-                        saved_run, save_error = autosave_run(
-                            round_num, players, checkpoint, infinite_mode, saved_run, slot=active_slot,
-                            retries_remaining=retries_remaining, run_defeated=True)
-                        saved_slots[active_slot - 1] = saved_run
-
-            if not paused:
-                update_ship_animations(players, enemies)
+                        update_powerups(powerups, players, enemy_bullets, particles)
+                        resolve_instant_powerups(players, enemies, enemy_bullets,
+                                                 player_bullets, powerups, particles)
+                        check_bunker_collisions(bunkers, player_bullets, enemy_bullets, enemies, particles)
+                        enemy_dx = update_enemies(enemies, enemy_dx, enemy_dy, round_num, infinite_mode)
+                        check_player_ram_collisions(
+                            enemies, particles, enemy_bullets, powerups, players
+                        )
+                        targets = [
+                            (
+                                max(
+                                    0,
+                                    min(
+                                        SCREEN_WIDTH,
+                                        player["x"] + PLAYER_WIDTH / 2
+                                        + player["move_dx"] * ENEMY_AIM_LEAD_FRAMES,
+                                    ),
+                                ),
+                                max(
+                                    0,
+                                    min(
+                                        SCREEN_HEIGHT,
+                                        player["y"] + PLAYER_HEIGHT / 2
+                                        + player["move_dy"] * ENEMY_AIM_LEAD_FRAMES,
+                                    ),
+                                ),
+                            )
+                            for player in players
+                            if not player["eliminated"] and player["respawn_until"] == 0
+                        ]
+                        update_enemy_projectiles(enemies, enemy_bullets, targets, players, particles, round_num)
+                        update_ship_animations(players, enemies)
+                        game_over, lives_message = death(
+                            enemies, enemy_bullets, particles, players, lives_font, lives_message
+                        )
+                        if game_over:
+                            saved_run, save_error = autosave_run(
+                                round_num, players, checkpoint, infinite_mode, saved_run, slot=active_slot,
+                                retries_remaining=retries_remaining, run_defeated=True)
+                            saved_slots[active_slot - 1] = saved_run
+                        simulation_accumulator -= simulation_step_ms
 
             if (native_ui_underlay is None
                     or native_ui_underlay.get_size() != ui_surface.get_size()):
