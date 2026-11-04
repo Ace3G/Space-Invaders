@@ -684,10 +684,10 @@ COLS = 11
 ENEMY_WIDTH = 35
 ENEMY_HEIGHT = 25
 PADDING = 15
-# Status docks no longer reserve a strip of the arena. Start the fleet closer
-# to the real top edge so the front rank leaves enough room to react to fire.
-OFFSET_Y = 24
-BOSS_SPAWN_Y = 80
+# Status docks no longer reserve a strip of the arena. Enemy bounds begin at
+# the real top edge in every display mode; the arena is letterboxed, not offset.
+OFFSET_Y = 0
+BOSS_SPAWN_Y = 0
 MARGIN = 50
 GAMEPLAY_TOP = 0  # The whole screen is playable; HUD elements are transparent overlays.
 HUD_TOP_HEIGHT = 108  # Keeps edge status docks clear of the score readouts.
@@ -733,7 +733,7 @@ MAX_RUN_RETRIES = 3
 BOSS_AIM_MAX_LEAD_PX = 135
 BOSS_LATE_EXTRA_BULLET_CAP = 12
 BOSS_LASER_WARNING_FRAMES = 90  # 1.5 seconds, including at wave 100.
-BOSS_LASER_ACTIVE_FRAMES = 22
+BOSS_LASER_ACTIVE_FRAMES = 180  # Three seconds of a continuous, sweeping beam.
 BOSS_ENCOUNTER_RECOVERY_FRAMES = 48
 HEAVY_ORB_FUSE_FRAMES = 84  # Pulses visibly for 1.4 seconds before bursting.
 HEAVY_ORB_BURST_COUNT = 8
@@ -1375,6 +1375,7 @@ BOSS_ATTACKS = {
     "spiral": (CYAN, 7),
     "crossfire": (YELLOW, 4),
     "laser": (PINK, 1),
+    "homing_laser": (CYAN, 1),
     "double_lance": (LIGHT_BLUE, 5),
     "heavy_orb": (VIOLET, 9),
     "sweep": (VIOLET, 8),
@@ -2921,7 +2922,9 @@ def create_enemies(round_num, infinite_mode=False):
             side_columns + (round_num - MAX_CAMPAIGN_ROUND) // 15,
         )
     row_count = ROWS + additional_rows
-    row_offset_y = OFFSET_Y - additional_rows * (curr_h + PADDING)
+    # Add extra rows downward from the top rather than moving their top bounds
+    # above the arena. This also keeps later waves clipped safely in every mode.
+    row_offset_y = max(GAMEPLAY_TOP, OFFSET_Y)
     col_count = COLS + side_columns * 2
     formations = ("grid", "staggered", "v", "diamond", "wedge", "pairs")
     non_boss_wave = round_num - 1 - ((round_num - 1) // 5)
@@ -4398,22 +4401,27 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
             attach_ship_animation(enemy, BOSS_ART, enemy["color"],
                                   enemy["rect"].width, enemy["rect"].height, "heavy")
 
-            if pattern == "laser":
+            if pattern in ("laser", "homing_laser"):
                 animate_ship_fire(enemy)
                 target_x = choose_target_position(
                     boss_targets, (origin_x, SCREEN_HEIGHT - 40)
                 )[0]
                 beam_width = round(54 + 16 * boss_difficulty_progress(round_num))
                 beam_x = max(0, min(SCREEN_WIDTH - beam_width, int(target_x - beam_width / 2)))
-                enemy_bullets.append({
+                beam = {
                     "rect": pygame.Rect(beam_x, origin_y, beam_width, SCREEN_HEIGHT - origin_y),
+                    "x": float(beam_x),
                     "dx": 0,
                     "dy": 0,
-                    "color": PINK,
+                    "color": BOSS_ATTACKS[pattern][0],
                     "laser_state": "warning",
                     "remaining_frames": BOSS_LASER_WARNING_FRAMES + 1,
                     "warning_frames": BOSS_LASER_WARNING_FRAMES,
-                })
+                }
+                if pattern == "homing_laser":
+                    beam["boss_laser"] = True
+                    beam["homing_target_index"] = random.randrange(len(boss_targets)) if boss_targets else None
+                enemy_bullets.append(beam)
                 enemy["attack_queue"] = []
                 enemy["attack_cooldown"] = BOSS_ENCOUNTER_RECOVERY_FRAMES
                 for other in enemies:
@@ -4852,11 +4860,31 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
 
         if "laser_state" in bullet:
             bullet["remaining_frames"] -= 1
-            if bullet["remaining_frames"] <= 0:
-                if bullet["laser_state"] == "warning":
+            if bullet["laser_state"] == "warning":
+                if bullet["remaining_frames"] <= 0:
                     bullet["laser_state"] = "active"
                     bullet["remaining_frames"] = BOSS_LASER_ACTIVE_FRAMES
-                else:
+                continue
+
+            if bullet.get("boss_laser"):
+                rect = bullet["rect"]
+                target_positions_live = boss_targets or target_positions
+                target_index = bullet.get("homing_target_index")
+                if target_positions_live:
+                    target_index = (target_index % len(target_positions_live)) if target_index is not None else 0
+                    target_x = target_positions_live[target_index][0]
+                    desired_x = target_x - rect.width / 2
+                    x = bullet.get("x", float(rect.x))
+                    combat_tier = boss_difficulty_progress(round_num)
+                    turn_speed = 0.035 + 0.025 * combat_tier
+                    desired_x = max(0, min(SCREEN_WIDTH - rect.width, desired_x))
+                    x += (desired_x - x) * turn_speed
+                    bullet["x"] = x
+                    rect.x = round(x)
+                if bullet["remaining_frames"] <= 0:
+                    enemy_bullets.remove(bullet)
+            else:
+                if bullet["remaining_frames"] <= 0:
                     enemy_bullets.remove(bullet)
             continue
 
@@ -7827,13 +7855,31 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
         elif bullet.get("laser_state") == "warning":
             draw_boss_laser_warning(screen, bullet, now)
         elif bullet.get("laser_state") == "active":
+            rect = bullet["rect"]
             if low_effects_mode():
-                pygame.draw.rect(screen, bullet["color"], bullet["rect"])
+                pygame.draw.rect(screen, bullet["color"], rect)
+            elif bullet.get("boss_laser"):
+                remaining = max(0, bullet.get("remaining_frames", 0))
+                fade = min(1.0, remaining / 24.0)
+                pulse = (math.sin(now / 55.0) + 1.0) / 2.0
+                beam_surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+                beam_surface.fill((*bullet["color"], round(150 * fade)))
+                screen.blit(beam_surface, rect.topleft)
+                core_width = max(6, round(rect.width * (0.18 + 0.025 * pulse)))
+                core_rect = pygame.Rect(rect.centerx - core_width // 2, rect.top,
+                                        core_width, rect.height)
+                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.42),
+                                 core_rect, border_radius=max(3, core_width // 2))
+                pygame.draw.line(screen, UI_TEXT,
+                                 (rect.centerx, rect.top + 4),
+                                 (rect.centerx, rect.bottom - 4),
+                                 max(1, core_width // 4))
+                pygame.draw.rect(screen, bullet["color"], rect, 2, border_radius=8)
             else:
-                beam_surface = pygame.Surface(bullet["rect"].size, pygame.SRCALPHA)
+                beam_surface = pygame.Surface(rect.size, pygame.SRCALPHA)
                 beam_surface.fill((*bullet["color"], 105))
-                screen.blit(beam_surface, bullet["rect"].topleft)
-                pygame.draw.rect(screen, bullet["color"], bullet["rect"], 2)
+                screen.blit(beam_surface, rect.topleft)
+                pygame.draw.rect(screen, bullet["color"], rect, 2)
         elif bullet.get("heavy_orb"):
             # State-based fuse marks stay frozen during pause. Geometry avoids
             # allocating a glowing surface for every orb on every frame.
