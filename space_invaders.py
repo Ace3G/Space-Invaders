@@ -7623,7 +7623,7 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
     return draw_rect
 
 
-def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=None):
+def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=None, fps=None):
     """Render status UI in its own coordinate space before the arena objects."""
     with ui_dimensions(screen.get_size()):
         sector_color = SECTOR_COLORS[(sector_for_round(round_num) - 1) % len(SECTOR_COLORS)]
@@ -7666,9 +7666,17 @@ def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=
 
 
 def draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, paused,
-                              save_error=None):
+                              save_error=None, display_button_rect=None, fps=None):
     """Pause controls use the same GUI coordinates as pointer hit testing."""
     with ui_dimensions(screen.get_size()):
+        if fps is not None and display_button_rect is not None:
+            compact = display_button_rect.width < 80
+            fps_font = hud_font(14 if compact else 17)
+            fps_text = cached_ui_text(fps_font, f"{max(0, round(fps))} FPS", UI_GOLD)
+            fps_badge = fps_text.get_rect(midbottom=(display_button_rect.centerx,
+                                                     display_button_rect.top - 5)).inflate(16, 6)
+            draw_gameplay_hud_panel(screen, fps_badge, UI_GOLD, radius=5)
+            screen.blit(fps_text, fps_text.get_rect(center=fps_badge.center))
         if paused:
             draw_pause_overlay(screen, font, save_error)
             draw_exit_button(screen, exit_button_rect, font)
@@ -9137,6 +9145,7 @@ def main():
     enemy_dy = 20
 
     clock = pygame.time.Clock()
+    smoothed_fps = 60.0
     keyboard = HeldInput()
     keyboard_controls = KeyboardControls()
     game_started = False
@@ -9225,6 +9234,8 @@ def main():
     while running:
         _UI_FRAME += 1
         frame_ms = clock.tick(display_manager.target_fps())
+        if frame_ms > 0:
+            smoothed_fps = smoothed_fps * 0.90 + (1000.0 / frame_ms) * 0.10
         update_adaptive_quality(frame_ms)
         keyboard.begin_frame()
 
@@ -9875,7 +9886,8 @@ def main():
             with ui_dimensions(ui_surface.get_size()):
                 draw_gameplay_ui_overlay(ui_surface, controls["exit_button_rect"],
                                          controls["pause_button_rect"], player_choice_font,
-                                         paused, save_error)
+                                         paused, save_error,
+                                         controls["display_button_rect"], smoothed_fps)
                 if not paused:
                     lives_message = draw_lives_text(ui_surface, lives_message)
                 if pending_save_action is None and pending_replace_slot is None:
