@@ -2922,9 +2922,10 @@ def create_enemies(round_num, infinite_mode=False):
             side_columns + (round_num - MAX_CAMPAIGN_ROUND) // 15,
         )
     row_count = ROWS + additional_rows
-    # Add extra rows downward from the top rather than moving their top bounds
-    # above the arena. This also keeps later waves clipped safely in every mode.
-    row_offset_y = max(GAMEPLAY_TOP, OFFSET_Y)
+    # Keep the bottom edge of the formation near the top quarter of the arena.
+    # Additional rows extend upward and may start completely offscreen.
+    row_spacing = curr_h + PADDING
+    row_offset_y = round(SCREEN_HEIGHT * 0.25 - (row_count - 1) * row_spacing)
     col_count = COLS + side_columns * 2
     formations = ("grid", "staggered", "v", "diamond", "wedge", "pairs")
     non_boss_wave = round_num - 1 - ((round_num - 1) // 5)
@@ -4346,8 +4347,10 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
                     target["animation_support"] = 24
                     enemy["animation_support"] = 24
 
-        # Entirely offscreen ships cannot fire invisible shots.
-        if not enemy_is_visible(enemy) or not target_positions:
+        # Above-screen ships remain part of the formation and can attack even
+        # while their sprites are not yet visible. Targets still prove that the
+        # player arena is active.
+        if not target_positions:
             continue
 
         if enemy.get("is_boss", False):
@@ -4655,11 +4658,12 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
         elif enemy["can_shoot"]:
             salvo_size = ENEMY_SALVO_SIZES.get(enemy["type"], 1)
             aimed_attack = enemy["type"] in AIMED_ENEMY_TYPES
+            fleet_density = min(1.0, 48.0 / max(1, len(enemies)))
             if (len(enemy_bullets) + salvo_size <= max_bullets
                     and now >= enemy.get("next_fire_ms", 0)
                     and (not aimed_attack or now >= next_aimed_volley_ms)
                     and random.random() < enemy_fire_probability(
-                        enemy["type"], round_num, active_players)):
+                        enemy["type"], round_num, active_players) * fleet_density):
                 # Spaced-out attacks prevent one fast-moving enemy from firing
                 # overlapping multi-shot patterns in a very short burst.
                 enemy["next_fire_ms"] = now + random.randint(
