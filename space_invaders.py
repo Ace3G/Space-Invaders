@@ -846,7 +846,7 @@ PADDING = 15
 # Status docks no longer reserve a strip of the arena. Enemy bounds begin at
 # the real top edge in every display mode; the arena follows the window shape.
 OFFSET_Y = 0
-BOSS_SPAWN_Y = 0
+BOSS_SPAWN_Y = 120
 MARGIN = 50
 GAMEPLAY_TOP = 0  # The whole screen is playable; HUD elements are transparent overlays.
 HUD_TOP_HEIGHT = 108  # Keeps edge status docks clear of the score readouts.
