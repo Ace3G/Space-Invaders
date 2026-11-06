@@ -18,7 +18,7 @@ import pygame
 # Screen Setup Constants
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
-WORLD_SIZE = (1600, 900)
+WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
@@ -286,16 +286,20 @@ class DisplayManager:
         self._presentation_size = None
         self._layer_targets.clear()
         self._margin_background = None
+        if self.display is not None:
+            width, height = self.display.get_size()
+            factor = min(width / WORLD_SIZE[0], height / WORLD_SIZE[1])
+            size = (max(WORLD_SIZE[0], round(width / factor)),
+                    max(WORLD_SIZE[1], round(height / factor)))
+            if self.world_surface.get_size() != size:
+                self.world_surface = pygame.Surface(size).convert()
 
     @property
     def viewport(self):
-        # One uniform world scale keeps circular fields, speeds and collision
-        # footprints proportional on every display. GUI uses the whole window.
-        width, height = self.display.get_size()
-        factor = min(width / WORLD_SIZE[0], height / WORLD_SIZE[1])
-        size = (max(1, round(WORLD_SIZE[0] * factor)),
-                max(1, round(WORLD_SIZE[1] * factor)))
-        return pygame.Rect((width - size[0]) // 2, (height - size[1]) // 2, *size)
+        # The logical arena follows the display's aspect ratio, so its real
+        # clipping edges coincide with the window. Both axes use the same scale
+        # (within one rounding pixel); circles and collision ranges stay round.
+        return self.display.get_rect()
 
     @property
     def effective_gui_zoom(self):
@@ -527,20 +531,6 @@ class DisplayManager:
         gui_region = self.display.get_rect()
         region = self.viewport if arena else gui_region
         self.display.fill((3, 7, 20))
-        if arena and region != gui_region:
-            if self._margin_background is None:
-                # Build once per display change. Only the uncovered strips are
-                # copied each frame; no extra full-screen effect pass is added.
-                self._margin_background = pygame.Surface(gui_region.size)
-                draw_space_background(self._margin_background, "gameplay", 0)
-            for margin in (
-                pygame.Rect(0, 0, gui_region.width, region.top),
-                pygame.Rect(0, region.bottom, gui_region.width, gui_region.height - region.bottom),
-                pygame.Rect(0, region.top, region.left, region.height),
-                pygame.Rect(region.right, region.top, gui_region.width - region.right, region.height),
-            ):
-                if margin.width and margin.height:
-                    self.display.blit(self._margin_background, margin, margin)
         if surface.get_size() == region.size:
             self.display.blit(surface, region)
         else:
@@ -553,6 +543,175 @@ class DisplayManager:
         self._present_layer(threat_surface, region, "threats")
         self._present_layer(ui_overlay, gui_region, "overlay", ui_overlay_bounds)
         pygame.display.flip()
+
+
+def resize_arena_state(old_size, new_size, players=(), enemies=(), enemy_bullets=(),
+                       player_bullets=(), bunkers=(), particles=(), powerups=(), *, now=None):
+    """Fit a live wave to the new arena without restarting or spending progress.
+
+    Positions retain their relative place in the field. Ships and ordinary
+    projectiles keep their sizes; arena-spanning hazards retain their coverage.
+    A committed boss warning is transformed with its eventual attack, not aimed
+    again. Combat stats, velocities, hit records and object identities persist.
+    A marked escape lane may receive extra warning time after expansion.
+    """
+    global SCREEN_WIDTH, SCREEN_HEIGHT, NOVA_MAX_RADIUS
+    SCREEN_WIDTH, SCREEN_HEIGHT = new_size
+    NOVA_MAX_RADIUS = math.ceil(math.hypot(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2))
+    if old_size == new_size:
+        return
+    now = pygame.time.get_ticks() if now is None else now
+    scale_x, scale_y = new_size[0] / old_size[0], new_size[1] / old_size[1]
+    moved_rects, moved_entities = {}, set()
+
+    def point(position):
+        return (position[0] * scale_x, position[1] * scale_y)
+
+    def move_rect(rect, area=False):
+        old = moved_rects.get(id(rect))
+        if old is not None:
+            return old
+        old = rect.copy()
+        moved_rects[id(rect)] = old
+        if area:
+            left, top = round(old.left * scale_x), round(old.top * scale_y)
+            right, bottom = round(old.right * scale_x), round(old.bottom * scale_y)
+            rect.update(left, top, max(1, right - left), max(1, bottom - top))
+        else:
+            rect.center = (round(old.centerx * scale_x), round(old.centery * scale_y))
+        return old
+
+    def move_entity(entity, area=False):
+        if id(entity) in moved_entities:
+            return
+        moved_entities.add(id(entity))
+        if isinstance(entity, pygame.Rect):
+            move_rect(entity, area)
+            return
+        rect = entity.get("rect")
+        if rect is not None:
+            old = move_rect(rect, area)
+            for axis, factor, old_half, new_half in (
+                    ("x", scale_x, old.width / 2, rect.width / 2),
+                    ("y", scale_y, old.height / 2, rect.height / 2)):
+                if axis in entity:
+                    entity[axis] = (entity[axis] + old_half) * factor - new_half
+                    setattr(rect, axis, round(entity[axis]))
+            for anchor in ("dive_origin_y", "weave_origin_y"):
+                if anchor in entity:
+                    entity[anchor] += rect.y - old.y
+        else:
+            for axis, factor in (("x", scale_x), ("y", scale_y)):
+                if axis in entity:
+                    entity[axis] *= factor
+        for anchor in ("animation_last_center", "animation_warp_origin"):
+            if entity.get(anchor) is not None:
+                entity[anchor] = point(entity[anchor])
+
+    for player in players:
+        player["x"] = max(0, min(new_size[0] - PLAYER_WIDTH,
+                                (player["x"] + PLAYER_WIDTH / 2) * scale_x - PLAYER_WIDTH / 2))
+        player["y"] = max(GAMEPLAY_TOP + 2, min(new_size[1] - PLAYER_HEIGHT,
+                                (player["y"] + PLAYER_HEIGHT / 2) * scale_y - PLAYER_HEIGHT / 2))
+        if "spawn_x" in player:
+            player["spawn_x"] = max(0, min(new_size[0] - PLAYER_WIDTH,
+                                   (player["spawn_x"] + PLAYER_WIDTH / 2) * scale_x - PLAYER_WIDTH / 2))
+        # Repositioning two fixed-size hitboxes can turn a near miss into an
+        # overlap. Brief contact grace lets the pilot react without deleting shots.
+        player["resize_invuln_until"] = max(player.get("resize_invuln_until", 0), now + 250)
+        for anchor in ("animation_last_center", "animation_warp_origin"):
+            if player.get(anchor) is not None:
+                player[anchor] = point(player[anchor])
+        if player.get("nova_sweep_previous_radius"):
+            # A circle changes which actors it encloses after an aspect change.
+            # Recheck its interior; existing nova_hit_id records prevent repeats.
+            player["nova_sweep_previous_radius"] = 0
+        for pending in ("pending_reflections", "pending_chain_shots"):
+            for shot in player.get(pending, ()):
+                move_entity(shot)
+
+    for enemy in enemies:
+        anchor = ("dive_origin_y" if enemy.get("type") == "diver" else
+                  "weave_origin_y" if enemy.get("type") == "weaver" else None)
+        old_bottom = enemy.get(anchor, enemy["rect"].y) + enemy["rect"].height
+        move_entity(enemy)
+        old_gap = old_size[1] - ENEMY_HEIGHT - old_bottom
+        new_bottom = enemy.get(anchor, enemy["rect"].y) + enemy["rect"].height
+        if old_gap > 0 and new_bottom >= new_size[1] - ENEMY_HEIGHT:
+            # Shrinking a window must not itself trigger an invasion defeat.
+            shift = math.floor(new_size[1] - ENEMY_HEIGHT
+                               - max(1, old_gap * scale_y) - new_bottom)
+            enemy["rect"].y += shift
+            for key in ("y", "dive_origin_y", "weave_origin_y"):
+                if key in enemy:
+                    enemy[key] += shift
+            for key in ("animation_last_center", "animation_warp_origin"):
+                if enemy.get(key) is not None:
+                    enemy[key] = (enemy[key][0], enemy[key][1] + shift)
+        if enemy.get("attack_queue"):
+            enemy["attack_queue"] = [
+                (x * scale_x if x is not None else None,
+                 y * scale_y if y is not None else None, *properties)
+                for x, y, *properties in enemy["attack_queue"]]
+        template = enemy.get("regrow_template")
+        if template is not None:
+            move_entity(template)
+        warning = enemy.get("signature_warning")
+        if warning is None:
+            continue
+        for rect in warning["beams"]:
+            move_rect(rect, area=True)
+        if warning.get("safe_gap") is not None:
+            move_rect(warning["safe_gap"], area=True)
+        for rect, _, _ in warning.get("walls", ()):
+            move_rect(rect, area=True)
+        warning["shots"] = [(x * scale_x, y * scale_y, dx, dy, size, color)
+                            for x, y, dx, dy, size, color in warning["shots"]]
+        warning["target_marks"] = [point(mark) for mark in warning.get("target_marks", ())]
+        gap = warning.get("safe_gap")
+        moving_walls = [(rect, dy) for rect, _, dy in warning.get("walls", ()) if dy > 0]
+        if gap is not None and moving_walls:
+            required = warning["remaining_frames"]
+            for player in players:
+                if player.get("eliminated", False) or player.get("respawn_until", 0) > now:
+                    continue
+                distance = max(0, gap.left + 8 - player["x"],
+                               player["x"] - (gap.right - PLAYER_WIDTH - 8))
+                flight = min(max(0, (player["y"] - rect.bottom)
+                                 / (dy * ENEMY_PROJECTILE_SPEED_MULTIPLIER))
+                             for rect, dy in moving_walls)
+                required = max(required, math.ceil(distance / PLAYER_SPEED + 18 - flight))
+            extra = required - warning["remaining_frames"]
+            warning["remaining_frames"] += extra
+            warning["warning_frames"] += extra
+
+    for shot in enemy_bullets:
+        move_entity(shot, area=bool(shot.get("laser_state") or shot.get("milestone_wall")))
+    for shot in player_bullets:
+        move_entity(shot)
+        if isinstance(shot, dict) and shot.get("type") == "laser":
+            owner = next((player for player in players if player["number"] == shot.get("owner")), None)
+            if owner is not None:
+                shot["rect"].update(player_laser_rect(owner, shot.get("offset", 0)))
+    for particle in particles:
+        move_entity(particle)
+        if "points" in particle:
+            particle["points"] = [point(position) for position in particle["points"]]
+        if particle.get("kind") == "nova_pulse":
+            particle["radius"] = NOVA_MAX_RADIUS
+    for powerup in powerups:
+        move_entity(powerup)
+
+    # Keep surviving bunker blocks together, including holes from earlier hits.
+    # Their four original group anchors are deterministic for each arena size.
+    bunker_width = len(BUNKER_SHAPE[0]) * BLOCK_SIZE
+    old_spacing = (old_size[0] - 4 * bunker_width) // 5
+    new_spacing = (new_size[0] - 4 * bunker_width) // 5
+    old_starts = [old_spacing + i * (bunker_width + old_spacing) for i in range(4)]
+    new_starts = [new_spacing + i * (bunker_width + new_spacing) for i in range(4)]
+    for block in bunkers:
+        group = min(range(4), key=lambda i: abs(block.centerx - (old_starts[i] + bunker_width / 2)))
+        block.move_ip(new_starts[group] - old_starts[group], new_size[1] - old_size[1])
 
 
 @ui_layout
@@ -685,7 +844,7 @@ ENEMY_WIDTH = 35
 ENEMY_HEIGHT = 25
 PADDING = 15
 # Status docks no longer reserve a strip of the arena. Enemy bounds begin at
-# the real top edge in every display mode; the arena is letterboxed, not offset.
+# the real top edge in every display mode; the arena follows the window shape.
 OFFSET_Y = 0
 BOSS_SPAWN_Y = 0
 MARGIN = 50
@@ -8210,6 +8369,7 @@ def register_player_hit(player, player_rect, particles, lives_font, lives_messag
     now = pygame.time.get_ticks()
     if (player.get("eliminated", False) or player.get("respawn_until", 0) > now
             or player.get("shield_until", 0) > now
+            or player.get("resize_invuln_until", 0) > now
             or (not bypass_durability and player.get("durability_invuln_until", 0) > now)):
         return lives_message
     update_durability([player], now)
@@ -8253,6 +8413,7 @@ def death(enemies, enemy_bullets, particles, players, lives_font, lives_message)
             not player["eliminated"]
             and player["respawn_until"] <= now
             and player["shield_until"] <= now
+            and player.get("resize_invuln_until", 0) <= now
         )
         player_rects.append(
             pygame.Rect(player["x"], player["y"], PLAYER_WIDTH, PLAYER_HEIGHT)
@@ -8265,7 +8426,8 @@ def death(enemies, enemy_bullets, particles, players, lives_font, lives_message)
         player = players[index]
         player_rects[index] = (
             None if (player["eliminated"] or player["respawn_until"] > now
-                     or player["shield_until"] > now)
+                     or player["shield_until"] > now
+                     or player.get("resize_invuln_until", 0) > now)
             else pygame.Rect(player["x"], player["y"], PLAYER_WIDTH, PLAYER_HEIGHT)
         )
 
@@ -9249,7 +9411,7 @@ def main():
         display_manager.preferences["window_size"] = [max(320, min(1280, round(desktop[0] * .92))),
                                                         max(240, min(720, round(desktop[1] * .88)))]
     display_manager.open()
-    SCREEN_WIDTH, SCREEN_HEIGHT = WORLD_SIZE
+    resize_arena_state(WORLD_SIZE, display_manager.world_surface.get_size())
     screen = display_manager.world_surface
     pygame.display.set_caption("Space Invaders")
 
@@ -9261,7 +9423,7 @@ def main():
     round_font = pygame.font.SysFont(None, 72)
     lives_font = pygame.font.SysFont(None, 36)
     native_ui_underlay = None
-    native_threats = pygame.Surface(WORLD_SIZE, pygame.SRCALPHA).convert_alpha()
+    native_threats = pygame.Surface(screen.get_size(), pygame.SRCALPHA).convert_alpha()
 
     player_sprites = [
         generate_pixel_sprite(PLAYER_ART, color, PLAYER_WIDTH, PLAYER_HEIGHT)
@@ -9344,8 +9506,17 @@ def main():
             AUDIO_MANAGER.music_channel.unpause()
 
     def activate_frame_ui():
+        nonlocal native_threats
         arena = game_started and not game_over and not campaign_complete
         surface = display_manager.activate(arena)
+        world_size = display_manager.world_surface.get_size()
+        if world_size != (SCREEN_WIDTH, SCREEN_HEIGHT):
+            resize_arena_state((SCREEN_WIDTH, SCREEN_HEIGHT), world_size, players, enemies,
+                               enemy_bullets, player_bullets, bunkers, particles, powerups,
+                               now=(paused_at if paused and paused_at is not None else
+                                    transition_started_at if transitioning else pygame.time.get_ticks()))
+        if native_threats.get_size() != world_size:
+            native_threats = pygame.Surface(world_size, pygame.SRCALPHA).convert_alpha()
         layout = menu_control_layout()
         if arena:
             layout["display_button_rect"] = gameplay_display_button_rect(
@@ -10071,7 +10242,7 @@ def main():
     display_manager.flush_preferences(force=True)
     _UI_LAYOUT_SIZE = None
     _UI_POINTER_POS = None
-    SCREEN_WIDTH, SCREEN_HEIGHT = WORLD_SIZE
+    resize_arena_state((SCREEN_WIDTH, SCREEN_HEIGHT), WORLD_SIZE)
     pygame.quit()
     sys.exit()
 
