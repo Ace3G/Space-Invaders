@@ -939,7 +939,7 @@ DURABILITY_HIT_INVULN_MS = 450
 # Eligible discharges arc to a second foe if one is in range, then roll for
 # extra hops. The hop list limits the total number of additional targets.
 LIGHTNING_HOP_CHANCES = (1.0, 0.85, 0.65, 0.45, 0.25)
-BOMB_BLAST_RADIUS = 62
+BOMB_BLAST_RADIUS = 96
 BULLET_TIME_RADIUS = 150
 GRAVITY_FIELD_RADIUS = 150
 GRAVITY_MAX_PROJECTILE_TURN = 0.65  # Total radians; a field cannot trap a shot in orbit.
@@ -3267,6 +3267,24 @@ def spawn_pop_particles(x, y, color, particles):
         particles.append(ring)
 
 
+def spawn_bomb_blast(x, y, color, radius, particles):
+    if _POTATO_MODE:
+        return
+    effect_cap = 96 if _ADAPTIVE_LOW_EFFECTS else MAX_EFFECT_PARTICLES
+    if len(particles) < effect_cap:
+        particles.append({
+            "kind": "bomb_blast",
+            "x": x,
+            "y": y,
+            "dx": 0,
+            "dy": 0,
+            "radius": radius,
+            "color": color,
+            "lifetime": 22,
+            "max_lifetime": 22,
+        })
+
+
 def update_and_draw_particles(screen, particles, advance=True):
     effect_cap = 48 if _POTATO_MODE else (96 if _ADAPTIVE_LOW_EFFECTS else MAX_EFFECT_PARTICLES)
     if _POTATO_MODE and advance:
@@ -3330,6 +3348,21 @@ def update_and_draw_particles(screen, particles, advance=True):
                 pygame.draw.circle(pulse, (*p["color"], alpha), center, radius, 3)
                 pygame.draw.circle(pulse, (*UI_TEXT, alpha // 2), center, max(1, radius - 9), 1)
                 screen.blit(pulse, bounds.topleft)
+        elif p.get("kind") == "bomb_blast":
+            progress = 1 - p["lifetime"] / p["max_lifetime"]
+            radius = max(1, round(p["radius"] * progress))
+            position = (round(p["x"]), round(p["y"]))
+            bounds = pygame.Rect(position[0] - radius - 3, position[1] - radius - 3,
+                                 radius * 2 + 7, radius * 2 + 7).clip(screen.get_clip())
+            if not bounds.width or not bounds.height:
+                continue
+            pulse = pygame.Surface(bounds.size, pygame.SRCALPHA)
+            center = (position[0] - bounds.x, position[1] - bounds.y)
+            alpha = round(190 * (1 - progress))
+            pygame.draw.circle(pulse, (*p["color"], alpha), center, radius, 4)
+            pygame.draw.circle(pulse, (*UI_GOLD, alpha // 2), center,
+                               max(1, radius - 7), 2)
+            screen.blit(pulse, bounds.topleft)
         elif p.get("kind") == "ring":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             ring_radius = int(p["radius"] + progress * 28)
@@ -6597,6 +6630,7 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
                 spawn_pop_particles(*center, color, particles)
                 hit_ids = bullet.setdefault("volley_hits", set())
                 blast_radius = bullet.get("blast_radius", BOMB_BLAST_RADIUS)
+                spawn_bomb_blast(*center, color, blast_radius, particles)
                 blast_candidates = nearby_enemy_candidates(
                     enemy_grid, center[0], center[1], blast_radius + 128, 128)
                 for other in blast_candidates:
@@ -6662,6 +6696,10 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
 
 def draw_exit_button(screen, exit_button_rect, font):
     draw_neon_button(screen, exit_button_rect, "SAVE FILES", font, UI_CORAL)
+
+
+def draw_main_menu_button(screen, main_menu_button_rect, font):
+    draw_neon_button(screen, main_menu_button_rect, "MAIN MENU", font, UI_VIOLET)
 
 
 def draw_pause_button(screen, pause_button_rect, font, paused):
@@ -6770,7 +6808,9 @@ def menu_control_layout():
     previous = journal_back.move(-nav_width - 12, 0)
     following = journal_back.move(nav_width + 12, 0)
     exit_rect = pygame.Rect(0, 0, 124, 32)
-    exit_rect.midtop = (cx, SCREEN_HEIGHT - 124)
+    exit_rect.midtop = (cx - 68, SCREEN_HEIGHT - 124)
+    main_menu = pygame.Rect(0, 0, 124, 32)
+    main_menu.midtop = (cx + 68, SCREEN_HEIGHT - 124)
     pause_width = min(104, max(48, round(SCREEN_WIDTH * 0.09)))
     pause = pygame.Rect(cx - pause_width // 2, SCREEN_HEIGHT - 40, pause_width, 28)
     play_again = pygame.Rect(0, 0, min(230, SCREEN_WIDTH - 40), 47)
@@ -6789,6 +6829,7 @@ def menu_control_layout():
             "journal_button_rect": journal, "choice_button_rects": choices,
             "journal_previous_rect": previous, "journal_next_rect": following,
             "journal_back_rect": journal_back, "exit_button_rect": exit_rect,
+            "main_menu_button_rect": main_menu,
             "pause_button_rect": pause, "play_again_rect": play_again,
             "checkpoint_rect": checkpoint, "infinite_mode_rect": infinite,
             "display_button_rect": pygame.Rect(SCREEN_WIDTH - (62 if SCREEN_WIDTH < 900 else 112),
@@ -6868,13 +6909,13 @@ def saved_run_can_continue(snapshot):
 @ui_scene
 def draw_save_browser(screen, saved_slots, title_font, button_font, font,
                       pending_replace_slot=None, save_error=None, pending_save_action=None,
-                      save_status=None):
+                      save_status=None, show_main_menu=True):
     """Independent save cards with confirmed replacement, deletion and transfers."""
     draw_space_background(screen, "menu")
     layout = save_browser_layout()
     if layout["compact"]:
         draw_compact_save_browser(screen, saved_slots, layout, title_font, button_font, font,
-                                  save_error, save_status)
+                                  save_error, save_status, show_main_menu)
         if pending_replace_slot is not None:
             action = {"kind": "import", "slot": pending_replace_slot,
                       "stage": "overwrite", "path": "", "error": None,
@@ -6951,7 +6992,8 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
                                 True, UI_CORAL if save_error else UI_MINT if save_status else UI_MUTED)
     footer_y = min(layout["back"].top - 24, layout["cards"][0]["panel"].bottom + 30)
     screen.blit(footer, footer.get_rect(center=(SCREEN_WIDTH // 2, footer_y)))
-    draw_neon_button(screen, layout["back"], "MAIN MENU", font, UI_VIOLET)
+    if show_main_menu:
+        draw_neon_button(screen, layout["back"], "MAIN MENU", font, UI_VIOLET)
     draw_neon_button(screen, layout["quit"], "QUIT GAME", font, UI_CORAL)
     if pending_replace_slot is not None:
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
@@ -6972,7 +7014,7 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
 
 
 def draw_compact_save_browser(screen, saved_slots, layout, title_font, button_font, font,
-                               save_error=None, save_status=None):
+                               save_error=None, save_status=None, show_main_menu=True):
     low = SCREEN_HEIGHT < 500
     draw_fitted_text(screen, "SAVED RUNS", title_font, UI_CYAN,
                      pygame.Rect(20, 12, SCREEN_WIDTH - 40, 42 if low else 60))
@@ -7022,7 +7064,8 @@ def draw_compact_save_browser(screen, saved_slots, layout, title_font, button_fo
                                       ("export", "EXPORT", UI_CYAN, snapshot is not None),
                                       ("import", "IMPORT", UI_GOLD, True)):
         draw_neon_button(screen, card[key], label, font, color, enabled=enabled)
-    draw_neon_button(screen, layout["back"], "MAIN MENU", font, UI_VIOLET)
+    if show_main_menu:
+        draw_neon_button(screen, layout["back"], "MAIN MENU", font, UI_VIOLET)
     draw_neon_button(screen, layout["quit"], "QUIT GAME", font, UI_CORAL)
     if save_error or save_status:
         draw_fitted_text(screen, save_error or save_status, font, UI_CORAL if save_error else UI_MINT,
@@ -7830,6 +7873,36 @@ def draw_spawn_shield(screen, x, y, spark_color, now):
         spark_x = center[0] + round(math.cos(angle) * radius)
         spark_y = center[1] + round(math.sin(angle) * radius)
         pygame.draw.circle(screen, spark_color, (spark_x, spark_y), 3)
+
+
+def draw_respawn_charge(screen, x, y, spark_color, now, respawn_until):
+    remaining = max(0, respawn_until - now)
+    progress = min(1.0, max(0.0, 1 - remaining / RESPAWN_DURATION))
+    if progress < 0.75:
+        radius = 10 + round(40 * progress / 0.75)
+        implode = 0.0
+    else:
+        implode = (progress - 0.75) / 0.25
+        radius = round(50 * (1 - implode) + 4 * implode)
+
+    center = (round(x + PLAYER_WIDTH / 2), round(y + PLAYER_HEIGHT / 2))
+    phase = now / 180
+    ring_color = blend_color(spark_color, UI_CYAN, 0.45)
+    thickness = 1 if _POTATO_MODE else 2
+    for index in range(3):
+        ring_radius = max(3, round(radius * (0.72 + 0.28 * math.sin(phase + index * 2.1))))
+        bounds = pygame.Rect(center[0] - ring_radius, center[1] - ring_radius,
+                             ring_radius * 2, ring_radius * 2)
+        start = phase + index * math.tau / 3
+        pygame.draw.arc(screen, ring_color, bounds, start, start + math.pi * 1.35, thickness)
+        spark_radius = max(2, round(ring_radius * (1 - 0.68 * implode)))
+        spark = (round(center[0] + math.cos(start) * spark_radius),
+                 round(center[1] + math.sin(start) * spark_radius))
+        pygame.draw.circle(screen, spark_color, spark, 2 if _POTATO_MODE else 3)
+
+    core_radius = round(2 + 5 * implode)
+    pygame.draw.circle(screen, UI_TEXT, center, core_radius)
+    pygame.draw.circle(screen, ring_color, center, core_radius + 4, thickness)
 
 
 def draw_powerup_icon(screen, powerup_type, center):
@@ -8852,7 +8925,8 @@ def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=
 
 
 def draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, paused,
-                              save_error=None, display_button_rect=None, fps=None):
+                              save_error=None, display_button_rect=None, fps=None,
+                              main_menu_button_rect=None):
     """Pause controls use the same GUI coordinates as pointer hit testing."""
     with ui_dimensions(screen.get_size()):
         if fps is not None and display_button_rect is not None:
@@ -8866,6 +8940,8 @@ def draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, 
         if paused:
             draw_pause_overlay(screen, font, save_error)
             draw_exit_button(screen, exit_button_rect, font)
+            if main_menu_button_rect is not None:
+                draw_main_menu_button(screen, main_menu_button_rect, font)
         draw_pause_button(screen, pause_button_rect, font, paused)
 
 
@@ -8978,7 +9054,7 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
                                  bullet["rect"].inflate(-3, -3), border_radius=2)
 
 
-def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, particles, powerups, players, exit_button_rect, pause_button_rect, font, paused=False, paused_at=None, time_override=None, round_num=1, save_error=None, ui_surface=None, defer_ui_overlay=False, defer_native_ui=False):
+def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, particles, powerups, players, exit_button_rect, pause_button_rect, font, paused=False, paused_at=None, time_override=None, round_num=1, save_error=None, ui_surface=None, defer_ui_overlay=False, defer_native_ui=False, main_menu_button_rect=None):
     now = paused_at if paused and paused_at is not None else pygame.time.get_ticks()
     if time_override is not None:
         now = time_override
@@ -9110,7 +9186,12 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
     update_and_draw_particles(screen, particles, advance=not paused)
 
     for player in players:
-        if player["eliminated"] or player["respawn_until"] > now:
+        if player["eliminated"]:
+            continue
+        if player["respawn_until"] > now:
+            spawn_x, spawn_y = safe_player_spawn(player, players)
+            draw_respawn_charge(screen, spawn_x, spawn_y, player["color"],
+                                now, player["respawn_until"])
             continue
         draw_support_powerups(screen, player, now)
         draw_animated_player(screen, player, now)
@@ -9121,10 +9202,12 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
     if not defer_native_ui:
         draw_hostile_projectiles(screen, enemy_bullets, now, enemies)
     if ui_surface is None and not defer_native_ui:
-        draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, paused, save_error)
+        draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, paused,
+                                 save_error, main_menu_button_rect=main_menu_button_rect)
     elif ui_surface is not None and not defer_ui_overlay and not defer_native_ui:
         ui_surface.fill((0, 0, 0, 0))
-        draw_gameplay_ui_overlay(ui_surface, exit_button_rect, pause_button_rect, font, paused, save_error)
+        draw_gameplay_ui_overlay(ui_surface, exit_button_rect, pause_button_rect, font, paused,
+                                 save_error, main_menu_button_rect=main_menu_button_rect)
         composite_gameplay_ui(screen, ui_surface, ui_surface.get_bounding_rect())
 
 
@@ -10397,6 +10480,7 @@ def main():
     active_slot = None
     saved_run = None
     save_browser_open = False
+    save_browser_from_gameplay = False
     pending_replace_slot = None
     pending_save_action = None
     save_status = None
@@ -10749,6 +10833,7 @@ def main():
                     pending_replace_slot = None
                 else:
                     save_browser_open = False
+                    save_browser_from_gameplay = False
                 keyboard.discard_taps()
 
             if (
@@ -10768,7 +10853,9 @@ def main():
                         if pending_replace_slot is not None:
                             ui_targets = [(layout["confirm"], UI_CORAL), (layout["cancel"], UI_CYAN)]
                         else:
-                            ui_targets = [(layout["back"], UI_CYAN), (layout["quit"], UI_CORAL)]
+                            ui_targets = [(layout["quit"], UI_CORAL)]
+                            if not save_browser_from_gameplay:
+                                ui_targets.append((layout["back"], UI_CYAN))
                             for card in layout["cards"]:
                                 snapshot = saved_slots[card["slot"] - 1]
                                 ui_targets.append((card["new"], UI_MINT))
@@ -10802,6 +10889,7 @@ def main():
                     ui_targets = [(controls["pause_button_rect"], UI_MINT if paused else UI_CYAN)]
                     if paused:
                         ui_targets.append((controls["exit_button_rect"], UI_CORAL))
+                        ui_targets.append((controls["main_menu_button_rect"], UI_VIOLET))
                 for ui_rect, ui_color in ui_targets:
                     if ui_rect.collidepoint(event.pos):
                         register_ui_click(event.pos, ui_color)
@@ -10814,8 +10902,10 @@ def main():
                                 requested_run = (pending_replace_slot, None)
                             elif layout["cancel"].collidepoint(event.pos):
                                 pending_replace_slot = None
-                        elif layout["back"].collidepoint(event.pos):
+                        elif (not save_browser_from_gameplay
+                              and layout["back"].collidepoint(event.pos)):
                             save_browser_open = False
+                            save_browser_from_gameplay = False
                         elif layout["quit"].collidepoint(event.pos):
                             running = False
                         else:
@@ -10865,6 +10955,7 @@ def main():
                         elif controls["continue_button_rect"].collidepoint(event.pos):
                             saved_slots = list_saved_runs()
                             save_browser_open = True
+                            save_browser_from_gameplay = False
                             pending_replace_slot = None
                         elif controls["start_button_rect"].collidepoint(event.pos):
                             saved_slots = list_saved_runs()
@@ -10872,6 +10963,7 @@ def main():
                                               if not save_slot_occupied(slot)), None)
                             if free_slot is None:
                                 save_browser_open = True
+                                save_browser_from_gameplay = False
                                 pending_replace_slot = None
                             else:
                                 requested_run = (free_slot, None)
@@ -10914,6 +11006,7 @@ def main():
                         checkpoint = save_sector_checkpoint(players, round_num)
                         saved_slots = list_saved_runs()
                         save_browser_open = True
+                        save_browser_from_gameplay = False
                         pending_replace_slot = None
                         keyboard.discard_taps()
                         enemies, bunkers, enemy_bullets, player_bullets, particles, powerups, enemy_dx = reset_game_state(round_num)
@@ -10973,6 +11066,17 @@ def main():
                     if controls["pause_button_rect"].collidepoint(event.pos):
                         keyboard.discard_taps()
                         set_game_paused(not paused)
+                    elif paused and controls["main_menu_button_rect"].collidepoint(event.pos):
+                        keyboard.discard_taps()
+                        set_game_paused(False)
+                        game_started = False
+                        game_over = False
+                        campaign_complete = False
+                        save_browser_open = False
+                        save_browser_from_gameplay = False
+                        pending_replace_slot = None
+                        pending_save_action = None
+                        saved_slots = list_saved_runs()
                     elif paused and controls["exit_button_rect"].collidepoint(event.pos):
                         keyboard.discard_taps()
                         paused = False
@@ -10986,6 +11090,7 @@ def main():
                         checkpoint = save_sector_checkpoint(players, round_num)
                         saved_slots = list_saved_runs()
                         save_browser_open = True
+                        save_browser_from_gameplay = True
                         pending_replace_slot = None
                         enemies, bunkers, enemy_bullets, player_bullets, particles, powerups, enemy_dx = reset_game_state(round_num)
                         transitioning = True
@@ -11018,6 +11123,7 @@ def main():
                 campaign_complete = False
                 enemy_journal_open = False
                 save_browser_open = False
+                save_browser_from_gameplay = False
                 pending_replace_slot = None
                 pending_save_action = None
                 save_status = None
@@ -11042,7 +11148,8 @@ def main():
                 draw_save_browser(screen, saved_slots, title_font, button_font,
                                   player_choice_font, pending_replace_slot=pending_replace_slot,
                                   save_error=save_error, pending_save_action=pending_save_action,
-                                  save_status=save_status)
+                                  save_status=save_status,
+                                  show_main_menu=not save_browser_from_gameplay)
             elif enemy_journal_open:
                 draw_enemy_journal(
                     screen,
@@ -11261,7 +11368,8 @@ def main():
                 draw_gameplay_ui_overlay(ui_surface, controls["exit_button_rect"],
                                          controls["pause_button_rect"], player_choice_font,
                                          paused, save_error,
-                                         controls["display_button_rect"], smoothed_fps)
+                                         controls["display_button_rect"], smoothed_fps,
+                                         controls["main_menu_button_rect"])
                 if not paused:
                     lives_message = draw_lives_text(ui_surface, lives_message)
                 if pending_save_action is None and pending_replace_slot is None:
