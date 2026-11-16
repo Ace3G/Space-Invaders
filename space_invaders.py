@@ -20,12 +20,49 @@ import pygame
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
-GAME_BUILD_ID = "2026.11.10-performance"
+GAME_BUILD_ID = "2026.11.16-stamina-ui"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
+GRAPHICS_DEFAULTS = {
+    "graphics_preset": "default",
+    "particles": "full",
+    "animations": True,
+    "glow": True,
+    "background": "full",
+    "trails": True,
+    "auto_effects": True,
+    "world_filter": "smooth",
+    "ui_theme": "neon",
+    "hud_opacity": "auto",
+    "text_outline": "auto",
+    "ship_names": True,
+}
+GRAPHICS_SETTING_OPTIONS = {
+    "particles": ("off", "reduced", "full"),
+    "animations": (True, False),
+    "glow": (True, False),
+    "background": ("off", "stars", "full"),
+    "trails": (True, False),
+    "auto_effects": (True, False),
+    "world_filter": ("smooth", "pixel"),
+    "ui_theme": ("neon", "ice", "amber", "rose", "mono"),
+    "hud_opacity": ("auto", "light", "medium", "solid"),
+    "text_outline": ("auto", "on", "off"),
+    "ship_names": (True, False),
+}
+GRAPHICS_PRESET_OPTIONS = ("default", "performance", "potato")
+# Presets tune rendering cost while keeping interface and readability choices.
+GRAPHICS_PRESETS = {
+    "default": {key: GRAPHICS_DEFAULTS[key] for key in (
+        "particles", "animations", "glow", "background", "trails", "auto_effects", "world_filter")},
+    "performance": {"particles": "reduced", "animations": False,
+                    "glow": False, "background": "stars", "trails": False,
+                    "auto_effects": True, "world_filter": "pixel"},
+}
 DISPLAY_SETTINGS_FILE = Path.home() / ".neon_frontier" / "display_settings.json"
 _POTATO_MODE = False
+_GRAPHICS_SETTINGS = dict(GRAPHICS_DEFAULTS)
 _ADAPTIVE_LOW_EFFECTS = False
 _ADAPTIVE_BAD_FRAMES = 0
 _ADAPTIVE_GOOD_FRAMES = 0
@@ -35,11 +72,53 @@ _UI_DIMENSION_DEPTH = 0
 
 
 def low_effects_mode():
-    return _POTATO_MODE or _ADAPTIVE_LOW_EFFECTS
+    return _POTATO_MODE or (_ADAPTIVE_LOW_EFFECTS and _GRAPHICS_SETTINGS["auto_effects"])
 
 
 def animation_slowdown():
-    return 4 if _POTATO_MODE else (2 if _ADAPTIVE_LOW_EFFECTS else 1)
+    return 4 if _POTATO_MODE else (2 if low_effects_mode() else 1)
+
+
+def graphics_settings_values():
+    """Configured choices, before temporary Potato or adaptive reductions."""
+    return dict(_GRAPHICS_SETTINGS)
+
+
+def graphics_option(name):
+    """Read an effective visual setting without changing any gameplay state."""
+    value = _GRAPHICS_SETTINGS.get(name)
+    if _POTATO_MODE:
+        if name in ("animations", "glow", "trails"):
+            return False
+        if name in ("particles", "background"):
+            return "off"
+        if name == "world_filter":
+            return "pixel"
+    if _ADAPTIVE_LOW_EFFECTS and _GRAPHICS_SETTINGS["auto_effects"]:
+        if name == "particles" and value == "full":
+            return "reduced"
+        if name == "background" and value == "full":
+            return "stars"
+    return value
+
+
+def graphics_feature_enabled(name):
+    value = graphics_option(name)
+    if name == "text_outline":
+        return value == "on" or (value == "auto" and not _POTATO_MODE)
+    return bool(value)
+
+
+def graphics_particle_level():
+    return graphics_option("particles")
+
+
+def graphics_background_level():
+    return graphics_option("background")
+
+
+def effective_world_filter():
+    return graphics_option("world_filter")
 
 
 def reset_animation_graphics(players=(), enemies=(), clear_caches=True):
@@ -73,6 +152,7 @@ def reset_animation_graphics(players=(), enemies=(), clear_caches=True):
         _HUD_PANEL_KEYS.clear()
         _HUD_FONTS.clear()
         _UI_TEXT_CACHE.clear()
+        _UI_TITLE_CACHE.clear()
         _GAMEPLAY_UI_SCALE_TARGET = None
         _GAMEPLAY_UI_REGION_TARGET = None
 
@@ -80,6 +160,14 @@ def reset_animation_graphics(players=(), enemies=(), clear_caches=True):
 def update_adaptive_quality(frame_ms):
     """Reduce only visuals when sustained frame-time spikes are detected."""
     global _ADAPTIVE_LOW_EFFECTS, _ADAPTIVE_BAD_FRAMES, _ADAPTIVE_GOOD_FRAMES
+    if not graphics_feature_enabled("auto_effects"):
+        was_reduced = _ADAPTIVE_LOW_EFFECTS
+        _ADAPTIVE_LOW_EFFECTS = False
+        _ADAPTIVE_BAD_FRAMES = 0
+        _ADAPTIVE_GOOD_FRAMES = 0
+        if was_reduced:
+            reset_animation_graphics(clear_caches=True)
+        return
     if _POTATO_MODE:
         return
     if frame_ms >= 24:
@@ -179,30 +267,47 @@ def display_preferences_path():
     return (save_file.parent / "display_settings.json") if save_file is not None else DISPLAY_SETTINGS_FILE
 
 
+def _validated_display_preferences(data):
+    """Validate fields separately so one obsolete choice cannot erase good ones."""
+    preferences = {"gui_scale": 1.0, "fullscreen": False,
+                   "window_size": [1280, 720], "potato_mode": False,
+                   "fps_mode": "auto", **GRAPHICS_DEFAULTS}
+    if not isinstance(data, dict):
+        return preferences
+    scale = data.get("gui_scale")
+    if type(scale) in (int, float) and scale in GUI_SCALE_STEPS:
+        preferences["gui_scale"] = float(scale)
+    for key in ("fullscreen", "potato_mode"):
+        if type(data.get(key)) is bool:
+            preferences[key] = data[key]
+    size = data.get("window_size")
+    if (isinstance(size, list) and len(size) == 2
+            and all(type(value) is int for value in size)
+            and 320 <= size[0] <= 7680 and 240 <= size[1] <= 4320):
+        preferences["window_size"] = list(size)
+    fps_mode = data.get("fps_mode")
+    if type(fps_mode) in (str, int) and fps_mode in FPS_MODES:
+        preferences["fps_mode"] = fps_mode
+    for key, options in GRAPHICS_SETTING_OPTIONS.items():
+        value = data.get(key)
+        if key == "text_outline" and type(value) is bool:
+            value = "on" if value else "off"
+        if any(type(value) is type(option) and value == option for option in options):
+            preferences[key] = value
+    if data.get("graphics_preset") in ("default", "performance", "custom"):
+        preferences["graphics_preset"] = data["graphics_preset"]
+    return preferences
+
+
 def load_display_preferences(filename=None):
-    defaults = {"gui_scale": 1.0, "fullscreen": False, "window_size": [1280, 720], "potato_mode": False, "fps_mode": "auto"}
     filename = display_preferences_path() if filename is None else Path(filename)
     try:
         if not filename.exists() or filename.stat().st_size > 4096:
-            return defaults
+            return _validated_display_preferences(None)
         data = json.loads(filename.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return defaults
-        scale = data.get("gui_scale", 1.0)
-        fullscreen = data.get("fullscreen", False)
-        size = data.get("window_size", [1280, 720])
-        potato_mode = data.get("potato_mode", False)
-        fps_mode = data.get("fps_mode", "auto")
-        if (type(scale) not in (int, float) or scale not in GUI_SCALE_STEPS
-                or type(fullscreen) is not bool or type(potato_mode) is not bool
-                or fps_mode not in FPS_MODES or not isinstance(size, list)
-                or len(size) != 2 or any(type(value) is not int for value in size)
-                or not 320 <= size[0] <= 7680 or not 240 <= size[1] <= 4320):
-            return defaults
-        return {"gui_scale": float(scale), "fullscreen": fullscreen, "window_size": size,
-                "potato_mode": potato_mode, "fps_mode": fps_mode}
+        return _validated_display_preferences(data)
     except (OSError, ValueError, TypeError, RecursionError):
-        return defaults
+        return _validated_display_preferences(None)
 
 
 def save_display_preferences(preferences, filename=None):
@@ -234,12 +339,9 @@ class DisplayManager:
 
     def __init__(self, preferences=None, settings_file=None):
         self.settings_file = display_preferences_path() if settings_file is None else Path(settings_file)
-        self.preferences = dict(preferences or load_display_preferences(self.settings_file))
-        self.preferences["window_size"] = list(self.preferences["window_size"])
-        self.preferences.setdefault("potato_mode", False)
-        self.preferences.setdefault("fps_mode", "auto")
-        global _POTATO_MODE
-        _POTATO_MODE = bool(self.preferences["potato_mode"])
+        self.preferences = _validated_display_preferences(
+            load_display_preferences(self.settings_file) if preferences is None else preferences)
+        self._sync_graphics_preferences()
         self.display = None
         self.world_surface = pygame.Surface(WORLD_SIZE)
         self.ui_surface = None
@@ -262,6 +364,51 @@ class DisplayManager:
         self._auto_probe_duration_ms = 1500
         self._auto_warmup_duration_ms = 3000
         self._auto_probe_interval_ms = 12000
+
+    def _sync_graphics_preferences(self):
+        global _POTATO_MODE, _ADAPTIVE_LOW_EFFECTS, _ADAPTIVE_BAD_FRAMES, _ADAPTIVE_GOOD_FRAMES
+        changed = (_ADAPTIVE_LOW_EFFECTS
+                   or _POTATO_MODE != self.preferences["potato_mode"]
+                   or any(_GRAPHICS_SETTINGS[key] != self.preferences[key]
+                          for key in GRAPHICS_DEFAULTS))
+        _POTATO_MODE = self.preferences["potato_mode"]
+        _GRAPHICS_SETTINGS.update({key: self.preferences[key] for key in GRAPHICS_DEFAULTS})
+        _ADAPTIVE_LOW_EFFECTS = False
+        _ADAPTIVE_BAD_FRAMES = 0
+        _ADAPTIVE_GOOD_FRAMES = 0
+        if changed:
+            reset_animation_graphics(clear_caches=True)
+
+    def _graphics_preferences_changed(self):
+        self._sync_graphics_preferences()
+        self._invalidate()
+        self._save()
+
+    def graphics_preset_name(self):
+        return "potato" if self.preferences["potato_mode"] else self.preferences["graphics_preset"]
+
+    def cycle_graphics_setting(self, key, direction=1):
+        """Cycle one configured option; Potato remains a reversible override."""
+        options = GRAPHICS_SETTING_OPTIONS[key]
+        current = self.preferences[key]
+        index = options.index(current)
+        self.preferences[key] = options[(index + direction) % len(options)]
+        self.preferences["graphics_preset"] = "custom"
+        self._graphics_preferences_changed()
+        return self.preferences[key]
+
+    def apply_graphics_preset(self, name):
+        name = str(name).lower()
+        if name == "potato":
+            self.preferences["potato_mode"] = True
+        elif name in GRAPHICS_PRESETS:
+            self.preferences.update(GRAPHICS_PRESETS[name])
+            self.preferences["graphics_preset"] = name
+            self.preferences["potato_mode"] = False
+        else:
+            raise ValueError("Unknown graphics preset: " + name)
+        self._graphics_preferences_changed()
+        return self.graphics_preset_name()
 
     def open(self):
         flags = pygame.FULLSCREEN if self.preferences["fullscreen"] else pygame.RESIZABLE
@@ -491,15 +638,8 @@ class DisplayManager:
         return self.preferences["fps_mode"]
 
     def toggle_potato_mode(self):
-        global _POTATO_MODE, _ADAPTIVE_LOW_EFFECTS, _ADAPTIVE_BAD_FRAMES, _ADAPTIVE_GOOD_FRAMES
         self.preferences["potato_mode"] = not bool(self.preferences.get("potato_mode", False))
-        _POTATO_MODE = self.preferences["potato_mode"]
-        _ADAPTIVE_LOW_EFFECTS = False
-        _ADAPTIVE_BAD_FRAMES = 0
-        _ADAPTIVE_GOOD_FRAMES = 0
-        reset_animation_graphics(clear_caches=True)
-        self._invalidate()
-        self._save()
+        self._graphics_preferences_changed()
         return _POTATO_MODE
 
     def _present_layer(self, surface, region, name, bounds=None):
@@ -519,7 +659,7 @@ class DisplayManager:
         if target is None or target.get_size() != region.size:
             target = pygame.Surface(region.size, pygame.SRCALPHA)
             self._layer_targets[name] = target
-        scaler = pygame.transform.scale if _POTATO_MODE and name == "threats" else pygame.transform.smoothscale
+        scaler = pygame.transform.scale if name == "threats" and effective_world_filter() == "pixel" else pygame.transform.smoothscale
         scaler(surface, region.size, target)
         if bounds is None:
             self.display.blit(target, region)
@@ -544,7 +684,7 @@ class DisplayManager:
             if self._presentation_size != region.size:
                 self._presentation = pygame.Surface(region.size)
                 self._presentation_size = region.size
-            scaler = pygame.transform.scale if _POTATO_MODE and arena else pygame.transform.smoothscale
+            scaler = pygame.transform.scale if arena and effective_world_filter() == "pixel" else pygame.transform.smoothscale
             scaler(surface, region.size, self._presentation)
             self.display.blit(self._presentation, region)
         self._present_layer(ui_underlay, gui_region, "underlay", ui_underlay_bounds)
@@ -669,14 +809,38 @@ def resize_arena_state(old_size, new_size, players=(), enemies=(), enemy_bullets
             move_rect(rect, area=True)
         if warning.get("safe_gap") is not None:
             move_rect(warning["safe_gap"], area=True)
+        for gap in warning.get("safe_gaps", ()):
+            move_rect(gap, area=True)
         for rect, _, _ in warning.get("walls", ()):
             move_rect(rect, area=True)
+        fronts = warning.get("wall_fronts", ())
+        for front in fronts:
+            move_rect(front["gap"], area=True)
+        if warning.get("pattern") == "portcullis" and len(fronts) == 2:
+            first = warning["walls"][fronts[0]["wall_indices"][0]][0]
+            second = warning["walls"][fronts[1]["wall_indices"][0]][0]
+            separation = milestone_front_separation(fronts[0]["gap"], fronts[1]["gap"],
+                                                     fronts[1]["dy"], second.height)
+            extra_spacing = max(0, separation - (first.y - second.y))
+            for index in fronts[1]["wall_indices"]:
+                warning["walls"][index][0].y -= extra_spacing
+            fronts[1]["delay_frames"] = (first.y - second.y) / (
+                fronts[1]["dy"] * ENEMY_PROJECTILE_SPEED_MULTIPLIER)
         warning["shots"] = [(x * scale_x, y * scale_y, dx, dy, size, color)
                             for x, y, dx, dy, size, color in warning["shots"]]
         warning["target_marks"] = [point(mark) for mark in warning.get("target_marks", ())]
         gap = warning.get("safe_gap")
         moving_walls = [(rect, dy) for rect, _, dy in warning.get("walls", ()) if dy > 0]
-        if gap is not None and moving_walls:
+        if fronts:
+            positions = [(player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
+                         for player in players if not player.get("eliminated", False)
+                         and player.get("respawn_until", 0) <= now]
+            required = milestone_front_warning_frames(warning["remaining_frames"], fronts,
+                                                        warning["walls"], positions)
+            extra = required - warning["remaining_frames"]
+            warning["remaining_frames"] += extra
+            warning["warning_frames"] += extra
+        elif gap is not None and moving_walls:
             required = warning["remaining_frames"]
             for player in players:
                 if player.get("eliminated", False) or player.get("respawn_until", 0) > now:
@@ -693,7 +857,29 @@ def resize_arena_state(old_size, new_size, players=(), enemies=(), enemy_bullets
 
     for shot in enemy_bullets:
         move_entity(shot, area=bool(shot.get("laser_state") or shot.get("milestone_wall")))
+        if shot.get("milestone_gap") is not None:
+            move_rect(shot["milestone_gap"], area=True)
         sync_boss_laser_attachment(shot)
+    # An expansion can lengthen the horizontal crossing while preserving the
+    # fronts' vertical distance. Hold the incoming second front farther back.
+    portcullis_groups = {}
+    for shot in enemy_bullets:
+        if shot.get("milestone_signature") == "portcullis" and shot.get("milestone_wall"):
+            group = portcullis_groups.setdefault(id(shot.get("milestone_hit_players")), ([], []))
+            group[shot.get("milestone_front_index", 0)].append(shot)
+    for first_front, second_front in portcullis_groups.values():
+        if not first_front or not second_front:
+            continue
+        first, second = first_front[0], second_front[0]
+        if first.get("milestone_gap") is None or second.get("milestone_gap") is None:
+            continue
+        separation = milestone_front_separation(first["milestone_gap"], second["milestone_gap"],
+                                                 second["dy"] / ENEMY_PROJECTILE_SPEED_MULTIPLIER,
+                                                 second["rect"].height)
+        extra_spacing = max(0, separation - (first["rect"].y - second["rect"].y))
+        for shot in second_front:
+            shot["rect"].y -= extra_spacing
+            shot["y"] = shot.get("y", float(shot["rect"].y + extra_spacing)) - extra_spacing
     for shot in player_bullets:
         move_entity(shot)
         if isinstance(shot, dict) and shot.get("type") == "laser":
@@ -738,72 +924,144 @@ def gameplay_foreground_bounds(size, controls, lives_message=None):
     return bounds.clip(pygame.Rect((0, 0), size))
 
 
-def gameplay_status_bounds(size, players):
+def gameplay_status_bounds(size, players, enemies=(), world_size=None):
     """Blit only the top status strip, leaving untouched alpha pixels out."""
     with ui_dimensions(size):
         height = max([120, *(gameplay_hud_slot_layout(player["number"])["rect"].bottom + 4
                               for player in players)])
+        if enemies and world_size:
+            for enemy in enemies:
+                if not enemy.get("is_boss"):
+                    continue
+                projected = dict(enemy)
+                rect = enemy["rect"]
+                projected["rect"] = pygame.Rect(round(rect.x * size[0] / world_size[0]),
+                    round(rect.y * size[1] / world_size[1]),
+                    max(1, round(rect.width * size[0] / world_size[0])),
+                    max(1, round(rect.height * size[1] / world_size[1])))
+                panel = boss_status_layout(projected, pygame.Rect((0, 0), size))["panel"]
+                height = max(height, panel.bottom + 4)
+                if enemy.get("signature_warning"):
+                    caption_top = max(110, projected["rect"].bottom + 24)
+                    if panel.top >= projected["rect"].bottom:
+                        caption_top = max(caption_top, panel.bottom + 12)
+                    height = max(height, caption_top + 28)
     return pygame.Rect(0, 0, size[0], min(size[1], height))
 
 
+SETTINGS_PAGES = ("display", "graphics", "interface")
+SETTINGS_ROWS = {
+    "graphics": (("preset", "Graphics preset"), ("particles", "Decorative particles"),
+                 ("animations", "Ship animation"), ("glow", "Glow"),
+                 ("background", "Background"), ("trails", "Projectile trails"),
+                 ("auto_effects", "Auto reduce effects"), ("world_filter", "World scaling")),
+    "interface": (("ui_theme", "Color theme"), ("hud_opacity", "HUD background"),
+                  ("text_outline", "Text outlines"), ("ship_names", "Names above ships")),
+}
+POTATO_LOCKED_SETTINGS = {"particles", "animations", "glow", "background", "trails", "world_filter"}
+
+
 @ui_layout
-def display_settings_layout():
-    panel = pygame.Rect(0, 0, min(580, SCREEN_WIDTH - 36), min(460, SCREEN_HEIGHT - 24))
+def display_settings_layout(page="display"):
+    page = page if page in SETTINGS_PAGES else "display"
+    panel = pygame.Rect(0, 0, min(760, SCREEN_WIDTH - 24), min(560, SCREEN_HEIGHT - 24))
     panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
-    gap = 12
-    button_width = (panel.width - 64) // 3
-    y = panel.y + round(panel.height * .28)
-    controls = [pygame.Rect(panel.x + 20 + i * (button_width + gap), y, button_width, 42)
-                for i in range(3)]
-    mode = pygame.Rect(panel.x + 20, y + 56, panel.width - 40, 42)
-    potato = pygame.Rect(panel.x + 20, y + 112, panel.width - 40, 42)
-    fps = pygame.Rect(panel.x + 20, y + 168, panel.width - 40, 42)
-    close = pygame.Rect(0, 0, (panel.width - 52) // 2, 42)
-    close.bottomright = (panel.right - 20, panel.bottom - 18)
+    compact = panel.height < 430
+    margin, gap = 14, 6
+    tab_width = (panel.width - margin * 2 - gap * 2) // 3
+    tabs = {key: pygame.Rect(panel.x + margin + index * (tab_width + gap),
+                            panel.y + 42, tab_width, 25 if compact else 32)
+            for index, key in enumerate(SETTINGS_PAGES)}
+    footer_height = 28 if compact else 36
+    close = pygame.Rect(0, 0, (panel.width - margin * 2 - gap) // 2, footer_height)
+    close.bottomright = (panel.right - margin, panel.bottom - 10)
     keyboard = close.copy()
-    keyboard.bottomleft = (panel.left + 20, panel.bottom - 18)
-    return {"panel": panel, "smaller": controls[0], "auto": controls[1],
-            "larger": controls[2], "mode": mode, "potato": potato, "fps": fps,
-            "close": close, "keyboard": keyboard}
+    keyboard.bottomleft = (panel.left + margin, panel.bottom - 10)
+    note = pygame.Rect(panel.x + margin, close.top - 23, panel.width - margin * 2, 18)
+    top, bottom = tabs["display"].bottom + 8, note.top - 5
+    row_gap = 3 if compact else 7
+    row_height = min(38, max(20, (bottom - top - row_gap * 7) // 8))
+    label_width = (panel.width - margin * 2) * 43 // 100
+
+    def row(index):
+        return pygame.Rect(panel.x + margin + label_width, top + index * (row_height + row_gap),
+                           panel.width - margin * 2 - label_width, row_height)
+
+    controls = {}
+    scale_row = row(0)
+    scale_width = (scale_row.width - 8) // 3
+    for index, key in enumerate(("smaller", "auto", "larger")):
+        controls[key] = pygame.Rect(scale_row.x + index * (scale_width + 4),
+                                    scale_row.y, scale_width, scale_row.height)
+    controls.update(mode=row(1), potato=row(2), fps=row(3))
+    setting_rows = {key: row(index) for index, (key, _) in enumerate(SETTINGS_ROWS.get(page, ()))}
+    return {"panel": panel, "tabs": tabs, "page": page, "rows": setting_rows,
+            "close": close, "keyboard": keyboard, "note": note,
+            "label_width": label_width, "top": top, "row_height": row_height,
+            "row_gap": row_gap, **controls}
+
+
+def graphics_setting_label(manager, key):
+    if key == "preset":
+        return manager.graphics_preset_name().replace("_", " ").title()
+    value = manager.preferences[key]
+    if manager.preferences.get("potato_mode", False) and key in POTATO_LOCKED_SETTINGS:
+        return "Pixel (Potato)" if key == "world_filter" else "Off (Potato)"
+    if type(value) is bool:
+        return "On" if value else "Off"
+    labels = {"neon": "Neon", "ice": "Ice", "amber": "Amber", "rose": "Rose", "mono": "Mono",
+              "light": "Light / 10%", "medium": "Medium / 35%", "solid": "Solid",
+              "smooth": "Smooth", "pixel": "Pixel", "off": "Off", "on": "On",
+              "auto": "Auto", "stars": "Stars", "full": "Full", "reduced": "Reduced"}
+    return labels.get(value, str(value).title())
 
 
 @ui_scene
-def draw_display_settings(screen, manager, font, small_font):
+def draw_display_settings(screen, manager, font, small_font, page="display"):
     overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
     overlay.fill((2, 4, 15, 215))
     screen.blit(overlay, (0, 0))
-    layout = display_settings_layout()
+    layout = display_settings_layout(page)
     panel = layout["panel"]
     draw_neon_panel(screen, panel, UI_CYAN)
-    title = font.render("DISPLAY & GUI", True, UI_CYAN)
-    screen.blit(title, title.get_rect(midtop=(panel.centerx, panel.y + 16)))
-    scale = round(manager.preferences["gui_scale"] * 100)
-    label = small_font.render(f"GUI SIZE  {scale}%  /  AUTO FIT", True, UI_TEXT)
-    screen.blit(label, label.get_rect(midtop=(panel.centerx, panel.y + 58)))
-    for key, text in (("smaller", "SMALLER"), ("auto", "AUTO"), ("larger", "LARGER")):
-        draw_neon_button(screen, layout[key], text, small_font, UI_GOLD)
-    mode = "WINDOWED" if manager.preferences["fullscreen"] else "FULLSCREEN"
-    draw_neon_button(screen, layout["mode"], f"SWITCH TO {mode}", small_font, UI_VIOLET)
-    potato_label = "POTATO MODE  ON" if manager.preferences.get("potato_mode", False) else "POTATO MODE  OFF"
-    draw_neon_button(screen, layout["potato"], potato_label, small_font, UI_MINT)
-    fps_mode = manager.preferences.get("fps_mode", "auto")
-    if fps_mode == "auto":
-        fps_label = manager.auto_fps_label()
-    elif fps_mode == "infinite":
-        fps_label = "FPS  INFINITE"
+    draw_fitted_text(screen, "DISPLAY & CUSTOMIZATION", font, ui_theme_color(UI_CYAN),
+                     pygame.Rect(panel.x + 12, panel.y + 8, panel.width - 24, 27))
+    for key, rect in layout["tabs"].items():
+        draw_neon_button(screen, rect, key.upper(), small_font, UI_CYAN,
+                         selected=layout["page"] == key)
+    if layout["page"] == "display":
+        for index, label in enumerate((f"GUI size / {round(manager.preferences['gui_scale'] * 100)}%",
+                                       "Window mode", "Potato override", "Frame limit")):
+            draw_fitted_text(screen, label, small_font, ui_theme_color(UI_TEXT),
+                             pygame.Rect(panel.x + 14, layout["top"] + index *
+                                         (layout["row_height"] + layout["row_gap"]),
+                                         layout["label_width"] - 10, layout["row_height"]), "left")
+        for key, text in (("smaller", "−"), ("auto", "AUTO"), ("larger", "+")):
+            draw_neon_button(screen, layout[key], text, small_font, UI_GOLD)
+        mode = "Fullscreen" if manager.preferences["fullscreen"] else "Windowed"
+        draw_neon_button(screen, layout["mode"], mode, small_font, UI_VIOLET)
+        draw_neon_button(screen, layout["potato"], "On" if manager.preferences["potato_mode"] else "Off",
+                         small_font, UI_MINT)
+        fps = manager.preferences["fps_mode"]
+        text = manager.auto_fps_label() if fps == "auto" else "Infinite" if fps == "infinite" else f"{fps} FPS"
+        draw_neon_button(screen, layout["fps"], text, small_font, UI_GOLD)
+        note = "F6/F7: GUI size   F8: auto fit   F11: fullscreen   Tab: next page"
     else:
-        fps_label = f"FPS  {int(fps_mode)}"
-    draw_neon_button(screen, layout["fps"], fps_label, small_font, UI_GOLD)
-    hint = small_font.render("F6 smaller / F7 larger / F8 auto / F11 display", True, UI_MUTED)
-    if hint.get_width() > panel.width - 36:
-        hint = pygame.transform.smoothscale(hint, (panel.width - 36, max(1, round(hint.get_height() * (panel.width - 36) / hint.get_width()))))
-    hint_rect = hint.get_rect(midtop=(panel.centerx, layout["fps"].bottom + 10))
-    screen.blit(hint, hint_rect)
-    wheel_hint = small_font.render("Ctrl + wheel: GUI size / F9: keyboard controls", True, UI_MUTED)
-    screen.blit(wheel_hint, wheel_hint.get_rect(midtop=(panel.centerx, hint_rect.bottom + 3)))
+        for key, label in SETTINGS_ROWS[layout["page"]]:
+            rect = layout["rows"][key]
+            draw_fitted_text(screen, label, small_font, ui_theme_color(UI_TEXT),
+                             pygame.Rect(panel.x + 14, rect.y, layout["label_width"] - 10, rect.height), "left")
+            enabled = not (manager.preferences["potato_mode"] and key in POTATO_LOCKED_SETTINGS)
+            draw_neon_button(screen, rect, graphics_setting_label(manager, key), small_font,
+                             UI_MINT if key == "preset" else UI_CYAN, enabled=enabled)
+        note = ("Turn Potato off on Display to customize individual world effects."
+                if manager.preferences["potato_mode"] and layout["page"] == "graphics"
+                else "Pilot colors and dangerous attacks stay distinct from your interface theme."
+                if layout["page"] == "interface" else "Click an option to cycle it. Presets preserve interface choices.")
     if manager.settings_error:
-        warning = pygame.font.SysFont(None, 17).render("Settings apply; preference file could not be saved.", True, UI_CORAL)
-        screen.blit(warning, warning.get_rect(midbottom=(panel.centerx, layout["close"].top - 5)))
+        note = "Settings apply now; preferences could not be saved. Check folder access."
+    draw_fitted_text(screen, note, small_font,
+                     UI_CORAL if manager.settings_error else ui_theme_color(UI_MUTED), layout["note"])
     draw_neon_button(screen, layout["close"], "DONE", small_font, UI_MINT)
     draw_neon_button(screen, layout["keyboard"], "KEYBOARD", small_font, UI_CYAN)
 
@@ -837,6 +1095,62 @@ UI_MINT = (90, 245, 181)
 UI_CORAL = (255, 107, 112)
 UI_TEXT = (230, 243, 255)
 UI_MUTED = (140, 161, 194)
+# Themes apply at interface draw sites. World, pilot and warning colors remain
+# their original constants, including yellow (also the fourth pilot's color).
+UI_THEME_PALETTES = {
+    "neon": {"bg": UI_BG, "panel": (10, 17, 35), "button": (10, 19, 38),
+             "primary": UI_CYAN, "secondary": UI_PINK, "tertiary": UI_VIOLET,
+             "positive": UI_MINT, "text": UI_TEXT, "muted": UI_MUTED,
+             "disabled": (67, 82, 109)},
+    "ice": {"bg": (5, 14, 24), "panel": (9, 25, 40), "button": (10, 28, 45),
+            "primary": (143, 225, 255), "secondary": (196, 240, 255),
+            "tertiary": (117, 174, 237), "positive": (163, 244, 237),
+            "text": (231, 249, 255), "muted": (151, 184, 207),
+            "disabled": (67, 93, 112)},
+    "amber": {"bg": (22, 13, 5), "panel": (36, 23, 10), "button": (42, 27, 11),
+              "primary": (255, 183, 69), "secondary": (255, 135, 77),
+              "tertiary": (222, 155, 93), "positive": (237, 220, 137),
+              "text": (255, 245, 219), "muted": (201, 174, 135),
+              "disabled": (112, 88, 58)},
+    "rose": {"bg": (23, 7, 18), "panel": (38, 13, 31), "button": (42, 15, 35),
+             "primary": (255, 146, 194), "secondary": (230, 161, 255),
+             "tertiary": (202, 136, 221), "positive": (255, 199, 210),
+             "text": (255, 235, 246), "muted": (204, 155, 184),
+             "disabled": (113, 70, 98)},
+    "mono": {"bg": (10, 12, 15), "panel": (22, 25, 30), "button": (25, 28, 34),
+             "primary": (229, 236, 245), "secondary": (182, 194, 209),
+             "tertiary": (151, 165, 182), "positive": (205, 217, 229),
+             "text": (243, 246, 250), "muted": (166, 177, 192),
+             "disabled": (84, 93, 106)},
+}
+
+
+_UI_THEME_COLOR_KEYS = {
+    UI_BG: "bg", UI_CYAN: "primary", UI_PINK: "secondary",
+    UI_VIOLET: "tertiary", UI_MINT: "positive", UI_TEXT: "text",
+    UI_MUTED: "muted",
+}
+
+
+def ui_palette():
+    """Resolve a small existing palette without changing gameplay constants."""
+    return UI_THEME_PALETTES.get(graphics_option("ui_theme"), UI_THEME_PALETTES["neon"])
+
+
+def ui_theme_color(color):
+    """Theme generic interface colors while retaining pilot/warning meanings."""
+    key = _UI_THEME_COLOR_KEYS.get(tuple(color))
+    return ui_palette()[key] if key is not None else color
+
+
+def gameplay_hud_opacity():
+    """Auto retains the original quality-specific plate opacity."""
+    choice = graphics_option("hud_opacity")
+    if choice == "auto":
+        return 255 if _POTATO_MODE else 42
+    return {"light": 26, "medium": 89, "solid": 255}.get(choice, 42)
+
+
 SECTOR_COLORS = (UI_CYAN, UI_VIOLET, UI_PINK, UI_MINT, UI_GOLD)
 _SPACE_BACKGROUNDS = {}
 _GLOW_SPRITES = {}
@@ -847,6 +1161,7 @@ _UI_FRAME = 0
 _SHIP_ANIMATIONS = {}
 _ROTATED_ENEMY_SPRITES = {}
 _NOVA_LABEL_SPRITES = {}
+_UI_TITLE_CACHE = {}
 
 # Enemy Fleet Configuration Constants
 ROWS = 5
@@ -912,6 +1227,7 @@ BOSS_AIM_MAX_LEAD_PX = 135
 BOSS_LATE_EXTRA_BULLET_CAP = 12
 BOSS_LASER_WARNING_FRAMES = 90  # 1.5 seconds, including at wave 100.
 BOSS_LASER_ACTIVE_FRAMES = 180  # Three seconds of a continuous, sweeping beam.
+NORMAL_BOSS_LASER_ACTIVE_FRAMES = 270  # 4.5 seconds after the separate warning.
 BOSS_ENCOUNTER_RECOVERY_FRAMES = 48
 HEAVY_ORB_FUSE_FRAMES = 84  # Pulses visibly for 1.4 seconds before bursting.
 HEAVY_ORB_BURST_COUNT = 8
@@ -921,6 +1237,15 @@ PLAYER_WIDTH = 30
 PLAYER_HEIGHT = 24
 PLAYER_SPAWN_BOTTOM_MARGIN = 20
 PLAYER_SPEED = 3.5
+# Stamina uses simulation ticks (60/second), so pause and render FPS cannot
+# shorten a sprint or its recovery. It is transient ship state, never saved.
+PLAYER_MAX_STAMINA = 100.0
+PLAYER_SPRINT_SPEED_MULTIPLIER = 1.55
+PLAYER_STAMINA_DRAIN_PER_TICK = PLAYER_MAX_STAMINA / 180  # Three seconds.
+PLAYER_STAMINA_REGEN_PER_TICK = PLAYER_MAX_STAMINA / 210
+PLAYER_STAMINA_REGEN_DELAY_TICKS = 45
+PLAYER_EXHAUSTION_TICKS = 120
+PLAYER_EXHAUSTED_SPEED_MULTIPLIER = 0.68
 BASE_SHOT_COOLDOWN = 27
 COOP_FIRE_COOLDOWN_STEP = 0.65  # A modest team boost; each pilot still fires slower than solo.
 # Slightly stronger rapid fire as more pilots join, with per-player
@@ -974,6 +1299,7 @@ FROSTBITE_BOSS_SPEED_MULTIPLIER = 0.75
 NOVA_COUNTDOWN_MS = 3000
 NOVA_PULSE_RADIUS = 300  # Retained for save compatibility; Nova damage now covers the full screen.
 NOVA_SWEEP_MS = 900
+NOVA_REGULAR_TARGET_FRACTION = 0.70
 NOVA_MAX_RADIUS = math.ceil(math.hypot(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2))
 
 
@@ -1068,6 +1394,36 @@ def life_share_keys():
     for index, key in enumerate(preferred):
         available = next(candidate for candidate in (key, *nearby[index], *fallback, *preferred)
                          if candidate not in used and candidate not in KEYBOARD_RESERVED_KEYS)
+        chosen.append(available)
+        used.add(available)
+    return tuple(chosen)
+
+
+def sprint_keys():
+    """Keep a nearby hold key for each pilot, including older custom mappings."""
+    preferred = (pygame.K_e, pygame.K_DELETE, pygame.K_p, pygame.K_KP3)
+    nearby = (
+        (pygame.K_r, pygame.K_f, pygame.K_c, pygame.K_z, pygame.K_x, pygame.K_TAB),
+        (pygame.K_HOME, pygame.K_PAGEDOWN, pygame.K_PAGEUP, pygame.K_BACKSPACE),
+        (pygame.K_y, pygame.K_n, pygame.K_m, pygame.K_COMMA, pygame.K_PERIOD),
+        (pygame.K_KP1, pygame.K_KP2, pygame.K_KP_PERIOD, pygame.K_KP_DIVIDE,
+         pygame.K_KP_MULTIPLY, pygame.K_KP_MINUS, pygame.K_KP_PLUS),
+    )
+    fallback = (*range(pygame.K_a, pygame.K_z + 1),
+                pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5,
+                pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9, pygame.K_0,
+                pygame.K_F1, pygame.K_F2, pygame.K_F3, pygame.K_F4, pygame.K_F5,
+                pygame.K_F10, pygame.K_F12, pygame.K_BACKQUOTE, pygame.K_MINUS,
+                pygame.K_EQUALS, pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
+                pygame.K_BACKSLASH, pygame.K_COMMA, pygame.K_PERIOD,
+                pygame.K_SLASH, pygame.K_QUOTE, pygame.K_SEMICOLON)
+    used = {key for row in PLAYER_CONTROLS for key in (*row[:4], *row[4])}
+    used.update(life_share_keys())
+    used.update(KEYBOARD_RESERVED_KEYS)
+    chosen = []
+    for index, key in enumerate(preferred):
+        available = next(candidate for candidate in (key, *nearby[index], *fallback, *preferred)
+                         if candidate not in used)
         chosen.append(available)
         used.add(available)
     return tuple(chosen)
@@ -1329,6 +1685,7 @@ def player_control_labels(index):
     firing = " / ".join(control_key_label(key) for key in fire)
     if PLAYER_AUTOFIRE[index]:
         firing = "AUTO FIRE ON"
+    firing += f"  /  HOLD {control_key_label(sprint_keys()[index])} SPRINT"
     return movement, firing
 
 
@@ -1472,7 +1829,8 @@ class KeyboardControls:
         draw_neon_button(screen, layout["reset"], "RESTORE ALL DEFAULTS", small_font, UI_GOLD)
         draw_neon_button(screen, layout["done"], "DONE", small_font, UI_CYAN)
         share_key = control_key_label(life_share_keys()[self.player])
-        draw_fitted_text(screen, f"GIVE LIFE: {share_key} (keep one life) / Missing keys? Try Auto-fire or remap.",
+        sprint_key = control_key_label(sprint_keys()[self.player])
+        draw_fitted_text(screen, f"HOLD {sprint_key}: SPRINT / EMPTY: SLOWED 2s, RELEASE TO REARM / GIVE LIFE: {share_key}",
                          small_font, UI_MUTED, layout["help"])
         draw_fitted_text(screen, self.status, small_font, UI_TEXT, layout["status"])
         held = " / ".join(control_key_label(key) for key in sorted(self.held)) or "none"
@@ -1844,8 +2202,8 @@ ENEMY_JOURNAL = (
     ("Devastator", "Late-game armored unit with a slow heavy shell that detonates into eight projectiles."),
     ("Echo", "Late-game edge fighter that sends paired aimed shots capable of bouncing twice off arena walls."),
     ("Sentinel", "Late-game support unit that starts with two shield charges and fires one careful aimed bolt."),
-    ("Boss", "One every fifth wave. Large orbs pulse then burst eight ways after 1.4s. Lasers pierce Durability. Waves 25/50/75 have guardians; 100 is final."),
-    ("Iron Citadel", "Wave 25: 12 moves in all three phases, including twin Portcullis gates and horizontal Bunker Lattice beams. Use green gate openings. A 28% HP core break stuns for 3.5s. Every pilot earns Rapid Fire."),
+    ("Boss", "One every fifth wave. Large orbs pulse then burst eight ways after 1.4s. Lasers follow the boss, stay active for 4.5s and pierce Durability. Waves 25/50/75 have guardians; 100 is final."),
+    ("Iron Citadel", "Wave 25: 12 moves in all three phases, including twin Portcullis gates and pilot-height Bunker Lattice beams. Take the numbered green opening, then the gold opening on the opposite side. A 28% HP core break stuns for 3.5s. Every pilot earns Rapid Fire."),
     ("Helix Matriarch", "Wave 50: 12 moves in all three phases, including outward Woven Rings and inward Helix Scissors. All shots lock before the tell. A 28% HP core break stuns for 3.5s. Every pilot earns Homing Shots."),
     ("Tempest Archon", "Wave 75: 12 moves in all three phases, including forked Thunderhead beams and staggered Rain Lanes. Leave outlined beams during the tell. A 28% HP core break stuns for 3.5s. Every pilot earns Bullet Time."),
     ("Eclipse Sovereign", "Final boss: 12 moves in all three phases, including stepped Lunar Partition beams and paired Binary Corona rings. Full warnings stay in every phase. A 28% HP core break stuns for 3.5s. Every pilot earns Emergency Warp."),
@@ -2043,7 +2401,7 @@ POWERUP_JOURNAL = (
     ("supply_beacon", "Stores eight credited-kill charges. Ordinary kills get better drop odds; boss kills spend a charge too. Drop limits still apply."),
     ("gravity_well", f"A {POWERUP_DURATIONS['gravity_well'] // 1000}-second, {GRAVITY_FIELD_RADIUS}-pixel field gently bends ordinary moving hostile shots away. Lasers and energy gates are unaffected."),
     ("emergency_warp", "Stored across waves and saves. After Reflector, warps only when a hit would cost a life. Nonlethal Durability hits keep the charge; lasers and gates count as lethal. Duplicates grant Double Score."),
-    ("nova_pulse", "After 3-2-1, the screen fills with expanding warning pulses, then a final expanding shock wave crosses the whole arena. Every foe touched by the wave takes 1 damage through shields. Ordinary shots and mines in its path clear; lasers and energy gates stay. Life loss cancels the charge. Rare pickup."),
+    ("nova_pulse", "After 3-2-1, an expanding shock wave crosses the whole arena. At detonation, about 70% of visible regular foes are chosen and defeated through shields; at least one is spared when two or more are present. A lone foe has a 70% chance. Each boss takes at most 1 damage. Ordinary shots and mines in the wave clear; lasers and energy gates stay. Life loss cancels the charge. Rare pickup."),
     ("missile_swarm", "Stores up to six guided missiles. Each one-shots an unshielded regular foe; bosses take 1 damage. Shields block a hit; weapon buffs do not multiply the swarm."),
     ("reflector", "Stores three blocks. Each damaging hit spends a block and returns a basic bolt toward the nearest foe."),
     ("chain_reaction", f"For {POWERUP_DURATIONS['chain_reaction'] // 1000} seconds, credited kills can send up to three shards at nearby visible foes. Support shots and Nova Pulse do not start bursts."),
@@ -2202,7 +2560,7 @@ def blend_color(first, second, amount):
 
 
 def draw_soft_glow(screen, center, color, radius=18, strength=35):
-    if low_effects_mode():
+    if low_effects_mode() or not graphics_feature_enabled("glow"):
         return
     key = (tuple(color), radius, strength)
     glow = _GLOW_SPRITES.get(key)
@@ -2219,14 +2577,28 @@ def draw_soft_glow(screen, center, color, radius=18, strength=35):
 
 def draw_space_background(screen, style="menu", now=None):
     """Cached nebula art plus a sparse animated star layer; no gameplay RNG."""
-    if _POTATO_MODE:
+    level = graphics_background_level()
+    palette = ui_palette() if style != "gameplay" else None
+    base_color = (3, 7, 20) if style == "gameplay" else palette["bg"]
+    if level == "off":
         # A flat clear avoids building, scaling or blitting nebula art, even
         # on the first frame after changing quality or resizing the arena.
-        screen.fill((3, 7, 20) if style == "gameplay" else UI_BG)
+        screen.fill(base_color)
         return
     width, height = screen.get_size()
-    key = (width, height, style)
+    theme = graphics_option("ui_theme") if palette is not None else None
+    key = (width, height, style, level, theme)
     entry = _SPACE_BACKGROUNDS.get(key)
+    if level == "stars":
+        # Sparse stars avoid constructing or scaling any nebula surfaces.
+        if entry is None:
+            entry = (None, space_background_stars(width, height, palette))
+            if len(_SPACE_BACKGROUNDS) >= 12:
+                _SPACE_BACKGROUNDS.clear()
+            _SPACE_BACKGROUNDS[key] = entry
+        screen.fill(base_color)
+        draw_space_stars(screen, entry[1], style, now, palette)
+        return
     if entry is None:
         palettes = {
             "menu": ((5, 10, 29), (20, 10, 42), UI_CYAN, UI_PINK),
@@ -2236,6 +2608,10 @@ def draw_space_background(screen, style="menu", now=None):
             "victory": ((5, 14, 30), (15, 20, 37), UI_MINT, UI_GOLD),
         }
         top, bottom, first, second = palettes.get(style, palettes["menu"])
+        if palette is not None and theme != "neon":
+            top = palette["bg"]
+            bottom = blend_color(top, palette["panel"], 0.7)
+            first, second = palette["primary"], palette["secondary"]
         background = pygame.Surface((width, height))
         for y in range(height):
             color = blend_color(top, bottom, y / max(1, height - 1))
@@ -2270,23 +2646,33 @@ def draw_space_background(screen, style="menu", now=None):
                 y = round(horizon + (height - horizon) * fraction)
                 pygame.draw.line(background, grid_color, (0, y), (width, y))
 
-        rng = random.Random(2807)
-        star_colors = (UI_CYAN, UI_VIOLET, UI_GOLD, UI_TEXT, UI_PINK)
-        stars = tuple((rng.randrange(width), rng.randrange(height), rng.choice((1, 1, 1, 2)),
-                       rng.choice(star_colors), rng.uniform(0, 6.28)) for _ in range(48))
+        stars = space_background_stars(width, height, palette)
         entry = (background, stars)
         if len(_SPACE_BACKGROUNDS) >= 12:
             _SPACE_BACKGROUNDS.clear()
         _SPACE_BACKGROUNDS[key] = entry
     background, stars = entry
     screen.blit(background, (0, 0))
-    if low_effects_mode():
-        return
+    draw_space_stars(screen, stars, style, now, palette)
+
+
+def space_background_stars(width, height, palette=None):
+    rng = random.Random(2807)
+    star_colors = ((palette["primary"], palette["tertiary"], UI_GOLD,
+                    palette["text"], palette["secondary"]) if palette is not None
+                   else (UI_CYAN, UI_VIOLET, UI_GOLD, UI_TEXT, UI_PINK))
+    return tuple((rng.randrange(width), rng.randrange(height), rng.choice((1, 1, 1, 2)),
+                  rng.choice(star_colors), rng.uniform(0, 6.28)) for _ in range(48))
+
+
+def draw_space_stars(screen, stars, style, now=None, palette=None):
+    if not graphics_feature_enabled("animations"):
+        now = 0
     if now is None:
         now = pygame.time.get_ticks()
     for x, y, radius, color, phase in stars:
         brightness = (0.17 if style == "gameplay" else 0.25) + 0.12 * (1 + math.sin(now / 1600 + phase))
-        star_color = blend_color(UI_BG, color, brightness)
+        star_color = blend_color(palette["bg"] if palette is not None else UI_BG, color, brightness)
         pygame.draw.circle(screen, star_color, (x, y), radius)
         if radius == 2 and style != "gameplay":
             pygame.draw.line(screen, star_color, (x - 3, y), (x + 3, y))
@@ -2296,14 +2682,16 @@ def draw_neon_panel(screen, rect, accent=UI_CYAN, fill=None, radius=12):
     rect = pygame.Rect(rect)
     if rect.width <= 0 or rect.height <= 0:
         return
+    accent = ui_theme_color(accent)
+    palette = ui_palette()
     if _POTATO_MODE:
-        pygame.draw.rect(screen, fill or (10, 17, 35), rect)
+        pygame.draw.rect(screen, fill or palette["panel"], rect)
         pygame.draw.rect(screen, accent, rect, 1)
         return
-    pygame.draw.rect(screen, blend_color(UI_BG, accent, 0.07), rect.inflate(6, 6),
+    pygame.draw.rect(screen, blend_color(palette["bg"], accent, 0.07), rect.inflate(6, 6),
                      border_radius=radius + 3)
-    pygame.draw.rect(screen, fill or (10, 17, 35), rect, border_radius=radius)
-    pygame.draw.rect(screen, blend_color(UI_BG, accent, 0.62), rect, 1, border_radius=radius)
+    pygame.draw.rect(screen, fill or palette["panel"], rect, border_radius=radius)
+    pygame.draw.rect(screen, blend_color(palette["bg"], accent, 0.62), rect, 1, border_radius=radius)
     inset = min(15, rect.width // 5)
     if rect.width > inset * 2:
         pygame.draw.line(screen, accent, (rect.x + inset, rect.y),
@@ -2312,6 +2700,8 @@ def draw_neon_panel(screen, rect, accent=UI_CYAN, fill=None, radius=12):
 
 def draw_neon_button(screen, rect, label, font, accent=UI_CYAN, enabled=True, selected=False):
     rect = pygame.Rect(rect)
+    accent = ui_theme_color(accent)
+    palette = ui_palette()
     now = pygame.time.get_ticks()
     key = tuple(rect)
     state = _BUTTON_ANIMATIONS.get(key)
@@ -2330,12 +2720,12 @@ def draw_neon_button(screen, rect, label, font, accent=UI_CYAN, enabled=True, se
         # Keep pointer/audio feedback and the exact hit rectangle, without a
         # tween, inflated glow, sweep, or pressed-position animation.
         state.update(hovered=hovered, amount=0.0, at=now, frame=_UI_FRAME)
-        color = accent if enabled else (67, 82, 109)
+        color = accent if enabled else palette["disabled"]
         active = enabled and (hovered or selected or just_clicked)
-        fill = blend_color((10, 19, 38), color, 0.22 if active else 0.07)
+        fill = blend_color(palette["button"], color, 0.22 if active else 0.07)
         pygame.draw.rect(screen, fill, rect)
         pygame.draw.rect(screen, color, rect, 2 if active else 1)
-        text = cached_ui_text(font, label, UI_TEXT if enabled else UI_MUTED,
+        text = cached_ui_text(font, label, palette["text"] if enabled else palette["muted"],
                               max(1, rect.width - 18), max(1, rect.height - 10))
         screen.blit(text, text.get_rect(center=rect.center))
         return
@@ -2346,8 +2736,8 @@ def draw_neon_button(screen, rect, label, font, accent=UI_CYAN, enabled=True, se
     amount = max(state["amount"], 0.65 if selected else 0.0) if enabled else 0.0
     pressed = enabled and just_clicked
     visual_rect = rect.move(0, 2) if pressed else rect.inflate(round(amount * 4), round(amount * 2))
-    color = accent if enabled else (67, 82, 109)
-    fill = blend_color((10, 19, 38), color, 0.35 if pressed else 0.07 + amount * 0.20)
+    color = accent if enabled else palette["disabled"]
+    fill = blend_color(palette["button"], color, 0.35 if pressed else 0.07 + amount * 0.20)
     if amount > 0.05:
         draw_soft_glow(screen, visual_rect.midtop, color, radius=min(54, rect.width // 2),
                        strength=round(25 + amount * 35))
@@ -2358,7 +2748,7 @@ def draw_neon_button(screen, rect, label, font, accent=UI_CYAN, enabled=True, se
         pygame.draw.line(screen, color, (visual_rect.x + 12, visual_rect.bottom - 5),
                          (visual_rect.x + 12 + sweep_width, visual_rect.bottom - 5), 2)
     max_width, max_height = max(1, rect.width - 18), max(1, rect.height - 10)
-    text = cached_ui_text(font, label, UI_TEXT if enabled else UI_MUTED,
+    text = cached_ui_text(font, label, palette["text"] if enabled else palette["muted"],
                           max_width, max_height)
     screen.blit(text, text.get_rect(center=visual_rect.center))
 
@@ -2394,28 +2784,36 @@ def draw_ui_feedback(screen):
 
 
 def draw_neon_title(screen, text, font, center, accent=UI_CYAN):
+    secondary = ui_theme_color(UI_PINK if accent == UI_CYAN else UI_CYAN)
+    accent = ui_theme_color(accent)
+    text_color = ui_palette()["text"]
     if _POTATO_MODE:
-        text_surface = cached_ui_text(font, text, UI_TEXT,
+        text_surface = cached_ui_text(font, text, text_color,
                                       max(1, screen.get_width() - 60))
         screen.blit(text_surface, text_surface.get_rect(center=center))
         return
-    text_surface = font.render(text, True, UI_TEXT)
-    max_width = screen.get_width() - 60
-    if text_surface.get_width() > max_width:
-        ratio = max_width / text_surface.get_width()
-        text_surface = pygame.transform.smoothscale(text_surface,
-            (max_width, max(1, round(text_surface.get_height() * ratio))))
+    font_key = ui_font_cache_key(font)
+    cache_key = (font_key, text, tuple(accent), text_color, screen.get_width()) if font_key else None
+    cached = _UI_TITLE_CACHE.get(cache_key) if cache_key is not None else None
+    if cached is None:
+        text_surface = cached_ui_text(font, text, text_color, max(1, screen.get_width() - 60))
+        shadow = text_surface.copy()
+        shadow.fill((*accent, 255), special_flags=pygame.BLEND_RGBA_MULT)
+        shadow.set_alpha(80)
+        cached = (text_surface, shadow)
+        if cache_key is not None:
+            if len(_UI_TITLE_CACHE) >= 24:
+                _UI_TITLE_CACHE.clear()
+            _UI_TITLE_CACHE[cache_key] = cached
+    text_surface, shadow = cached
     rect = text_surface.get_rect(center=center)
-    shadow = text_surface.copy()
-    shadow.fill((*accent, 255), special_flags=pygame.BLEND_RGBA_MULT)
-    shadow.set_alpha(80)
     screen.blit(shadow, rect.move(-2, 2))
     screen.blit(shadow, rect.move(2, -1))
     screen.blit(text_surface, rect)
     line_width = min(rect.width // 2, 220)
     line_y = rect.bottom + 8
     pygame.draw.line(screen, accent, (rect.centerx - line_width, line_y), (rect.centerx - 8, line_y), 2)
-    pygame.draw.line(screen, UI_PINK if accent == UI_CYAN else UI_CYAN,
+    pygame.draw.line(screen, secondary,
                      (rect.centerx + 8, line_y), (rect.centerx + line_width, line_y), 2)
 
 
@@ -2829,6 +3227,8 @@ def animate_ship_fire(ship, offsets=(0,)):
 
 def update_ship_animations(players, enemies):
     """Advance only from the unpaused game loop, never from draw functions."""
+    if not graphics_feature_enabled("animations"):
+        return
     for player in players:
         if player["eliminated"] or player["respawn_until"]:
             continue
@@ -2857,7 +3257,7 @@ def update_ship_animations(players, enemies):
 
 
 def animated_ship_frame(ship, fallback):
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations"):
         return fallback
     frames = ship.get("animation_frames")
     if not frames:
@@ -2872,7 +3272,11 @@ def animated_ship_frame(ship, fallback):
 
 
 def draw_animated_player(screen, player, now):
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations"):
+        if not _POTATO_MODE and graphics_feature_enabled("glow"):
+            draw_soft_glow(screen, (round(player["x"] + PLAYER_WIDTH / 2),
+                                    round(player["y"] + PLAYER_HEIGHT / 2)),
+                           player["color"], radius=24, strength=50)
         screen.blit(player["sprite"], (round(player["x"]), round(player["y"])))
         draw_player_nameplate(screen, player)
         return
@@ -2945,17 +3349,55 @@ def player_nameplate_bounds(player):
 
 
 def draw_player_nameplate(screen, player):
+    if not graphics_feature_enabled("ship_names"):
+        return
     rect = player_nameplate_bounds(player)
     draw_gameplay_hud_panel(screen, rect, player["color"], radius=4)
     draw_hud_label(screen, hud_font(18), player_display_name(player), player["color"],
                    rect.inflate(-10, -6), align="center", max_height=16)
 
 
+def player_stamina_bar_rect(player, bounds=None):
+    """A ship-width gauge follows its pilot, clear of the hull and arena edge."""
+    bounds = pygame.Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT) if bounds is None else pygame.Rect(bounds)
+    bar = pygame.Rect(0, 0, PLAYER_WIDTH, 5)
+    bar.midtop = (round(player["x"] + PLAYER_WIDTH / 2),
+                  round(player["y"] + PLAYER_HEIGHT + 9))
+    if bar.bottom > bounds.bottom - 2:
+        # At the bottom edge, keep the complete gauge visible above the name
+        # rather than covering the ship or silently clipping the gauge.
+        top = (player_nameplate_bounds(player).top if graphics_feature_enabled("ship_names")
+               else round(player["y"]))
+        bar.bottom = top - 4
+    bar.clamp_ip(bounds.inflate(-4, -4))
+    return bar
+
+
+def draw_player_stamina_bar(screen, player, now=None):
+    """Always-readable gameplay pixels, with no text or decorative surfaces."""
+    now = pygame.time.get_ticks() if now is None else now
+    if player["eliminated"] or player["respawn_until"] > now:
+        return
+    bar = player_stamina_bar_rect(player, screen.get_rect())
+    stamina = max(0.0, min(PLAYER_MAX_STAMINA, player.get("stamina", PLAYER_MAX_STAMINA)))
+    color = UI_CORAL if player.get("stamina_exhaustion_ticks", 0) > 0 else player["color"]
+    pygame.draw.rect(screen, UI_BG, bar)
+    inner = bar.inflate(-2, -2)
+    fill = inner.copy()
+    fill.width = round(inner.width * stamina / PLAYER_MAX_STAMINA)
+    if fill.width:
+        pygame.draw.rect(screen, color, fill)
+    pygame.draw.rect(screen, UI_MUTED, bar, 1)
+
+
 def draw_animated_enemy(screen, enemy):
     rect = enemy["rect"]
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations"):
         # Shared base art is immutable: no animation, opacity copies, banking,
         # muzzle flashes or cosmetic support/warp rings in the low renderer.
+        if not _POTATO_MODE and graphics_feature_enabled("glow"):
+            draw_soft_glow(screen, rect.center, enemy["color"],
+                           radius=26 if enemy.get("is_boss") else 18, strength=30)
         screen.blit(enemy["surface"], rect)
         if enemy.get("milestone_kind"):
             draw_milestone_boss_hull(screen, enemy, 0)
@@ -2983,7 +3425,7 @@ def draw_animated_enemy(screen, enemy):
     recoil = round(2 * enemy.get("animation_fire", 0) / 8)
     screen.blit(frame, frame.get_rect(center=(rect.centerx, rect.centery - recoil)))
 
-    if enemy.get("animation_style") == "fast":
+    if enemy.get("animation_style") == "fast" and graphics_feature_enabled("trails"):
         length = 4 + (tick // 3) % 5
         pygame.draw.line(screen, enemy["color"], (rect.centerx, rect.top),
                          (rect.centerx, rect.top - length), 2)
@@ -2992,16 +3434,8 @@ def draw_animated_enemy(screen, enemy):
         center = (rect.centerx, rect.bottom + 2)
         pygame.draw.circle(screen, enemy["color"], center, radius + 2, 1)
         pygame.draw.circle(screen, UI_TEXT, center, max(1, radius // 2))
-    if (enemy.get("is_boss") and not enemy.get("milestone_kind")
-            and not enemy.get("attack_queue")):
-        # This small halo is cosmetic preparation for a normal boss's volley.
-        # Guardian signatures have their own exact danger tells; a recovery
-        # cooldown is not another expanding attack or a shield. Clamp progress
-        # even when a delayed attack leaves the cooldown below zero.
-        charge = max(0, min(1, 1 - enemy.get("attack_cooldown", 30) / 30))
-        if charge:
-            radius = 3 + round(charge * rect.width / 5)
-            pygame.draw.circle(screen, blend_color(enemy["color"], UI_TEXT, pulse), rect.center, radius, 2)
+    if enemy.get("is_boss"):
+        draw_boss_charge_accents(screen, enemy, tick)
     support = enemy.get("animation_support", 0)
     if support:
         pygame.draw.circle(screen, enemy["color"], rect.center, 12 + (24 - support) * 3, 1)
@@ -3011,6 +3445,44 @@ def draw_animated_enemy(screen, enemy):
             pygame.draw.circle(screen, UI_CYAN, center, 6 + (16 - warp) * 2, 2)
     if enemy.get("milestone_kind"):
         draw_milestone_boss_hull(screen, enemy, tick)
+
+
+def draw_boss_charge_accents(screen, enemy, tick):
+    """Hull-mounted capacitors and muzzle sparks never imply a damage radius."""
+    if not graphics_feature_enabled("animations") or low_effects_mode():
+        return
+    rect = enemy["rect"]
+    warning = enemy.get("signature_warning")
+    if warning is not None:
+        charge = 1 - max(0, warning["remaining_frames"]) / max(1, warning["warning_frames"])
+    elif not enemy.get("milestone_kind") and not enemy.get("attack_queue"):
+        charge = max(0, min(1, 1 - enemy.get("attack_cooldown", 30) / 30))
+    else:
+        charge = 0
+    color = enemy["color"]
+    bright = blend_color(color, UI_TEXT, .65)
+    lit = min(6, max(0, math.ceil(charge * 6)))
+    # Two six-cell rails make a pending volley conspicuous, close to its hull.
+    for side in (-1, 1):
+        rail_x = rect.centerx + side * max(12, rect.width // 3)
+        pygame.draw.line(screen, blend_color(color, UI_BG, .4),
+                         (rail_x, rect.top + 4), (rail_x, rect.bottom - 4), 2)
+        for index in range(lit):
+            y = rect.bottom - 6 - round(index * max(1, rect.height - 12) / 6)
+            pygame.draw.line(screen, bright, (rail_x - 4, y), (rail_x + 4, y), 2)
+        if charge > 0:
+            # Small fixed-size glows use only three shared strength variants.
+            draw_soft_glow(screen, (rail_x, rect.bottom), color, radius=12,
+                           strength=(35, 50, 65)[min(2, int(charge * 3))])
+        fire = enemy.get("animation_fire", 0)
+        if fire:
+            reach = 4 + min(8, fire)
+            muzzle = (rail_x, rect.bottom + 2)
+            pygame.draw.polygon(screen, color, ((muzzle[0] - 4, muzzle[1]),
+                                (muzzle[0], muzzle[1] + reach),
+                                (muzzle[0] + 4, muzzle[1])))
+            pygame.draw.line(screen, UI_TEXT, muzzle,
+                             (muzzle[0], muzzle[1] + reach - 2), 2)
 
 
 def draw_milestone_boss_hull(screen, enemy, tick):
@@ -3023,9 +3495,13 @@ def draw_milestone_boss_hull(screen, enemy, tick):
         if enemy.get("stagger_remaining", 0) > 0:
             pygame.draw.circle(screen, UI_MINT, (x, y), core + 9, 2)
         return
+    animated = graphics_feature_enabled("animations")
+    tick = tick if animated else 0
+    phase = milestone_boss_phase(enemy)
+    phase_color = UI_CORAL if phase == 3 else UI_GOLD if phase == 2 else enemy["color"]
     color = enemy["color"]
     pulse = (1 + math.sin(tick / 11)) / 2
-    light = blend_color(color, UI_TEXT, .32 + pulse * .34)
+    light = blend_color(phase_color, UI_TEXT, .32 + pulse * .34)
     core = max(5, rect.height // 10)
     kind = enemy["milestone_kind"]
     if kind == "bulwark":
@@ -3036,6 +3512,13 @@ def draw_milestone_boss_hull(screen, enemy, tick):
                 end = (anchor[0] + side * 9, anchor[1] + level * 5)
                 pygame.draw.line(screen, color, anchor, end, 3)
                 pygame.draw.circle(screen, light, end, 3)
+                pygame.draw.line(screen, light, (anchor[0] - side * 8, anchor[1]),
+                                 (anchor[0] - side * 2, anchor[1]), 2)
+        for side in (-1, 1):
+            armor = pygame.Rect(x + side * (rect.width // 3) - 8, y - rect.height // 4,
+                                16, rect.height // 2)
+            pygame.draw.rect(screen, blend_color(color, UI_BG, .4), armor)
+            pygame.draw.rect(screen, light, armor, 2)
         aperture = pygame.Rect(x - core, y - core, core * 2, core * 2)
         pygame.draw.rect(screen, UI_BG, aperture.inflate(5, 5), border_radius=3)
         pygame.draw.rect(screen, light, aperture, 2, border_radius=2)
@@ -3049,6 +3532,9 @@ def draw_milestone_boss_hull(screen, enemy, tick):
             node = (round(x + math.cos(angle) * ellipse.width / 2),
                     round(y + math.sin(angle) * ellipse.height / 2))
             pygame.draw.circle(screen, light if index % 2 else color, node, 3)
+            inner = (round(x + math.cos(angle) * ellipse.width * .35),
+                     round(y + math.sin(angle) * ellipse.height * .35))
+            pygame.draw.line(screen, color, inner, node, 2)
         pygame.draw.circle(screen, UI_BG, (x, y), core + 3)
         pygame.draw.circle(screen, light, (x, y), core, 2)
     elif kind == "tempest":
@@ -3059,6 +3545,10 @@ def draw_milestone_boss_hull(screen, enemy, tick):
                       (x + side * (rect.width // 2 - 4), y + 5),
                       (x + side * (rect.width // 2 + 3), y + rect.height // 4)]
             pygame.draw.lines(screen, light, False, points, 2)
+            pygame.draw.lines(screen, color, False,
+                              [(x + side * rect.width // 5, rect.top + 5),
+                               (x + side * rect.width // 3, rect.top - 6),
+                               (x + side * (rect.width // 2 + 8), rect.top + 4)], 2)
         diamond = ((x, y - core - 3), (x + core, y),
                    (x, y + core + 3), (x - core, y))
         pygame.draw.polygon(screen, UI_BG, diamond)
@@ -3074,12 +3564,33 @@ def draw_milestone_boss_hull(screen, enemy, tick):
             node = (round(x + math.cos(start) * crown.width / 2),
                     round(y - math.sin(start) * crown.height / 2))
             pygame.draw.circle(screen, color, node, 3)
+            outer = (round(x + math.cos(start) * (crown.width / 2 + 9)),
+                     round(y - math.sin(start) * (crown.height / 2 + 9)))
+            pygame.draw.line(screen, light, node, outer, 3)
         pygame.draw.circle(screen, UI_BG, (x, y), core + 5)
         pygame.draw.circle(screen, light, (x, y), core + 5, 2)
         pygame.draw.circle(screen, color, (x, y), core + 9, 1)
+    # A bright core and three discrete phase marks read consistently across hulls.
+    core_color = UI_MINT if enemy.get("stagger_remaining", 0) > 0 else light
+    pygame.draw.circle(screen, core_color, (x, y), max(2, core // 3))
+    for index in range(3):
+        marker = pygame.Rect(x - 12 + index * 9, rect.top + 2, 6, 3)
+        pygame.draw.rect(screen, phase_color if index < phase else blend_color(color, UI_BG, .65), marker)
+    if animated and not low_effects_mode():
+        charge = milestone_stagger_ratio(enemy)
+        if charge:
+            aperture = pygame.Rect(x - core - 4, y - core - 4, (core + 4) * 2, (core + 4) * 2)
+            pygame.draw.arc(screen, UI_MINT, aperture, -math.pi / 2,
+                            -math.pi / 2 + max(.02, charge * math.tau), 2)
     if enemy.get("stagger_remaining", 0) > 0:
-        for radius in (core + 13 + round(pulse * 4), core + 20 + round(pulse * 6)):
-            pygame.draw.circle(screen, UI_MINT, (x, y), radius, 2)
+        # Broken-core sparks remain confined to the ship, with no danger ring.
+        reach = core + 12 + (round(pulse * 4) if animated else 0)
+        for index in range(4):
+            angle = index * math.pi / 2 + (tick / 28 if animated else 0)
+            start = (round(x + math.cos(angle) * (core + 6)),
+                     round(y + math.sin(angle) * (core + 6)))
+            end = (round(x + math.cos(angle) * reach), round(y + math.sin(angle) * reach))
+            pygame.draw.line(screen, UI_MINT, start, end, 2)
 
 
 def enemy_animation_style(enemy_type):
@@ -3230,26 +3741,30 @@ def player_projectile_color(bullet, player_colors=None):
     return UI_MINT
 
 
+_IMPACT_EFFECT_RANDOM = random.Random(2807)
+
+
 def spawn_pop_particles(x, y, color, particles):
-    if _POTATO_MODE:
+    level = graphics_particle_level()
+    if level == "off":
         return
-    effect_cap = 96 if _ADAPTIVE_LOW_EFFECTS else MAX_EFFECT_PARTICLES
-    particle_count = 6 if _ADAPTIVE_LOW_EFFECTS else 16
+    effect_cap = 96 if level == "reduced" else MAX_EFFECT_PARTICLES
+    particle_count = 6 if level == "reduced" else 16
     for _ in range(particle_count):
-        radius = random.uniform(2, 5)
-        lifetime = random.randint(14, 26)
+        # Visual budgets must never consume combat's attack/drop RNG stream.
+        radius = _IMPACT_EFFECT_RANDOM.uniform(2, 5)
+        lifetime = _IMPACT_EFFECT_RANDOM.randint(14, 26)
         particle = {
             "x": x,
             "y": y,
-            "dx": random.uniform(-4.5, 4.5),
-            "dy": random.uniform(-4.5, 4.5),
+            "dx": _IMPACT_EFFECT_RANDOM.uniform(-4.5, 4.5),
+            "dy": _IMPACT_EFFECT_RANDOM.uniform(-4.5, 4.5),
             "radius": radius,
             "color": color,
             "lifetime": lifetime,
             "max_lifetime": lifetime,
         }
-        # Keep cosmetic randomness independent of the available draw budget:
-        # a crowded explosion should not change subsequent gameplay rolls.
+        # Keep the visual budget capped even during crowded explosions.
         if len(particles) < effect_cap:
             particles.append(particle)
     ring = {
@@ -3268,9 +3783,10 @@ def spawn_pop_particles(x, y, color, particles):
 
 
 def spawn_bomb_blast(x, y, color, radius, particles):
-    if _POTATO_MODE:
+    level = graphics_particle_level()
+    if level == "off":
         return
-    effect_cap = 96 if _ADAPTIVE_LOW_EFFECTS else MAX_EFFECT_PARTICLES
+    effect_cap = 96 if level == "reduced" else MAX_EFFECT_PARTICLES
     if len(particles) < effect_cap:
         particles.append({
             "kind": "bomb_blast",
@@ -3286,12 +3802,14 @@ def spawn_bomb_blast(x, y, color, radius, particles):
 
 
 def update_and_draw_particles(screen, particles, advance=True):
-    effect_cap = 48 if _POTATO_MODE else (96 if _ADAPTIVE_LOW_EFFECTS else MAX_EFFECT_PARTICLES)
-    if _POTATO_MODE and advance:
+    level = graphics_particle_level()
+    effect_cap = 48 if level == "off" else (96 if level == "reduced" else MAX_EFFECT_PARTICLES)
+    retained_kinds = ("nova_pulse", "lightning_arc") if _POTATO_MODE else ("nova_pulse",)
+    if level == "off" and advance:
         # Quality changes take effect immediately, including particles that
         # were already alive. Keep Nova's area cue and short lightning links.
         particles[:] = [p for p in particles
-                        if p.get("kind") in ("nova_pulse", "lightning_arc")]
+                        if p.get("kind") in retained_kinds]
     if advance and len(particles) > effect_cap:
         # Preserve distinctive feedback before generic impact sparks.
         important = [p for p in particles if p.get("kind") not in (None, "ring")]
@@ -3299,7 +3817,7 @@ def update_and_draw_particles(screen, particles, advance=True):
         available = max(0, effect_cap - len(important))
         particles[:] = (generic[-available:] if available else []) + important[-effect_cap:]
     for p in particles[:]:
-        if _POTATO_MODE and p.get("kind") not in ("nova_pulse", "lightning_arc"):
+        if level == "off" and p.get("kind") not in retained_kinds:
             continue
         if advance:
             p["x"] += p["dx"]
@@ -3309,7 +3827,7 @@ def update_and_draw_particles(screen, particles, advance=True):
         if advance and p["lifetime"] <= 0:
             continue
         if p.get("kind") == "lightning_arc":
-            if _POTATO_MODE:
+            if level != "full":
                 pygame.draw.line(screen, p["color"], p["points"][0], p["points"][-1], 1)
             else:
                 pygame.draw.lines(screen, p["color"], False, p["points"], 4)
@@ -3326,7 +3844,7 @@ def update_and_draw_particles(screen, particles, advance=True):
         elif p.get("kind") == "nova_pulse":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             radius = max(1, round(p["radius"] * min(1, progress * 1.6)))
-            if _POTATO_MODE:
+            if level == "off":
                 pygame.draw.circle(screen, p["color"], (round(p["x"]), round(p["y"])), radius, 2)
             else:
                 size = int(p["radius"] * 2 + 8)
@@ -3352,6 +3870,9 @@ def update_and_draw_particles(screen, particles, advance=True):
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             radius = max(1, round(p["radius"] * progress))
             position = (round(p["x"]), round(p["y"]))
+            if level == "reduced":
+                pygame.draw.circle(screen, p["color"], position, radius, 2)
+                continue
             bounds = pygame.Rect(position[0] - radius - 3, position[1] - radius - 3,
                                  radius * 2 + 7, radius * 2 + 7).clip(screen.get_clip())
             if not bounds.width or not bounds.height:
@@ -4005,7 +4526,7 @@ def create_enemy_projectile(x, y, dx, dy, size=8, color=RED):
     }
 
 
-def damage_enemy(enemy, damage, player_number, *, ignore_shields=False):
+def damage_enemy(enemy, damage, player_number, *, ignore_shields=False, damage_cap=None):
     if damage <= 0:
         return 0
     if not ignore_shields and enemy.get("shield_charges", 0) > 0:
@@ -4015,6 +4536,8 @@ def damage_enemy(enemy, damage, player_number, *, ignore_shields=False):
 
     if enemy.get("stagger_remaining", 0) > 0 and enemy.get("milestone_kind"):
         damage = round(damage * 1.5)
+    if damage_cap is not None:
+        damage = min(damage, damage_cap)
     actual_damage = min(enemy["hp"], max(0, damage))
     enemy["hp"] -= actual_damage
     if actual_damage > 0:
@@ -4273,6 +4796,35 @@ def milestone_attack_patterns(enemy):
     return cycles[enemy["milestone_kind"]]
 
 
+def milestone_front_separation(first_gap, second_gap, speed, thickness):
+    """Leave a full ship crossing and a fresh reaction window between fronts."""
+    crossing = abs(second_gap.centerx - first_gap.centerx) / PLAYER_SPEED
+    return math.ceil((crossing + 18) * abs(speed) * ENEMY_PROJECTILE_SPEED_MULTIPLIER
+                     + thickness + PLAYER_HEIGHT + 16)
+
+
+def milestone_front_warning_frames(warning_frames, fronts, walls, targets):
+    """A pilot near either entry edge can reach the committed escape corridor."""
+    for front in fronts[:1]:
+        gap = front["gap"]
+        rect, dx, dy = walls[front["wall_indices"][0]]
+        for x, y in targets:
+            if front["axis"] == "y":
+                distance = max(0, gap.left + PLAYER_WIDTH / 2 + 8 - x,
+                               x - (gap.right - PLAYER_WIDTH / 2 - 8))
+                flight = max(0, (y - PLAYER_HEIGHT / 2 - rect.bottom)
+                             / (dy * ENEMY_PROJECTILE_SPEED_MULTIPLIER))
+            else:
+                distance = max(0, gap.top + PLAYER_HEIGHT / 2 + 8 - y,
+                               y - (gap.bottom - PLAYER_HEIGHT / 2 - 8))
+                travel = (x - PLAYER_WIDTH / 2 - rect.right if dx > 0
+                          else rect.left - x - PLAYER_WIDTH / 2)
+                flight = max(0, travel / (abs(dx) * ENEMY_PROJECTILE_SPEED_MULTIPLIER))
+            warning_frames = max(warning_frames,
+                                 math.ceil(distance / PLAYER_SPEED + 18 - flight))
+    return warning_frames
+
+
 def plan_milestone_attack(enemy, target_positions=()):
     """Commit the whole signature before its tell; no tracking after the warning."""
     kind = enemy["milestone_kind"]
@@ -4282,6 +4834,7 @@ def plan_milestone_attack(enemy, target_positions=()):
     origin_x, origin_y = enemy["rect"].midbottom
     shots, beams, walls, target_marks = [], [], [], []
     safe_gap = None
+    safe_gaps, wall_fronts = [], []
     options = milestone_attack_patterns(enemy)
     pattern = options[cursor % len(options)]
     cycle = cursor // len(options)
@@ -4289,6 +4842,24 @@ def plan_milestone_attack(enemy, target_positions=()):
                      max(PLAYER_HEIGHT / 2, min(SCREEN_HEIGHT - PLAYER_HEIGHT / 2, y)))
                     for x, y in target_positions)
     warning_frames = BOSS_LASER_WARNING_FRAMES
+
+    def add_front(gap, position, speed, thickness=24, axis="y", delay_frames=0):
+        """Two solid pieces preserve the same real opening for a whole crossing."""
+        first = len(walls)
+        if axis == "y":
+            walls.extend(((pygame.Rect(0, position, gap.left, thickness), 0, speed),
+                          (pygame.Rect(gap.right, position, SCREEN_WIDTH - gap.right,
+                                       thickness), 0, speed)))
+        else:
+            walls.extend(((pygame.Rect(position, GAMEPLAY_TOP, thickness,
+                                       gap.top - GAMEPLAY_TOP), speed, 0),
+                          (pygame.Rect(position, gap.bottom, thickness,
+                                       SCREEN_HEIGHT - gap.bottom), speed, 0)))
+        safe_gaps.append(gap)
+        wall_fronts.append({"gap": gap, "wall_indices": (first, first + 1),
+                            "axis": axis, "dx": speed if axis == "x" else 0,
+                            "dy": speed if axis == "y" else 0,
+                            "delay_frames": delay_frames})
     names = {"gates": "IRON GATES", "hammer": "HAMMER FAN",
              "helix": "DOUBLE HELIX", "bloom": "PRISM BLOOM",
              "channels": "STORM CHANNELS", "crosswind": "CROSSWIND",
@@ -4323,20 +4894,7 @@ def plan_milestone_attack(enemy, target_positions=()):
                                GAMEPLAY_TOP, gap_width, SCREEN_HEIGHT - GAMEPLAY_TOP)
         wall_speed = 5.4 if kind == "bulwark" else 5.8
         wall_y, wall_height = GAMEPLAY_TOP - 24, 24
-        walls = [(pygame.Rect(0, wall_y, safe_gap.left, wall_height), 0, wall_speed),
-                 (pygame.Rect(safe_gap.right, wall_y, SCREEN_WIDTH - safe_gap.right,
-                              wall_height), 0, wall_speed)]
-        # A pilot high on the screen has less flight time. Extend that tell
-        # when necessary, including for teammates at opposite edges, with an
-        # eighteen-frame reaction allowance at the unboosted movement speed.
-        for x, y in targets:
-            player_left = x - PLAYER_WIDTH / 2
-            distance = max(0, safe_gap.left + 8 - player_left,
-                           player_left - (safe_gap.right - PLAYER_WIDTH - 8))
-            flight = max(0, (y - PLAYER_HEIGHT / 2 - GAMEPLAY_TOP)
-                         / (wall_speed * ENEMY_PROJECTILE_SPEED_MULTIPLIER))
-            warning_frames = max(warning_frames,
-                                 math.ceil(distance / PLAYER_SPEED + 18 - flight))
+        add_front(safe_gap, wall_y, wall_speed, wall_height)
     elif pattern == "hammer":
         # Wide heavy arcs, with a central corridor instead of an aimed burst.
         lean = -.12 if cycle % 2 else .12
@@ -4421,7 +4979,7 @@ def plan_milestone_attack(enemy, target_positions=()):
             speed = (7.2 if pattern == "orbit_break" else 6.8) + .18 * phase
             dx, dy = (x - launch_x) / distance * speed, (y - origin_y) / distance * speed
             target_marks.append((x, y))
-            for spread in ((-.10, .10) if phase >= 2 else (0,)):
+            for spread in ((-.10, 0, .10) if phase >= 2 else (0,)):
                 shots.append((launch_x, origin_y,
                               dx * math.cos(spread) - dy * math.sin(spread),
                               dx * math.sin(spread) + dy * math.cos(spread), 13, color))
@@ -4448,22 +5006,28 @@ def plan_milestone_attack(enemy, target_positions=()):
     elif pattern == "barricade":
         gap = round(SCREEN_WIDTH * (.24 if cycle % 2 else .76))
         width = 180
-        safe_gap = pygame.Rect(gap - width // 2, GAMEPLAY_TOP, width, SCREEN_HEIGHT)
-        walls = [(pygame.Rect(0, origin_y, safe_gap.left, 34), 0, 0.0),
-                 (pygame.Rect(safe_gap.right, origin_y, SCREEN_WIDTH - safe_gap.right, 34), 0, 0.0)]
+        safe_gap = pygame.Rect(gap - width // 2, GAMEPLAY_TOP, width,
+                               SCREEN_HEIGHT - GAMEPLAY_TOP)
+        add_front(safe_gap, GAMEPLAY_TOP - 36, 4.3 + .15 * phase, 36)
     elif pattern in ("breaker_wall", "gust_wall", "black_horizon"):
-        y = SCREEN_HEIGHT * (.38 if cycle % 2 else .62)
-        gap_fraction = .68 if cycle % 2 else .32
-        gap = pygame.Rect(round(SCREEN_WIDTH * gap_fraction - 130), round(y - 35), 260, 70)
-        walls = [(pygame.Rect(0, round(y - 30), gap.left, 60), 3.5 if cycle % 2 else -3.5, 0.0),
-                 (pygame.Rect(gap.right, round(y - 30), SCREEN_WIDTH - gap.right, 60), -3.5 if cycle % 2 else 3.5, 0.0)]
+        # A vertical split front crosses the entire arena. The opening is a
+        # horizontal flight lane, so bottom parking now calls for an up dodge.
+        gap_height = min(220, max(160, round(SCREEN_HEIGHT * .23)))
+        gap_y = round(SCREEN_HEIGHT * (.35 if cycle % 2 else .65) - gap_height / 2)
+        safe_gap = pygame.Rect(0, gap_y, SCREEN_WIDTH, gap_height)
+        speed = (5.0 if pattern == "gust_wall" else 4.6) + .15 * phase
+        direction = 1 if cycle % 2 else -1
+        add_front(safe_gap, -36 if direction > 0 else SCREEN_WIDTH,
+                  direction * speed, 36, "x")
     elif pattern in ("mortars", "crush_marks", "rain_marks"):
         wanted = targets or ((SCREEN_WIDTH * (.35 if cycle % 2 else .65), SCREEN_HEIGHT - 70),)
         for x, y in wanted[:4]:
             target_marks.append((x, y))
-            for dx in (-4.0, 0, 4.0):
-                shots.append((origin_x, origin_y, dx + (x - origin_x) / 180,
-                              4.8 + .2 * phase, 16, color))
+            heading = math.atan2(y - origin_y, x - origin_x)
+            for spread in (-.14, 0, .14):
+                speed = 5.8 + .2 * phase
+                shots.append((origin_x, origin_y, math.cos(heading + spread) * speed,
+                              math.sin(heading + spread) * speed, 16, color))
     elif pattern in ("fortress_fan", "twin_burst", "tempest_spiral"):
         for index in range(18 if phase >= 2 else 12):
             angle = -1.25 + 2.5 * index / max(1, (18 if phase >= 2 else 12) - 1)
@@ -4516,30 +5080,29 @@ def plan_milestone_attack(enemy, target_positions=()):
         beams.append(pygame.Rect(beam_x - 30, GAMEPLAY_TOP, 60, SCREEN_HEIGHT - GAMEPLAY_TOP))
         beams.append(pygame.Rect(0, beam_y - 20, SCREEN_WIDTH, 40))
     elif pattern == "portcullis":
-        # Two separated fronts share one marked opening for the entire crossing.
-        # Account for the first front, so a pilot never has to race the second.
+        # Pass one side, wait for its trailing edge, then cross to the other.
+        # The stagger uses actual projectile speed and unboosted ship motion.
         gap_width = min(260, max(200, round(SCREEN_WIDTH * .24)))
-        gap_x = round(SCREEN_WIDTH * (.35 if cycle % 2 else .65) - gap_width / 2)
-        safe_gap = pygame.Rect(gap_x, GAMEPLAY_TOP, gap_width, SCREEN_HEIGHT - GAMEPLAY_TOP)
+        fractions = (.75, .25) if cycle % 2 else (.25, .75)
+        gaps = [pygame.Rect(round(SCREEN_WIDTH * fraction - gap_width / 2),
+                            GAMEPLAY_TOP, gap_width, SCREEN_HEIGHT - GAMEPLAY_TOP)
+                for fraction in fractions]
         speed = 5.4 + .15 * phase
-        for y in (GAMEPLAY_TOP - 24, GAMEPLAY_TOP - 124):
-            walls.extend(((pygame.Rect(0, y, safe_gap.left, 24), 0, speed),
-                          (pygame.Rect(safe_gap.right, y, SCREEN_WIDTH - safe_gap.right, 24), 0, speed)))
-        for x, y in targets:
-            player_left = x - PLAYER_WIDTH / 2
-            distance = max(0, safe_gap.left + 8 - player_left,
-                           player_left - (safe_gap.right - PLAYER_WIDTH - 8))
-            flight = max(0, (y - PLAYER_HEIGHT / 2 - GAMEPLAY_TOP)
-                         / (speed * ENEMY_PROJECTILE_SPEED_MULTIPLIER))
-            warning_frames = max(warning_frames,
-                                 math.ceil(distance / PLAYER_SPEED + 18 - flight))
+        separation = milestone_front_separation(gaps[0], gaps[1], speed, 24)
+        add_front(gaps[0], GAMEPLAY_TOP - 24, speed)
+        add_front(gaps[1], GAMEPLAY_TOP - 24 - separation, speed,
+                  delay_frames=separation / (speed * ENEMY_PROJECTILE_SPEED_MULTIPLIER))
     elif pattern == "bunker_lattice":
-        # Horizontal firing floors require a vertical dodge, with three broad
-        # unbroken safe bands rather than another side-to-side beam puzzle.
+        # Commit firing floors at the pilots' actual heights. Fixed upper bands
+        # never reached a ship at the bottom of the arena.
         height = 28 + 4 * phase
-        for fraction in (.32, .68):
-            beams.append(pygame.Rect(0, round(SCREEN_HEIGHT * fraction - height / 2),
-                                     SCREEN_WIDTH, height))
+        positions = []
+        for _, y in (targets or ((SCREEN_WIDTH / 2, SCREEN_HEIGHT - PLAYER_HEIGHT / 2),)):
+            if all(abs(y - previous) >= height + PLAYER_HEIGHT + 32 for previous in positions):
+                positions.append(y)
+        for y in positions[:4]:
+            beams.append(pygame.Rect(0, round(y - height / 2), SCREEN_WIDTH, height))
+            target_marks.append((SCREEN_WIDTH / 2, y))
     elif pattern == "woven_ring":
         # Paired outward crescents leave the entire central route open. Their
         # curved trajectories differ from the straight braided curtain.
@@ -4565,15 +5128,17 @@ def plan_milestone_attack(enemy, target_positions=()):
                 shots.append((x, y, math.sin(angle) * speed,
                               math.cos(angle) * speed, 12, color))
     elif pattern == "thunderhead":
-        # Two short lightning shafts connect to a high crossbar. The lower
-        # arena stays open, including on short windows, with no chasing beams.
+        # Full-height forked shafts meet a crossbar at the marked pilot height;
+        # both horizontal and vertical movement can answer the committed fork.
         width = 48 + 4 * phase
         for fraction in (.32, .68):
             beams.append(pygame.Rect(round(SCREEN_WIDTH * fraction - width / 2),
-                                     GAMEPLAY_TOP, width,
-                                     round((SCREEN_HEIGHT - GAMEPLAY_TOP) * .58)))
-        beams.append(pygame.Rect(round(SCREEN_WIDTH * .22), round(SCREEN_HEIGHT * .25),
+                                     GAMEPLAY_TOP, width, SCREEN_HEIGHT - GAMEPLAY_TOP))
+        marked = targets or ((SCREEN_WIDTH / 2, SCREEN_HEIGHT - PLAYER_HEIGHT / 2),)
+        cross_y = marked[cycle % len(marked)][1]
+        beams.append(pygame.Rect(round(SCREEN_WIDTH * .22), round(cross_y - 16),
                                  round(SCREEN_WIDTH * .56), 32))
+        target_marks.append((SCREEN_WIDTH / 2, cross_y))
     elif pattern == "rain_lanes":
         # Two staggered rows fall at different speeds. The sparse offset lanes
         # have ship-sized gaps and leave permanent outer escape strips.
@@ -4605,8 +5170,13 @@ def plan_milestone_attack(enemy, target_positions=()):
                 shots.append((origin_x, y, math.sin(angle) * speed,
                               math.cos(angle) * speed, 12, color))
 
+    if safe_gaps:
+        safe_gap = safe_gaps[0]
+        warning_frames = milestone_front_warning_frames(warning_frames, wall_fronts,
+                                                         walls, targets)
     return {"name": names[pattern], "pattern": pattern, "shots": shots,
             "beams": beams, "walls": walls, "safe_gap": safe_gap,
+            "safe_gaps": safe_gaps, "wall_fronts": wall_fronts,
             "target_marks": target_marks,
             "remaining_frames": warning_frames,
             "warning_frames": warning_frames, "phase": phase}
@@ -4646,15 +5216,20 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
                                   "remaining_frames": BOSS_LASER_ACTIVE_FRAMES + 1,
                                   "milestone_signature": warning["pattern"]})
         wall_hit_players = set()
-        for rect, dx, dy in warning.get("walls", ()):
+        for wall_index, (rect, dx, dy) in enumerate(warning.get("walls", ())):
             projectile = create_enemy_projectile(rect.centerx, rect.centery, dx, dy,
                                                   rect.height, enemy["color"])
             projectile.update(rect=rect.copy(), x=float(rect.x), y=float(rect.y),
                               milestone_wall=True, milestone_hit_players=wall_hit_players,
                               milestone_signature=warning["pattern"])
-            if dy == 0:
-                # Stationary/sideways fronts must finish so the boss can attack
-                # again. Descending gates instead finish their whole crossing.
+            for front_index, front in enumerate(warning.get("wall_fronts", ())):
+                if wall_index in front["wall_indices"]:
+                    projectile.update(milestone_front_index=front_index,
+                                      milestone_gap=front["gap"])
+                    break
+            if dx == 0 and dy == 0:
+                # Legacy stationary fronts need a finite lifetime. Moving
+                # fronts instead finish their entire announced arena crossing.
                 projectile["wall_lifetime"] = BOSS_LASER_ACTIVE_FRAMES
             enemy_bullets.append(projectile)
         enemy["signature_warning"] = None
@@ -4693,57 +5268,94 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
     enemy["last_attack_pattern"] = warning["pattern"]
 
 
-def draw_milestone_attack_warning(screen, enemy):
+def draw_direction_chevrons(screen, rect, dx, dy, color, spacing=120):
+    """Small arrows sit inside the real crossing front and show its travel."""
+    if not dx and not dy:
+        return
+    rect = pygame.Rect(rect)
+    if abs(dy) >= abs(dx):
+        sign = 1 if dy > 0 else -1
+        y = rect.centery
+        for x in range(rect.left + min(24, rect.width // 2), rect.right, spacing):
+            pygame.draw.lines(screen, color, False,
+                              [(x - 5, y - sign * 3), (x, y + sign * 3),
+                               (x + 5, y - sign * 3)], 2)
+    else:
+        sign = 1 if dx > 0 else -1
+        x = rect.centerx
+        for y in range(rect.top + min(24, rect.height // 2), rect.bottom, spacing):
+            pygame.draw.lines(screen, color, False,
+                              [(x - sign * 3, y - 5), (x + sign * 3, y),
+                               (x - sign * 3, y + 5)], 2)
+
+
+def draw_milestone_wall_warning(screen, warning, color, bright, elapsed):
+    """Committed front paths and separately numbered escape corridors."""
+    walls = warning.get("walls", ())
+    fronts = warning.get("wall_fronts", ())
+    gaps = warning.get("safe_gaps")
+    if not gaps:
+        gaps = (warning["safe_gap"],) if warning.get("safe_gap") is not None else ()
+    animated = graphics_feature_enabled("animations") and not low_effects_mode()
+    for rect, dx, dy in walls:
+        if abs(dx) > abs(dy):
+            path = pygame.Rect(0, rect.y, SCREEN_WIDTH, rect.height)
+        else:
+            path = pygame.Rect(rect.x, GAMEPLAY_TOP, rect.width, SCREEN_HEIGHT - GAMEPLAY_TOP)
+        pygame.draw.rect(screen, color, path, 1)
+        if animated:
+            offset = (elapsed * 2) % 90
+            if abs(dx) > abs(dy):
+                for x in range(path.left + 12 + offset, path.right, 90):
+                    front = pygame.Rect(x, path.top, 18, path.height)
+                    draw_direction_chevrons(screen, front, dx, dy, bright)
+            else:
+                for y in range(path.top + 12 + offset, path.bottom, 90):
+                    front = pygame.Rect(path.left, y, path.width, 18)
+                    draw_direction_chevrons(screen, front, dx, dy, bright)
+    for index, gap in enumerate(gaps):
+        gap_color = UI_MINT if index == 0 else UI_GOLD
+        front = fronts[index] if index < len(fronts) else {}
+        axis = front.get("axis")
+        if axis is None:
+            wall_index = front.get("wall_indices", (0,))[0]
+            if walls and wall_index < len(walls):
+                _, dx, dy = walls[wall_index]
+                axis = "x" if abs(dx) > abs(dy) else "y"
+            else:
+                axis = "y"
+        if axis == "x":
+            edges = ((gap.topleft, gap.topright), (gap.bottomleft, gap.bottomright))
+        else:
+            edges = ((gap.topleft, gap.bottomleft), (gap.topright, gap.bottomright))
+        for start, end in edges:
+            pygame.draw.line(screen, gap_color, start, end, 2)
+        if len(gaps) > 1:
+            label = cached_ui_text(hud_font(18), f"GAP {index + 1}", gap_color,
+                                   max_width=max(24, min(120, gap.width - 8)), max_height=16)
+            label_rect = label.get_rect(center=(gap.centerx,
+                min(SCREEN_HEIGHT - 24, max(130, gap.top + 24) + index * 36)))
+            pygame.draw.rect(screen, UI_BG, label_rect.inflate(10, 6), border_radius=3)
+            screen.blit(label, label_rect)
+
+
+def draw_milestone_attack_warning(screen, enemy, show_label=True):
     """Pure, lightweight tells use the exact committed launch geometry."""
     warning = enemy.get("signature_warning")
     if warning is None:
         return
     color = enemy["color"]
-    if _POTATO_MODE:
-        for rect in warning["beams"]:
-            pygame.draw.rect(screen, color, rect, 2)
-            pygame.draw.line(screen, color, rect.midtop, rect.midbottom, 1)
-        safe_gap = warning["safe_gap"]
-        if safe_gap is not None:
-            pygame.draw.line(screen, UI_MINT, safe_gap.topleft, safe_gap.bottomleft, 2)
-            pygame.draw.line(screen, UI_MINT, safe_gap.topright, safe_gap.bottomright, 2)
-            for rect, _, _ in warning.get("walls", ()):
-                path = pygame.Rect(rect.x, GAMEPLAY_TOP, rect.width, SCREEN_HEIGHT - GAMEPLAY_TOP)
-                pygame.draw.rect(screen, color, path, 1)
-        for x, y in warning.get("target_marks", ()):
-            center = (round(x), round(y))
-            pygame.draw.circle(screen, color, center, 22, 2)
-            pygame.draw.line(screen, color, (center[0] - 29, center[1]), (center[0] + 29, center[1]), 1)
-            pygame.draw.line(screen, color, (center[0], center[1] - 29), (center[0], center[1] + 29), 1)
-        for x, y, dx, dy, size, _ in warning["shots"]:
-            speed = max(.01, math.hypot(dx, dy))
-            end = (round(x + dx / speed * 90), round(y + dy / speed * 90))
-            pygame.draw.circle(screen, color, (round(x), round(y)), max(4, size // 2), 1)
-            pygame.draw.line(screen, color, (round(x), round(y)), end, 1)
-        warning_label = warning["name"]
-        if warning["beams"] or warning.get("walls"):
-            warning_label += " / PIERCES DURABILITY"
-        label = hud_font(22).render(warning_label, True, color)
-        screen.blit(label, label.get_rect(midtop=(SCREEN_WIDTH // 2,
-                                                 max(110, enemy["rect"].bottom + 24))))
-        return
-    elapsed = warning["warning_frames"] - warning["remaining_frames"]
-    bright = blend_color(color, UI_TEXT, .3 + .2 * math.sin(elapsed * .2))
+    animated = graphics_feature_enabled("animations") and not low_effects_mode()
+    elapsed = warning["warning_frames"] - warning["remaining_frames"] if animated else 0
+    bright = blend_color(color, UI_TEXT, .3 + .2 * math.sin(elapsed * .2)) if animated else color
     for rect in warning["beams"]:
         pygame.draw.rect(screen, color, rect, 2)
         pygame.draw.line(screen, bright, rect.midtop, rect.midbottom, 1)
-        for y in range(rect.top + (elapsed * 2) % 32, rect.bottom, 32):
-            pygame.draw.line(screen, color, (rect.left + 3, y),
-                             (rect.right - 3, min(rect.bottom, y + 12)), 1)
-    safe_gap = warning["safe_gap"]
-    if safe_gap is not None:
-        pygame.draw.line(screen, UI_MINT, safe_gap.topleft, safe_gap.bottomleft, 2)
-        pygame.draw.line(screen, UI_MINT, safe_gap.topright, safe_gap.bottomright, 2)
-        for rect, _, _ in warning.get("walls", ()):
-            path = pygame.Rect(rect.x, GAMEPLAY_TOP, rect.width, SCREEN_HEIGHT - GAMEPLAY_TOP)
-            pygame.draw.rect(screen, color, path, 1)
-            for y in range(GAMEPLAY_TOP + 12, SCREEN_HEIGHT, 90):
-                pygame.draw.line(screen, bright, (path.left + 4, y), (path.right - 4, y), 1)
+        if animated:
+            for y in range(rect.top + (elapsed * 2) % 32, rect.bottom, 32):
+                pygame.draw.line(screen, color, (rect.left + 3, y),
+                                 (rect.right - 3, min(rect.bottom, y + 12)), 1)
+    draw_milestone_wall_warning(screen, warning, color, bright, elapsed)
     for x, y in warning.get("target_marks", ()):
         center = (round(x), round(y))
         pygame.draw.circle(screen, color, center, 22, 2)
@@ -4754,12 +5366,29 @@ def draw_milestone_attack_warning(screen, enemy):
         end = (round(x + dx / speed * 90), round(y + dy / speed * 90))
         pygame.draw.circle(screen, color, (round(x), round(y)), max(4, size // 2), 1)
         pygame.draw.line(screen, bright, (round(x), round(y)), end, 1)
+    if show_label:
+        draw_milestone_warning_caption(screen, enemy, bright)
+
+
+def draw_milestone_warning_caption(screen, enemy, color=None):
+    """Fit the signature caption beneath the entire boss status block."""
+    warning = enemy.get("signature_warning")
+    if warning is None:
+        return
+    color = enemy["color"] if color is None else color
     warning_label = warning["name"]
     if warning["beams"] or warning.get("walls"):
         warning_label += " / PIERCES DURABILITY"
-    label = hud_font(22).render(warning_label, True, bright)
-    label_rect = label.get_rect(midtop=(SCREEN_WIDTH // 2,
-                                       max(110, enemy["rect"].bottom + 24)))
+    label = cached_ui_text(hud_font(22), warning_label, color,
+                           max_width=max(1, screen.get_width() - 32), max_height=24)
+    label_y = max(110, enemy["rect"].bottom + 24)
+    if enemy.get("is_boss"):
+        status = boss_status_layout(enemy, screen.get_rect())["panel"]
+        if status.top >= enemy["rect"].bottom:
+            label_y = max(label_y, status.bottom + 12)
+    label_rect = label.get_rect(midtop=(screen.get_width() // 2, label_y))
+    label_rect.clamp_ip(screen.get_rect().inflate(-16, -16))
+    pygame.draw.rect(screen, UI_BG, label_rect.inflate(12, 8), border_radius=4)
     screen.blit(label, label_rect)
 
 
@@ -5053,12 +5682,13 @@ def grant_momentum(player, now, origin=None, particles=None):
     player["momentum_stacks"] = min(BULLET_TIME_MAX_STACKS, old_stacks + 1)
     player["momentum_flash_until"] = now + 440
     # Small energy motes communicate a captured shot.
-    if particles is not None and origin is not None and not _POTATO_MODE:
+    if particles is not None and origin is not None and graphics_particle_level() != "off":
         start_x, start_y = origin
         target_x = player["x"] + PLAYER_WIDTH / 2
         target_y = player["y"] + PLAYER_HEIGHT / 2
         distance = max(1.0, math.hypot(target_x - start_x, target_y - start_y))
-        for index in range(5):
+        effect_cap = 96 if graphics_particle_level() == "reduced" else MAX_EFFECT_PARTICLES
+        for index in range(min(5, max(0, effect_cap - len(particles)))):
             spread = (index - 2) * 0.20
             particles.append({
                 "kind": "momentum",
@@ -5082,9 +5712,11 @@ def grant_shatter(player, now, origin=None, particles=None):
     if old_stacks < SHATTER_MAX_STACKS:
         player["shatter_flash_until"] = now + 500
     if (particles is not None and origin is not None and old_stacks < SHATTER_MAX_STACKS
-            and not _POTATO_MODE):
-        available = max(0, 48 - sum(p.get("kind") == "shatter" for p in particles))
-        for index in range(min(6, available)):
+            and graphics_particle_level() != "off"):
+        level = graphics_particle_level()
+        available = min(max(0, 48 - sum(p.get("kind") == "shatter" for p in particles)),
+                        max(0, (96 if level == "reduced" else MAX_EFFECT_PARTICLES) - len(particles)))
+        for index in range(min(3 if level == "reduced" else 6, available)):
             angle = math.tau * index / 6
             particles.append({"kind": "shatter", "x": float(origin[0]), "y": float(origin[1]),
                               "dx": math.cos(angle) * 4.5, "dy": math.sin(angle) * 4.5,
@@ -5797,7 +6429,8 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
             if bullet["laser_state"] == "warning":
                 if bullet["remaining_frames"] <= 0:
                     bullet["laser_state"] = "active"
-                    bullet["remaining_frames"] = BOSS_LASER_ACTIVE_FRAMES
+                    bullet["remaining_frames"] = (NORMAL_BOSS_LASER_ACTIVE_FRAMES
+                                                  if bullet.get("boss_laser") else BOSS_LASER_ACTIVE_FRAMES)
                 continue
 
             if bullet["remaining_frames"] <= 0:
@@ -5883,7 +6516,8 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
             # A wide barrier remains active while any part is in the arena.
             # Ordinary bullet edge handling would erase a whole moving wall as
             # soon as its first pixel crossed the left or right edge.
-            if (bullet["rect"].right <= 0 or bullet["rect"].left >= SCREEN_WIDTH
+            if ((bullet["rect"].right <= 0 and bullet["dx"] <= 0)
+                    or (bullet["rect"].left >= SCREEN_WIDTH and bullet["dx"] >= 0)
                     or bullet["rect"].top > SCREEN_HEIGHT
                     or (bullet["rect"].bottom < 0 and bullet["dy"] <= 0)):
                 enemy_bullets.remove(bullet)
@@ -6296,13 +6930,40 @@ def nova_countdown(player, now):
     return min(NOVA_COUNTDOWN_MS // 1000, max(0, math.ceil(remaining / 1000)))
 
 
+def snapshot_nova_targets(player, enemies):
+    """Choose a bounded, fixed regular-foe cohort once for this whole-field sweep."""
+    arena = pygame.Rect(0, GAMEPLAY_TOP, SCREEN_WIDTH, SCREEN_HEIGHT - GAMEPLAY_TOP)
+    candidates = [enemy for enemy in enemies
+                  if enemy["hp"] > 0 and not enemy.get("is_boss", False)
+                  and arena.colliderect(enemy["rect"])]
+    count = len(candidates)
+    if count == 1:
+        chosen = candidates if random.random() < NOVA_REGULAR_TARGET_FRACTION else []
+    else:
+        target_count = min(max(0, count - 1), int(count * NOVA_REGULAR_TARGET_FRACTION + 0.5))
+        chosen = random.sample(candidates, target_count) if target_count else []
+    # Retain only the chosen objects until the sweep ends. Keeping the objects
+    # behind these IDs prevents a defeated target's ID being reused by a newly
+    # spawned shardling or another enemy during the same pulse.
+    player["nova_target_ids"] = {id(enemy): enemy for enemy in chosen}
+    player["nova_target_sweep_start"] = player["nova_sweep_start"]
+    player["nova_target_sweep_id"] = (player["number"], player["nova_sweep_start"])
+
+
+def nova_distance_to_rect(center, rect):
+    """Let the wave touch partially visible targets even beyond a screen corner."""
+    return math.hypot(max(rect.left - center[0], 0, center[0] - rect.right),
+                      max(rect.top - center[1], 0, center[1] - rect.bottom))
+
+
 def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, powerups, particles):
     """Resolve charged Nova pulses and stored missiles with reward context."""
     now = pygame.time.get_ticks()
+    # Snapshot all pulses that fire together before any one pilot's damage can
+    # split a foe or change another pilot's pool of eligible targets.
     for player in players:
         if player.get("eliminated") or player.get("respawn_until", 0) > now:
             continue
-        center = (player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
         if player.get("pending_nova"):
             if not player.get("nova_charge_until", 0):
                 # Also accept an older in-memory pending flag as a fresh charge.
@@ -6313,18 +6974,30 @@ def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, po
                 player["nova_sweep_start"] = now
                 player["nova_sweep_until"] = now + NOVA_SWEEP_MS
                 player["nova_sweep_previous_radius"] = 0
+                player["nova_sweep_particle_added"] = False
+                snapshot_nova_targets(player, enemies)
 
+        if (player.get("nova_sweep_until", 0)
+                and (player.get("nova_target_ids") is None
+                     or player.get("nova_target_sweep_start") != player["nova_sweep_start"])):
+            # Older in-memory active sweeps have no target snapshot yet.
+            snapshot_nova_targets(player, enemies)
+
+    for player in players:
+        if player.get("eliminated") or player.get("respawn_until", 0) > now:
+            continue
+        center = (player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
         if player.get("nova_sweep_until", 0):
             sweep_duration = max(1, player["nova_sweep_until"] - player["nova_sweep_start"])
             elapsed = max(0, now - player["nova_sweep_start"])
             progress = min(1.0, elapsed / sweep_duration)
             screen_center = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
             current_radius = NOVA_MAX_RADIUS * progress
-            previous_radius = player.get("nova_sweep_previous_radius", 0)
-            # Include the exact center on the first step. Later steps still
-            # affect only the newly crossed annulus, once per enemy and sweep.
-            lower_radius = -1 if previous_radius == 0 else previous_radius
-            sweep_id = (player["number"], player["nova_sweep_start"])
+            # Recheck the reached interior so movement across the front between
+            # frames cannot let a chosen foe slip behind it. The hit ledger
+            # still limits each boss to one hit per pilot and sweep.
+            sweep_id = player["nova_target_sweep_id"]
+            target_ids = player["nova_target_ids"]
 
             if now < player["nova_sweep_until"] and not player.get("nova_sweep_particle_added", False):
                 player["nova_sweep_particle_added"] = True
@@ -6337,8 +7010,11 @@ def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, po
             for enemy in enemies[:]:
                 if enemy["hp"] <= 0:
                     continue
-                distance = math.dist(screen_center, enemy["rect"].center)
-                if lower_radius < distance <= current_radius:
+                is_boss = enemy.get("is_boss", False)
+                if not is_boss and target_ids.get(id(enemy)) is not enemy:
+                    continue
+                distance = nova_distance_to_rect(screen_center, enemy["rect"])
+                if distance <= current_radius:
                     # Each pilot can have a sweep active at the same time.
                     # A single last-hit ID lets one pilot overwrite another's
                     # record, allowing a moving foe to take repeated damage.
@@ -6348,7 +7024,10 @@ def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, po
                         continue
                     hits_by_player[player["number"]] = sweep_id[1]
                     enemy["nova_hit_id"] = sweep_id
-                    damage_enemy(enemy, 1, player["number"], ignore_shields=True)
+                    # Regular targets are executed regardless of health or
+                    # shields. Boss stagger bonuses cannot amplify Nova's cap.
+                    damage_enemy(enemy, 1 if is_boss else enemy["hp"], player["number"],
+                                 ignore_shields=True, damage_cap=1 if is_boss else None)
                     if enemy["hp"] <= 0:
                         enemy["no_chain_reaction"] = True
                         finish_defeated_enemy(enemy, enemies, players, powerups, enemy_bullets, particles)
@@ -6356,8 +7035,8 @@ def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, po
             for shot in enemy_bullets[:]:
                 if shot.get("laser_state") is not None or shot.get("milestone_wall"):
                     continue
-                distance = math.dist(screen_center, shot["rect"].center)
-                if lower_radius < distance <= current_radius:
+                distance = nova_distance_to_rect(screen_center, shot["rect"])
+                if distance <= current_radius:
                     enemy_bullets.remove(shot)
 
             player["nova_sweep_previous_radius"] = current_radius
@@ -6368,6 +7047,9 @@ def resolve_instant_powerups(players, enemies, enemy_bullets, player_bullets, po
                 player["nova_sweep_previous_radius"] = 0
                 player["nova_sweep_start"] = 0
                 player["nova_sweep_particle_added"] = False
+                player["nova_target_ids"] = None
+                player["nova_target_sweep_start"] = 0
+                player["nova_target_sweep_id"] = None
         if player.get("pending_missiles"):
             targets = sorted((enemy for enemy in enemies
                               if enemy["hp"] > 0 and enemy_is_visible(enemy)),
@@ -7693,6 +8375,45 @@ def safe_player_spawn(player, players=()):
     return position
 
 
+def reset_player_stamina(player):
+    """A new ship starts ready; checkpoints/Continue rebuild this transient state."""
+    player.update(stamina=PLAYER_MAX_STAMINA, stamina_regen_delay=0,
+                  stamina_exhaustion_ticks=0, sprint_release_required=False,
+                  sprinting=False)
+
+
+def update_player_stamina(player, sprint_held, moving):
+    """Advance one active simulation tick and return this tick's speed factor."""
+    # Defaults also support callers constructing old-style player dictionaries.
+    player.setdefault("stamina", PLAYER_MAX_STAMINA)
+    player.setdefault("stamina_regen_delay", 0)
+    player.setdefault("stamina_exhaustion_ticks", 0)
+    player.setdefault("sprint_release_required", False)
+    player["sprinting"] = False
+    if not sprint_held:
+        player["sprint_release_required"] = False
+    if player["stamina_exhaustion_ticks"] > 0:
+        player["stamina_exhaustion_ticks"] -= 1
+        player["stamina_regen_delay"] = max(0, player["stamina_regen_delay"] - 1)
+        return PLAYER_EXHAUSTED_SPEED_MULTIPLIER
+    if (sprint_held and moving and player["stamina"] > 0
+            and not player["sprint_release_required"]):
+        player["sprinting"] = True
+        player["stamina"] = max(0.0, player["stamina"] - PLAYER_STAMINA_DRAIN_PER_TICK)
+        player["stamina_regen_delay"] = PLAYER_STAMINA_REGEN_DELAY_TICKS
+        if player["stamina"] <= 1e-9:
+            player["stamina"] = 0.0
+            player["stamina_exhaustion_ticks"] = PLAYER_EXHAUSTION_TICKS
+            player["sprint_release_required"] = True
+        return PLAYER_SPRINT_SPEED_MULTIPLIER
+    if player["stamina_regen_delay"] > 0:
+        player["stamina_regen_delay"] -= 1
+    else:
+        player["stamina"] = min(PLAYER_MAX_STAMINA,
+                                player["stamina"] + PLAYER_STAMINA_REGEN_PER_TICK)
+    return 1.0
+
+
 def spawn_player(player, players=()):
     """Apply safe placement and reset recoil without altering lives or upgrades."""
     player["x"], player["y"] = safe_player_spawn(player, players)
@@ -7700,6 +8421,7 @@ def spawn_player(player, players=()):
     player["ram_bounce_x"] = player["ram_bounce_y"] = 0
     player["ram_bounce_frames"] = 0
     player["move_dx"] = player["move_dy"] = 0
+    reset_player_stamina(player)
     reset_player_animation(player)
 
 
@@ -7764,6 +8486,9 @@ def create_player_states(player_count, player_sprites):
             "nova_sweep_until": 0,
             "nova_sweep_previous_radius": 0,
             "nova_sweep_particle_added": False,
+            "nova_target_ids": None,
+            "nova_target_sweep_start": 0,
+            "nova_target_sweep_id": None,
             "pending_missiles": False,
             "pending_reflections": [],
             "pending_chain_shots": [],
@@ -7771,6 +8496,7 @@ def create_player_states(player_count, player_sprites):
             "powerup_notice_until": 0,
             "eliminated": False,
         })
+        reset_player_stamina(players[-1])
         attach_ship_animation(players[-1], PLAYER_ART, PLAYER_COLORS[index],
                               PLAYER_WIDTH, PLAYER_HEIGHT, "player")
         reset_player_animation(players[-1])
@@ -7780,6 +8506,8 @@ def create_player_states(player_count, player_sprites):
 
 
 def reset_player_positions(players):
+    # Placement is also used between waves; it does not grant a fresh ship.
+    # Display/arena changes must preserve in-progress stamina and exhaustion.
     team = sorted(players, key=lambda player: player["number"])
     for player, (x, y) in zip(team, _safe_player_spawn_positions(team)):
         player["spawn_x"] = player["x"] = x
@@ -7792,6 +8520,7 @@ def reset_player_positions(players):
 
 def update_player_movement(keys, players):
     now = pygame.time.get_ticks()
+    sprint_bindings = sprint_keys()
     for player in players:
         previous_x = player["x"]
         previous_y = player["y"]
@@ -7801,6 +8530,7 @@ def update_player_movement(keys, players):
             player["ram_bounce_frames"] = 0
             player["move_dx"] = 0
             player["move_dy"] = 0
+            player["sprinting"] = False
             continue
 
         left_key, right_key, up_key, down_key, _ = PLAYER_CONTROLS[player["number"] - 1]
@@ -7815,6 +8545,14 @@ def update_player_movement(keys, players):
         input_x = int(bool(keys[right_key])) - int(bool(keys[left_key]))
         input_y = int(bool(keys[down_key])) - int(bool(keys[up_key]))
         distance = max(1, math.hypot(input_x, input_y))
+        # Recoil and holding against an arena edge never consume stamina.
+        target_x = max(0, min(SCREEN_WIDTH - PLAYER_WIDTH,
+                             player["x"] + input_x / distance * move_speed))
+        target_y = max(GAMEPLAY_TOP + 2, min(SCREEN_HEIGHT - PLAYER_HEIGHT,
+                                          player["y"] + input_y / distance * move_speed))
+        moving = target_x != player["x"] or target_y != player["y"]
+        move_speed *= update_player_stamina(
+            player, bool(keys[sprint_bindings[player["number"] - 1]]), moving)
         player["x"] = max(0, min(SCREEN_WIDTH - PLAYER_WIDTH, player["x"] + input_x / distance * move_speed))
         player["y"] = max(GAMEPLAY_TOP + 2, min(SCREEN_HEIGHT - PLAYER_HEIGHT, player["y"] + input_y / distance * move_speed))
         player["move_dx"] = player["x"] - previous_x
@@ -7860,7 +8598,7 @@ def check_player_ram_collisions(enemies, particles, enemy_bullets, powerups, pla
 
 def draw_spawn_shield(screen, x, y, spark_color, now):
     center = (int(x + PLAYER_WIDTH / 2), int(y + PLAYER_HEIGHT / 2))
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations"):
         pygame.draw.circle(screen, CYAN, center, 26, 1)
         return
     phase = now / 250
@@ -7878,6 +8616,21 @@ def draw_spawn_shield(screen, x, y, spark_color, now):
 def draw_respawn_charge(screen, x, y, spark_color, now, respawn_until):
     remaining = max(0, respawn_until - now)
     progress = min(1.0, max(0.0, 1 - remaining / RESPAWN_DURATION))
+    center = (round(x + PLAYER_WIDTH / 2), round(y + PLAYER_HEIGHT / 2))
+    ring_color = blend_color(spark_color, UI_CYAN, 0.45)
+    if not graphics_feature_enabled("animations"):
+        # A fixed charge marker still identifies the safe return location.
+        pygame.draw.circle(screen, ring_color, center, 25, 1)
+        bounds = pygame.Rect(center[0] - 29, center[1] - 29, 58, 58)
+        if progress > 0:
+            pygame.draw.arc(screen, spark_color, bounds, -math.pi / 2,
+                            -math.pi / 2 + math.tau * progress, 2)
+        pygame.draw.line(screen, spark_color, (center[0] - 7, center[1]),
+                         (center[0] + 7, center[1]), 2)
+        pygame.draw.line(screen, spark_color, (center[0], center[1] - 7),
+                         (center[0], center[1] + 7), 2)
+        pygame.draw.circle(screen, UI_TEXT, center, 3)
+        return
     if progress < 0.75:
         radius = 10 + round(40 * progress / 0.75)
         implode = 0.0
@@ -7885,9 +8638,7 @@ def draw_respawn_charge(screen, x, y, spark_color, now, respawn_until):
         implode = (progress - 0.75) / 0.25
         radius = round(50 * (1 - implode) + 4 * implode)
 
-    center = (round(x + PLAYER_WIDTH / 2), round(y + PLAYER_HEIGHT / 2))
     phase = now / 180
-    ring_color = blend_color(spark_color, UI_CYAN, 0.45)
     thickness = 1 if _POTATO_MODE else 2
     for index in range(3):
         ring_radius = max(3, round(radius * (0.72 + 0.28 * math.sin(phase + index * 2.1))))
@@ -8168,7 +8919,7 @@ def draw_world_powerup(screen, powerup, now):
     """Render an identifiable animated pickup without changing its hitbox or RNG."""
     key = powerup["type"]
     color = POWERUP_COLORS.get(key, UI_CYAN)
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations"):
         # Draw the existing identity glyph directly; no per-pickup alpha
         # canvas, pulsing aura, trigonometry or halo reaches this path.
         center = powerup["rect"].center
@@ -8184,7 +8935,8 @@ def draw_world_powerup(screen, powerup, now):
     surface = pygame.Surface((72, 72), pygame.SRCALPHA)
     center = (36, 36)
     pulse = 0.5 + 0.5 * math.sin(now / 240 + visual_phase)
-    pygame.draw.circle(surface, (*color, round(10 + pulse * 9)), center, 26)
+    if graphics_feature_enabled("glow"):
+        pygame.draw.circle(surface, (*color, round(10 + pulse * 9)), center, 26)
     pygame.draw.circle(surface, (*UI_BG, 172), center, 14)
     pygame.draw.circle(surface, (*color, 190), center, 14, 1)
     draw_powerup_aura(surface, center, (*color, 150), motif, count, phase,
@@ -8196,16 +8948,18 @@ def draw_world_powerup(screen, powerup, now):
 
 def spawn_powerup_pickup_effect(player, powerup_type, particles):
     """A small capped celebration, using the pickup's own visual identity."""
-    if _POTATO_MODE:
+    level = graphics_particle_level()
+    if level == "off":
         return 0
-    available = max(0, POWERUP_COLLECTION_PARTICLE_CAP
-                    - sum(p.get("kind") == "powerup_pickup" for p in particles))
+    available = min(max(0, POWERUP_COLLECTION_PARTICLE_CAP
+                        - sum(p.get("kind") == "powerup_pickup" for p in particles)),
+                    max(0, (96 if level == "reduced" else MAX_EFFECT_PARTICLES) - len(particles)))
     if not available:
         return 0
     color = POWERUP_COLORS.get(powerup_type, UI_CYAN)
     motif, count, _ = POWERUP_VISUAL_PROFILES.get(powerup_type, ("hex", 6, 1.0))
     center = (player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
-    number = min(7, available)
+    number = min(3 if level == "reduced" else 7, available)
     for index in range(number):
         angle = math.tau * max(0, index - 1) / max(1, number - 1)
         particles.append({
@@ -8223,7 +8977,7 @@ def spawn_powerup_pickup_effect(player, powerup_type, particles):
 
 def draw_powerup_collection_particle(screen, particle):
     """Lightweight alpha effects, including Frostbite's separate icy Shatter."""
-    if _POTATO_MODE:
+    if graphics_particle_level() == "off":
         return
     fraction = max(0, particle["lifetime"] / max(1, particle["max_lifetime"]))
     progress = 1 - fraction
@@ -8307,33 +9061,41 @@ def cached_ui_text(font, text, color, max_width=None, max_height=None):
 
 def draw_gameplay_hud_panel(screen, rect, color, radius=6):
     """Cached translucent plates keep both resizing and busy fights inexpensive."""
-    if _POTATO_MODE:
-        # Opaque small docks need no alpha blend or outline on every glyph.
-        pygame.draw.rect(screen, UI_BG, rect)
+    rect = pygame.Rect(rect)
+    color = ui_theme_color(color)
+    background = ui_palette()["bg"]
+    alpha = gameplay_hud_opacity()
+    if _POTATO_MODE and alpha == 255:
+        # Auto retains Potato's opaque small docks; selected opacity still
+        # applies when the user opts into translucent plates in this mode.
+        pygame.draw.rect(screen, background, rect)
         pygame.draw.rect(screen, color, rect, 1)
         return
-    key = (rect.size, tuple(color), radius)
+    key = (rect.size, tuple(color), radius, background, alpha, _POTATO_MODE)
     overlay = _HUD_BACKPLATES.get(key)
     if overlay is None:
         if len(_HUD_BACKPLATES) >= 64:
             _HUD_BACKPLATES.clear()
         overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(overlay, (*UI_BG, 42), overlay.get_rect(), border_radius=radius)
-        pygame.draw.rect(overlay, (*color, 82), overlay.get_rect(), 1, border_radius=radius)
+        corner_radius = 0 if _POTATO_MODE else radius
+        border_alpha = 255 if _POTATO_MODE else max(82, alpha)
+        pygame.draw.rect(overlay, (*background, alpha), overlay.get_rect(), border_radius=corner_radius)
+        pygame.draw.rect(overlay, (*color, border_alpha), overlay.get_rect(), 1, border_radius=corner_radius)
         _HUD_BACKPLATES[key] = overlay
     screen.blit(overlay, rect.topleft)
 
 
-def draw_hud_label(screen, font, text, color, rect, align="left", max_height=None):
+def draw_hud_label(screen, font, text, color, rect, align="left", max_height=None, themed=True):
     """Fit outlined text so bright ships behind translucent docks stay legible."""
+    color = ui_theme_color(color) if themed else color
     surface = cached_ui_text(font, text, color, rect.width, max_height or rect.height)
     position = surface.get_rect(midleft=rect.midleft)
     if align == "right":
         position.midright = rect.midright
     elif align == "center":
         position.center = rect.center
-    if not _POTATO_MODE:
-        outline = cached_ui_text(font, text, UI_BG, rect.width, max_height or rect.height)
+    if graphics_feature_enabled("text_outline"):
+        outline = cached_ui_text(font, text, ui_palette()["bg"], rect.width, max_height or rect.height)
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             screen.blit(outline, position.move(dx, dy))
     screen.blit(surface, position)
@@ -8347,11 +9109,11 @@ def gameplay_hud_slot_layout(player_number):
     center_width = max(100, min(176, SCREEN_WIDTH // 5))
     width = min(244 if compact else 260,
                 max(160, (SCREEN_WIDTH - center_width - 4 * margin) // 2))
-    score_height = 38 if compact else 48
+    score_height = 42 if compact else 48
     armor_height = 14 if compact else 16
     effect_height = 38 if compact else 50
-    gap = 3 if compact else 4
-    pitch = score_height + armor_height + gap + effect_height + (3 if compact else 10)
+    gap = 2 if compact else 4
+    pitch = score_height + armor_height + gap + effect_height + (2 if compact else 10)
     x = margin if player_number in (1, 3) else SCREEN_WIDTH - margin - width
     y = margin + (pitch if player_number in (3, 4) else 0)
     return {"rect": pygame.Rect(x, y, width, pitch), "compact": compact,
@@ -8364,6 +9126,23 @@ def scoreboard_layout(player_number, upgraded=False):
     rect = slot["rect"].copy()
     rect.height = slot["score_height"] + (slot["armor_height"] if upgraded else 0)
     return rect
+
+
+def player_status_hud_layout(player_number, upgraded=False):
+    """Exhaustion sits beside Durability; its repair timer keeps separate space."""
+    slot = gameplay_hud_slot_layout(player_number)
+    panel = scoreboard_layout(player_number, upgraded)
+    inset = 6 if slot["compact"] else 8
+    row = pygame.Rect(panel.x + inset, panel.y + slot["score_height"] - 11,
+                      panel.width - inset * 2, 9)
+    armor_y = panel.bottom - (16 if slot["compact"] else 18)
+    durability = pygame.Rect(panel.x + inset, armor_y, panel.width // 2 - inset - 4, 14)
+    repair = pygame.Rect(panel.centerx, armor_y, panel.width // 2 - inset, 14)
+    exhaustion = repair.copy() if upgraded else pygame.Rect(
+        panel.centerx, row.y, panel.width // 2 - inset, row.height)
+    repair_exhausted = pygame.Rect(panel.centerx, row.y, panel.width // 2 - inset, row.height)
+    return {"durability": durability, "exhaustion": exhaustion,
+            "repair": repair, "repair_exhausted": repair_exhausted}
 
 
 def draw_scoreboard(screen, players, font, now=None, background_only=False, foreground_only=False):
@@ -8389,9 +9168,9 @@ def draw_scoreboard(screen, players, font, now=None, background_only=False, fore
             continue
         inset = 6 if compact else 8
         label_font = hud_font(20 if compact else 22)
-        text_height = 14 if compact else 16
-        row_height = 17 if compact else 20
-        first_y = panel.y + 4
+        text_height = 12 if compact else 14
+        row_height = 14 if compact else 17
+        first_y = panel.y + (3 if compact else 4)
         score_width = 84 if compact else 94
         name_cell = pygame.Rect(panel.x + inset, first_y,
                                 panel.width - inset * 2 - score_width - 6, text_height)
@@ -8422,31 +9201,36 @@ def draw_scoreboard(screen, players, font, now=None, background_only=False, fore
         if status_text:
             draw_hud_label(screen, label_font, status_text, status_color, status_cell,
                            align="right", max_height=text_height)
+        status_layout = player_status_hud_layout(player["number"], upgraded)
+        exhausted = (player.get("stamina_exhaustion_ticks", 0) > 0
+                     and not player["eliminated"] and player["respawn_until"] <= now)
+        if exhausted:
+            seconds = math.ceil(player["stamina_exhaustion_ticks"] / 60)
+            draw_hud_label(screen, label_font, f"SLOWED {seconds}s", UI_CORAL,
+                           status_layout["exhaustion"], align="right")
         if upgraded:
-            armor_y = panel.bottom - (16 if compact else 18)
             remaining, capacity = durability_remaining(player), durability_capacity(player)
-            label_cell = pygame.Rect(panel.x + inset, armor_y, panel.width // 2 - inset - 4, 14)
             draw_hud_label(screen, label_font, f"DUR {remaining}/{capacity}", UI_CYAN,
-                           label_cell, max_height=12 if compact else 14)
+                           status_layout["durability"], max_height=12 if compact else 14)
             regen = (math.ceil(max(0, player.get("durability_regen_until", 0) - now) / 1000)
                      if player.get("durability_damage", 0) else None)
             regen_text = f"REPAIR {regen}s" if regen is not None else ""
             if regen_text:
+                repair_cell = status_layout["repair_exhausted"] if exhausted else status_layout["repair"]
                 draw_hud_label(screen, label_font, regen_text, UI_MUTED,
-                               pygame.Rect(panel.centerx, armor_y, panel.width // 2 - inset, 14),
-                               align="right", max_height=12 if compact else 14)
+                               repair_cell, align="right", max_height=repair_cell.height)
 
 
 def draw_boss_laser_warning(screen, bullet, now):
     """Show the exact locked beam footprint throughout its harmless windup."""
     rect = bullet["rect"]
     remaining = bullet["remaining_frames"]
-    if not _POTATO_MODE:
+    if not _POTATO_MODE and graphics_feature_enabled("glow"):
         progress = 1 - min(1.0, remaining / bullet.get("warning_frames", BOSS_LASER_WARNING_FRAMES))
-        pulse = (math.sin(now / 70) + 1) / 2
-        danger = pygame.Surface(rect.size, pygame.SRCALPHA)
-        danger.fill((*bullet["color"], round(30 + 40 * progress + 20 * pulse)))
-        screen.blit(danger, rect.topleft)
+        pulse = ((math.sin(now / 70) + 1) / 2
+                 if graphics_feature_enabled("animations") else 0)
+        pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"],
+                                            .13 + .16 * progress + .07 * pulse), rect)
     pygame.draw.rect(screen, UI_GOLD, rect, 2)
     for y in range(rect.top + 8, rect.bottom, 36):
         pygame.draw.line(screen, bullet["color"], (rect.centerx, y),
@@ -8458,8 +9242,7 @@ def draw_boss_laser_warning(screen, bullet, now):
                               [(edge_x - side * 5, y - 4), (edge_x, y),
                                (edge_x - side * 5, y + 4)], 2)
     warning_text = f"LASER {remaining / 60:.1f}s / PIERCES DURABILITY"
-    label = (cached_ui_text(hud_font(24), warning_text, UI_GOLD) if _POTATO_MODE
-             else hud_font(24).render(warning_text, True, UI_GOLD))
+    label = cached_ui_text(hud_font(24), warning_text, UI_GOLD)
     label_rect = label.get_rect(midtop=(rect.centerx, rect.top + 18))
     label_rect.x = max(4, min(SCREEN_WIDTH - label_rect.width - 4, label_rect.x))
     pygame.draw.rect(screen, UI_BG, label_rect.inflate(12, 8), border_radius=4)
@@ -8553,13 +9336,16 @@ def draw_powerup_hud(screen, player, now, font):
         return None
     metrics = powerup_hud_metrics(player["number"], len(entries), bool(notice))
     panel = metrics["panel"]
-    key = (player["number"], panel.size, _POTATO_MODE)
+    alpha = gameplay_hud_opacity()
+    key = (player["number"], panel.size, _POTATO_MODE, graphics_option("ui_theme"),
+           graphics_option("hud_opacity"), graphics_feature_enabled("text_outline"))
+    opaque = _POTATO_MODE and alpha == 255
     overlay = _HUD_PANEL_SURFACES.get(key)
     if overlay is None:
         if len(_HUD_PANEL_SURFACES) >= 16:
             _HUD_PANEL_SURFACES.clear()
             _HUD_PANEL_KEYS.clear()
-        overlay = pygame.Surface(panel.size, 0 if _POTATO_MODE else pygame.SRCALPHA)
+        overlay = pygame.Surface(panel.size, 0 if opaque else pygame.SRCALPHA)
         _HUD_PANEL_SURFACES[key] = overlay
     shown, page, page_count = powerup_hud_page(player, now, metrics)
     font = hud_font(18 if metrics["compact"] else 20)
@@ -8570,12 +9356,15 @@ def draw_powerup_hud(screen, player, now, font):
     if font_key is not None and _HUD_PANEL_KEYS.get(key) == content_key:
         screen.blit(overlay, panel.topleft)
         return panel
-    if _POTATO_MODE:
+    if not opaque:
+        overlay.fill((0, 0, 0, 0))
+    if opaque:
         draw_gameplay_hud_panel(overlay, overlay.get_rect(), player["color"])
     else:
-        overlay.fill((0, 0, 0, 0))
-        pygame.draw.rect(overlay, (*UI_BG, 42), overlay.get_rect(), border_radius=6)
-        pygame.draw.rect(overlay, (*player["color"], 82), overlay.get_rect(), 1, border_radius=6)
+        radius = 0 if _POTATO_MODE else 6
+        border_alpha = 255 if _POTATO_MODE else max(82, alpha)
+        pygame.draw.rect(overlay, (*ui_palette()["bg"], alpha), overlay.get_rect(), border_radius=radius)
+        pygame.draw.rect(overlay, (*player["color"], border_alpha), overlay.get_rect(), 1, border_radius=radius)
     title = notice or f"{player_display_name(player)} POWERUPS ({len(entries)})"
     if page_count > 1:
         title += f"  {page + 1}/{page_count}"
@@ -8590,7 +9379,7 @@ def draw_powerup_hud(screen, player, now, font):
                        pygame.Rect(8 + column * cell_width,
                                    metrics["header_height"] + row * metrics["row_height"],
                                    cell_width - 5, metrics["row_height"]),
-                       max_height=metrics["row_height"] - 2)
+                       max_height=metrics["row_height"] - 2, themed=False)
     _HUD_PANEL_KEYS[key] = content_key if font_key is not None else None
     screen.blit(overlay, panel.topleft)
     return panel
@@ -8606,7 +9395,7 @@ def draw_nova_countdown(screen, player, now):
     screen_center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
     remaining = max(0, player["nova_charge_until"] - now)
     progress = 1 - remaining / NOVA_COUNTDOWN_MS
-    if not _POTATO_MODE:
+    if graphics_feature_enabled("animations") and graphics_particle_level() != "off":
         for ring_index in range(3):
             phase = (progress * 2.5 + ring_index / 3) % 1
             radius = max(20, round(40 + (NOVA_MAX_RADIUS - 40) * phase))
@@ -8635,7 +9424,7 @@ def draw_support_powerups(screen, player, now):
     """Distinct, restrained active effects; all are below hostile shots."""
     draw_nova_countdown(screen, player, now)
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations") or graphics_particle_level() == "off":
         if player.get("gravity_until", 0) > now:
             pygame.draw.circle(screen, POWERUP_COLORS["gravity_well"], center,
                                GRAVITY_FIELD_RADIUS, 1)
@@ -8664,7 +9453,8 @@ def draw_support_powerups(screen, player, now):
 
     if player.get("gravity_until", 0) > now:
         field_radius = GRAVITY_FIELD_RADIUS
-        pygame.draw.circle(effects, color("gravity_well", 7), (cx, cy), field_radius)
+        if graphics_feature_enabled("glow"):
+            pygame.draw.circle(effects, color("gravity_well", 7), (cx, cy), field_radius)
         ring = pygame.Rect(cx - field_radius, cy - field_radius, field_radius * 2, field_radius * 2)
         for index in range(4):
             start = now / 700 + index * math.pi / 2
@@ -8672,7 +9462,8 @@ def draw_support_powerups(screen, player, now):
             pygame.draw.circle(effects, color("gravity_well", 155), point(-start, field_radius - 7), 2)
     if player.get("bullet_time_until", 0) > now:
         field_radius = BULLET_TIME_RADIUS
-        pygame.draw.circle(effects, color("bullet_time", 6), (cx, cy), field_radius)
+        if graphics_feature_enabled("glow"):
+            pygame.draw.circle(effects, color("bullet_time", 6), (cx, cy), field_radius)
         pygame.draw.circle(effects, color("bullet_time", 100), (cx, cy), field_radius, 1)
         for index in range(12):
             angle = index * math.tau / 12 - now / 2600
@@ -8775,7 +9566,7 @@ def draw_support_powerups(screen, player, now):
     for index in range(min(MAX_DAMAGE_BONUS, player.get("damage_bonus", 0))):
         pygame.draw.circle(effects, color("damage_up", 160), (cx - 5 + index * 5, cy + 6), 1)
     stacks = momentum_stacks(player, now)
-    if stacks:
+    if stacks and graphics_feature_enabled("trails"):
         momentum_color = blend_color(UI_CYAN, UI_VIOLET, min(1, stacks / BULLET_TIME_MAX_STACKS))
         for segment in range(min(5, 1 + stacks // 4)):
             travel = ((now // 48 + segment * 11) % 24)
@@ -8800,7 +9591,7 @@ def draw_support_powerups(screen, player, now):
 
 def draw_aimed_projectile_trail(screen, bullet):
     """A short direction cue uses existing geometry, without extra particles."""
-    if low_effects_mode():
+    if low_effects_mode() or not graphics_feature_enabled("trails"):
         return
     if not bullet.get("aimed_shot") or bullet.get("laser_state") is not None:
         return
@@ -8828,7 +9619,7 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
         velocity_x = bullet.get("dx", bullet.get("vx", 0))
         velocity_y = bullet.get("dy", bullet.get("vy", -1))
         heading = math.atan2(velocity_y, velocity_x)
-    if _POTATO_MODE:
+    if not graphics_feature_enabled("animations"):
         if bullet.get("type") == "bomb" and not hostile:
             pygame.draw.ellipse(screen, color, rect)
         else:
@@ -8945,6 +9736,96 @@ def draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, 
         draw_pause_button(screen, pause_button_rect, font, paused)
 
 
+def boss_status_layout(enemy, bounds):
+    """Separate caption and meter cells, kept below the fixed top HUD area."""
+    bounds = pygame.Rect(bounds)
+    guardian = bool(enemy.get("milestone_kind"))
+    width = min(max(280, enemy["rect"].width + 80), 360, max(1, bounds.width - 16))
+    height = 76 if guardian else 56
+    panel = pygame.Rect(0, 0, width, min(height, bounds.height - 16))
+    panel.midbottom = (enemy["rect"].centerx, enemy["rect"].top - 12)
+    # Moving an above-hull block to the bottom keeps it off wave/sector badges.
+    hud_bottom = min(bounds.bottom - panel.height - 8, bounds.top + 108)
+    if panel.top < hud_bottom:
+        panel.top = max(hud_bottom, enemy["rect"].bottom + 16)
+    panel.clamp_ip(bounds.inflate(-16, -16))
+    inset, phase_width = 10, 72
+    name = pygame.Rect(panel.x + inset, panel.y + 7, max(1, panel.width - phase_width - 28), 22)
+    phase = pygame.Rect(panel.right - inset - phase_width, panel.y + 7, phase_width, 22)
+    label_width = min(80, max(45, panel.width // 3))
+    label_x = panel.x + inset
+    meter_x = label_x + label_width + 8
+    meter_width = max(1, panel.right - inset - meter_x)
+    health_label = pygame.Rect(label_x, panel.y + 31, label_width, 16)
+    health = pygame.Rect(meter_x, panel.y + 35, meter_width, 8)
+    result = {"panel": panel, "name": name, "phase": phase,
+              "health_label": health_label, "health": health}
+    if guardian:
+        result["core_label"] = pygame.Rect(label_x, panel.y + 52, label_width, 16)
+        result["core"] = pygame.Rect(meter_x, panel.y + 56, meter_width, 8)
+        result["status"] = pygame.Rect(meter_x, panel.y + 51, meter_width, 18)
+    return result
+
+
+def draw_boss_status_layer(screen, enemies, world_size):
+    """Project boss anchors into the native GUI so labels stay readable at 640px."""
+    sx, sy = screen.get_width() / world_size[0], screen.get_height() / world_size[1]
+    with ui_dimensions(screen.get_size()):
+        for enemy in enemies:
+            if not enemy.get("is_boss"):
+                continue
+            world_rect = enemy["rect"]
+            if not pygame.Rect((0, 0), world_size).inflate(160, 160).colliderect(world_rect):
+                continue
+            projected = dict(enemy)
+            projected["rect"] = pygame.Rect(round(world_rect.x * sx), round(world_rect.y * sy),
+                                             max(1, round(world_rect.width * sx)),
+                                             max(1, round(world_rect.height * sy)))
+            draw_boss_status(screen, projected)
+            if enemy.get("signature_warning"):
+                draw_milestone_warning_caption(screen, projected)
+
+
+def draw_boss_status(screen, enemy):
+    """Boss captions never share pixels with the health or core meters."""
+    cells = boss_status_layout(enemy, screen.get_rect())
+    phase = milestone_boss_phase(enemy)
+    phase_color = UI_CORAL if phase == 3 else UI_GOLD if phase == 2 else UI_TEXT
+    draw_gameplay_hud_panel(screen, cells["panel"], enemy["color"], radius=6)
+    draw_hud_label(screen, hud_font(22), enemy.get("boss_name", "BOSS"), enemy["color"],
+                   cells["name"], max_height=20, themed=False)
+    draw_hud_label(screen, hud_font(17), f"PHASE {phase}", phase_color, cells["phase"],
+                   align="right", max_height=16, themed=False)
+    draw_hud_label(screen, hud_font(16), "HULL", UI_TEXT, cells["health_label"],
+                   max_height=14, themed=False)
+    ratio = max(0, min(1, enemy["hp"] / max(1, enemy["max_hp"])))
+    health = cells["health"]
+    pygame.draw.rect(screen, (51, 23, 49), health, border_radius=3)
+    if ratio:
+        filled = pygame.Rect(health.x, health.y, max(1, round(health.width * ratio)), health.height)
+        pygame.draw.rect(screen, blend_color(UI_CORAL, UI_MINT, ratio), filled, border_radius=3)
+    pygame.draw.rect(screen, UI_TEXT, health, 1, border_radius=3)
+    # Phase thresholds remain visible as small fixed ticks in the hull meter.
+    for threshold in (.35, .65):
+        x = health.x + round(health.width * threshold)
+        pygame.draw.line(screen, UI_BG, (x, health.y + 1), (x, health.bottom - 2), 1)
+    if "core" not in cells:
+        return
+    stunned = enemy.get("stagger_remaining", 0) > 0
+    draw_hud_label(screen, hud_font(15), "CORE" if stunned else "BREAK CORE", UI_MINT,
+                   cells["core_label"], max_height=14, themed=False)
+    if stunned:
+        draw_hud_label(screen, hud_font(17), "BROKEN / STUNNED", UI_MINT,
+                       cells["status"], max_height=15, themed=False)
+        return
+    core = cells["core"]
+    pygame.draw.rect(screen, (39, 47, 63), core, border_radius=2)
+    filled_width = round(core.width * milestone_stagger_ratio(enemy))
+    if filled_width:
+        pygame.draw.rect(screen, UI_MINT, (core.x, core.y, filled_width, core.height), border_radius=2)
+    pygame.draw.rect(screen, UI_TEXT, core, 1, border_radius=2)
+
+
 def composite_gameplay_ui(screen, ui_surface, bounds=None):
     """Scale into reusable destinations; sparse foregrounds may supply a crop."""
     global _GAMEPLAY_UI_SCALE_TARGET, _GAMEPLAY_UI_REGION_TARGET
@@ -8977,11 +9858,11 @@ def composite_gameplay_ui(screen, ui_surface, bounds=None):
     screen.blit(_GAMEPLAY_UI_SCALE_TARGET, (0, 0))
 
 
-def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
+def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss_ui=False):
     """Draw threats without updating them, so native HUDs cannot obscure shots."""
     for enemy in enemies:
         if enemy.get("milestone_kind"):
-            draw_milestone_attack_warning(screen, enemy)
+            draw_milestone_attack_warning(screen, enemy, show_label=not native_boss_ui)
     for bullet in enemy_bullets:
         if _POTATO_MODE:
             rect = bullet.get("rect") if isinstance(bullet, dict) else bullet
@@ -8995,19 +9876,21 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
                              (rect.right - 1, rect.centery), 2)
             pygame.draw.line(screen, blend_color(bullet["color"], UI_BG, .5),
                              rect.bottomleft, (rect.right - 1, rect.bottom - 1), 2)
+            draw_direction_chevrons(screen, rect, bullet.get("dx", 0),
+                                    bullet.get("dy", 0), UI_TEXT)
         elif bullet.get("laser_state") == "warning":
             draw_boss_laser_warning(screen, bullet, now)
         elif bullet.get("laser_state") == "active":
             rect = bullet["rect"]
-            if low_effects_mode():
+            if low_effects_mode() or not graphics_feature_enabled("glow"):
                 pygame.draw.rect(screen, bullet["color"], rect)
             elif bullet.get("boss_laser"):
                 remaining = max(0, bullet.get("remaining_frames", 0))
                 fade = min(1.0, remaining / 24.0)
-                pulse = (math.sin(now / 55.0) + 1.0) / 2.0
-                beam_surface = pygame.Surface(rect.size, pygame.SRCALPHA)
-                beam_surface.fill((*bullet["color"], round(150 * fade)))
-                screen.blit(beam_surface, rect.topleft)
+                pulse = ((math.sin(now / 55.0) + 1.0) / 2.0
+                         if graphics_feature_enabled("animations") else 0)
+                pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"],
+                                                    (.42 + .08 * pulse) * fade), rect)
                 core_width = max(6, round(rect.width * (0.18 + 0.025 * pulse)))
                 core_rect = pygame.Rect(rect.centerx - core_width // 2, rect.top,
                                         core_width, rect.height)
@@ -9019,10 +9902,10 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
                                  max(1, core_width // 4))
                 pygame.draw.rect(screen, bullet["color"], rect, 2, border_radius=8)
             else:
-                beam_surface = pygame.Surface(rect.size, pygame.SRCALPHA)
-                beam_surface.fill((*bullet["color"], 105))
-                screen.blit(beam_surface, rect.topleft)
+                pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"], .4), rect)
                 pygame.draw.rect(screen, bullet["color"], rect, 2)
+                pygame.draw.line(screen, blend_color(bullet["color"], UI_TEXT, .5),
+                                 rect.midtop, rect.midbottom, max(2, min(6, rect.width // 6)))
         elif bullet.get("heavy_orb"):
             # State-based fuse marks stay frozen during pause. Geometry avoids
             # allocating a glowing surface for every orb on every frame.
@@ -9031,7 +9914,8 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=()):
             total = max(1, bullet.get("orb_fuse_frames", HEAVY_ORB_FUSE_FRAMES))
             remaining = max(0, bullet.get("split_timer", total))
             elapsed = total - remaining
-            pulse = 0 if _POTATO_MODE else (1 + math.sin(elapsed * .24)) / 2
+            pulse = ((1 + math.sin(elapsed * .24)) / 2
+                     if graphics_feature_enabled("animations") else 0)
             color = blend_color(bullet["color"], UI_TEXT, .18 + .25 * pulse)
             pygame.draw.circle(screen, bullet["color"], center, radius)
             pygame.draw.circle(screen, color, center, radius + 3 + round(2 * pulse), 2)
@@ -9065,6 +9949,8 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
     else:
         ui_surface.fill((0, 0, 0, 0))
         draw_gameplay_ui_underlay(ui_surface, players, font, now, round_num, save_error)
+        if defer_native_ui:
+            draw_boss_status_layer(ui_surface, enemies, screen.get_size())
         if not defer_native_ui:
             composite_gameplay_ui(screen, ui_surface)
     # Tall fleets can have many rows waiting above the arena. Skip only ships
@@ -9090,50 +9976,8 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
                 2,
             )
 
-        # Render Boss Health Bar
-        if enemy.get("is_boss", False):
-            bar_w = enemy["rect"].width
-            bar_h = 6
-            bar_x = enemy["rect"].x
-            bar_y = enemy["rect"].y - 12
-            health_ratio = enemy["hp"] / enemy["max_hp"]
-
-            pygame.draw.rect(screen, (51, 23, 49), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
-            health_color = blend_color(UI_CORAL, UI_MINT, health_ratio)
-            pygame.draw.rect(screen, health_color,
-                             (bar_x, bar_y, max(0, int(bar_w * health_ratio)), bar_h), border_radius=3)
-            pygame.draw.rect(screen, UI_TEXT, (bar_x, bar_y, bar_w, bar_h), 1, border_radius=3)
-            if enemy.get("milestone_kind"):
-                stagger_remaining = enemy.get("stagger_remaining", 0)
-                if stagger_remaining > 0:
-                    stun_label = hud_font(18).render("CORE BROKEN — STUNNED", True, UI_MINT)
-                    stun_rect = stun_label.get_rect(midbottom=(bar_x + bar_w // 2, bar_y - 3))
-                    stun_rect.clamp_ip(screen.get_rect().inflate(-8, -8))
-                    screen.blit(stun_label, stun_rect)
-                else:
-                    break_y = bar_y + bar_h + 3
-                    break_h = 4
-                    pygame.draw.rect(screen, (39, 47, 63),
-                                     (bar_x, break_y, bar_w, break_h), border_radius=2)
-                    pygame.draw.rect(screen, UI_MINT,
-                                     (bar_x, break_y,
-                                      round(bar_w * milestone_stagger_ratio(enemy)), break_h),
-                                     border_radius=2)
-                    pygame.draw.rect(screen, UI_TEXT,
-                                     (bar_x, break_y, bar_w, break_h), 1, border_radius=2)
-                    break_label = pygame.font.SysFont(None, 15).render("BREAK CORE", True, UI_MINT)
-                    label_rect = break_label.get_rect(midbottom=(bar_x + bar_w // 2, break_y - 1))
-                    screen.blit(break_label, label_rect)
-            boss_phase = 3 if health_ratio <= 0.35 else 2 if health_ratio <= 0.65 else 1
-            phase_label = pygame.font.SysFont(None, 16).render(
-                f"PHASE {boss_phase}" if bar_w > 72 else f"P{boss_phase}",
-                True, UI_CORAL if boss_phase == 3 else UI_GOLD if boss_phase == 2 else UI_TEXT)
-            screen.blit(phase_label, phase_label.get_rect(midbottom=(bar_x + bar_w // 2, bar_y - 3)))
-            if enemy.get("boss_name"):
-                name = hud_font(22).render(enemy["boss_name"], True, enemy["color"])
-                name_rect = name.get_rect(midbottom=(enemy["rect"].centerx, bar_y - 20))
-                name_rect.clamp_ip(screen.get_rect().inflate(-8, -8))
-                screen.blit(name, name_rect)
+        if enemy.get("is_boss", False) and not (defer_native_ui and ui_surface is not None):
+            draw_boss_status(screen, enemy)
 
     # Projectiles and effects remain visible across the entire screen.
     player_colors = {player["number"]: player["color"] for player in players}
@@ -9197,6 +10041,7 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
         draw_animated_player(screen, player, now)
         if player["shield_until"] > now:
             draw_spawn_shield(screen, player["x"], player["y"], player["color"], now)
+        draw_player_stamina_bar(screen, player, now)
     # Native presentation adds threats above the native status layer, avoiding
     # a GUI-to-world-to-window round trip. Legacy direct draws keep their order.
     if not defer_native_ui:
@@ -9390,6 +10235,9 @@ def register_player_hit(player, player_rect, particles, lives_font, lives_messag
     player["nova_sweep_until"] = 0
     player["nova_sweep_previous_radius"] = 0
     player["nova_sweep_particle_added"] = False
+    player["nova_target_ids"] = None
+    player["nova_target_sweep_start"] = 0
+    player["nova_target_sweep_id"] = None
     if player["lives"] > 0:
         player["lives"] -= 1
         if player["lives"] > 0:
@@ -9930,6 +10778,7 @@ def grant_boss_clear_life(players):
             player["eliminated"] = False
             player["lives"] = 1
             reset_durability(player)
+            reset_player_stamina(player)
             player["respawn_until"] = 0
             player["shield_until"] = now + SPAWN_SHIELD_DURATION
             player["cooldown"] = 0
@@ -9953,6 +10802,7 @@ def revive_eliminated_teammates(players):
             player["eliminated"] = False
             player["lives"] = 1
             reset_durability(player)
+            reset_player_stamina(player)
             player["respawn_until"] = 0
             player["shield_until"] = now + SPAWN_SHIELD_DURATION
             player["cooldown"] = 0
@@ -10512,6 +11362,7 @@ def main():
     transition_started_at = pygame.time.get_ticks()
 
     settings_open = False
+    settings_page = "display"
     keyboard_controls_open = False
     settings_resume_after_close = False
     player_names_menu = None
@@ -10537,6 +11388,8 @@ def main():
                     player[key] = deadline + pause_duration
             if player.get("nova_sweep_until", 0):
                 player["nova_sweep_start"] += pause_duration
+                if player.get("nova_target_ids") is not None:
+                    player["nova_target_sweep_start"] += pause_duration
         for enemy in enemies:
             for key in ("cryo_slow_until", "next_fire_ms"):
                 if enemy.get(key, 0):
@@ -10725,21 +11578,37 @@ def main():
             if settings_open:
                 if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
                     close_display_settings()
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    settings_layout = display_settings_layout()
-                    if settings_layout["smaller"].collidepoint(event.pos):
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_TAB and new_press:
+                    direction = -1 if getattr(event, "mod", 0) & pygame.KMOD_SHIFT else 1
+                    settings_page = SETTINGS_PAGES[(SETTINGS_PAGES.index(settings_page) + direction) % len(SETTINGS_PAGES)]
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    settings_layout = display_settings_layout(settings_page)
+                    tab = next((key for key, rect in settings_layout["tabs"].items()
+                                if rect.collidepoint(event.pos)), None)
+                    option = next((key for key, rect in settings_layout["rows"].items()
+                                   if rect.collidepoint(event.pos)), None)
+                    if tab is not None:
+                        settings_page = tab
+                    elif option == "preset":
+                        current = display_manager.graphics_preset_name()
+                        index = GRAPHICS_PRESET_OPTIONS.index(current) if current in GRAPHICS_PRESET_OPTIONS else -1
+                        display_manager.apply_graphics_preset(GRAPHICS_PRESET_OPTIONS[(index + 1) % len(GRAPHICS_PRESET_OPTIONS)])
+                    elif option is not None:
+                        if not (display_manager.preferences["potato_mode"] and option in POTATO_LOCKED_SETTINGS):
+                            display_manager.cycle_graphics_setting(option)
+                    elif settings_page == "display" and settings_layout["smaller"].collidepoint(event.pos):
                         display_manager.adjust_gui_scale(-1)
-                    elif settings_layout["larger"].collidepoint(event.pos):
+                    elif settings_page == "display" and settings_layout["larger"].collidepoint(event.pos):
                         display_manager.adjust_gui_scale(1)
-                    elif settings_layout["auto"].collidepoint(event.pos):
+                    elif settings_page == "display" and settings_layout["auto"].collidepoint(event.pos):
                         display_manager.reset_gui_scale()
-                    elif settings_layout["mode"].collidepoint(event.pos):
+                    elif settings_page == "display" and settings_layout["mode"].collidepoint(event.pos):
                         display_manager.toggle_fullscreen()
-                    elif settings_layout["potato"].collidepoint(event.pos):
+                    elif settings_page == "display" and settings_layout["potato"].collidepoint(event.pos):
                         display_manager.toggle_potato_mode()
                         reset_animation_graphics(players, enemies, clear_caches=True)
                         keyboard.clear()
-                    elif settings_layout["fps"].collidepoint(event.pos):
+                    elif settings_page == "display" and settings_layout["fps"].collidepoint(event.pos):
                         display_manager.cycle_fps_mode()
                         keyboard.clear()
                     elif settings_layout["close"].collidepoint(event.pos):
@@ -11349,7 +12218,8 @@ def main():
             has_native_threats = bool(enemy_bullets) or any(
                 enemy.get("signature_warning") for enemy in enemies)
             if has_native_threats:
-                draw_hostile_projectiles(native_threats, enemy_bullets, threat_now, enemies=enemies)
+                draw_hostile_projectiles(native_threats, enemy_bullets, threat_now, enemies=enemies,
+                                         native_boss_ui=True)
 
             if transitioning and not paused:
                 draw_round_transition(screen, round_num, round_font, transition_timer)
@@ -11377,7 +12247,7 @@ def main():
                     draw_neon_button(ui_surface, controls["display_button_rect"], display_label, journal_font, UI_CYAN)
                 draw_ui_feedback(ui_surface)
                 if settings_open:
-                    draw_display_settings(ui_surface, display_manager, button_font, player_choice_font)
+                    draw_display_settings(ui_surface, display_manager, button_font, player_choice_font, settings_page)
                 if keyboard_controls_open:
                     keyboard_controls.draw(ui_surface, button_font, journal_font)
                 if life_share_menu is not None:
@@ -11392,7 +12262,7 @@ def main():
                                          "NAMES", journal_font, UI_MINT)
                 draw_ui_feedback(screen)
                 if settings_open:
-                    draw_display_settings(screen, display_manager, button_font, player_choice_font)
+                    draw_display_settings(screen, display_manager, button_font, player_choice_font, settings_page)
                 if keyboard_controls_open:
                     keyboard_controls.draw(screen, button_font, journal_font)
                 if player_names_menu is not None:
@@ -11410,7 +12280,8 @@ def main():
                                     ui_overlay=ui_surface,
                                     threat_surface=native_threats if has_native_threats else None,
                                     ui_overlay_bounds=foreground_bounds,
-                                    ui_underlay_bounds=gameplay_status_bounds(ui_surface.get_size(), players))
+                                    ui_underlay_bounds=gameplay_status_bounds(ui_surface.get_size(), players,
+                                                                            enemies, screen.get_size()))
         else:
             display_manager.present(screen, arena)
 
