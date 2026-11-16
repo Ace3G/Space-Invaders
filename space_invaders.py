@@ -20,7 +20,7 @@ import pygame
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
-GAME_BUILD_ID = "2026.11.16-stamina-ui"
+GAME_BUILD_ID = "2026.11.16-save-profiles"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
@@ -911,6 +911,10 @@ def gameplay_display_button_rect(pause_button, exit_button=None, paused=False):
     return button
 
 
+def settings_button_label(rect):
+    return "SETUP" if rect.width < 80 else "DISPLAY / KEYS"
+
+
 def gameplay_foreground_bounds(size, controls, lives_message=None):
     """Bound sparse controls/feedback without scanning an entire alpha canvas."""
     bounds = pygame.Rect(controls["pause_button_rect"]).union(controls["display_button_rect"])
@@ -1024,7 +1028,7 @@ def draw_display_settings(screen, manager, font, small_font, page="display"):
     layout = display_settings_layout(page)
     panel = layout["panel"]
     draw_neon_panel(screen, panel, UI_CYAN)
-    draw_fitted_text(screen, "DISPLAY & CUSTOMIZATION", font, ui_theme_color(UI_CYAN),
+    draw_fitted_text(screen, "DISPLAY & KEYBOARD", font, ui_theme_color(UI_CYAN),
                      pygame.Rect(panel.x + 12, panel.y + 8, panel.width - 24, 27))
     for key, rect in layout["tabs"].items():
         draw_neon_button(screen, rect, key.upper(), small_font, UI_CYAN,
@@ -1290,7 +1294,6 @@ DEFAULT_PLAYER_CONTROLS = PLAYER_CONTROLS
 PLAYER_AUTOFIRE = (False, False, False, False)
 PLAYER_NAMES = ("", "", "", "")
 PLAYER_NAME_MAX_LENGTH = 16
-_PLAYER_NAME_PROFILE_CONFIGURED = False
 FIRE_INPUT_BUFFER_MS = 150
 EMERGENCY_WARP_SHIELD_MS = 1500
 CRYO_SLOW_MS = 2000
@@ -1315,6 +1318,7 @@ class HeldInput:
         self.pressed = set()
         self.fire_deadlines = {}
         self.focused = True
+        self.toggle_firing = False
 
     def begin_frame(self, now=None):
         self.pressed.clear()
@@ -1355,6 +1359,10 @@ class HeldInput:
         return self.focused and (key in self.held or key in self.pressed)
 
     def fire_requested(self, shoot_keys, now):
+        if self.toggle_firing:
+            return self.focused and any(
+                PLAYER_AUTOFIRE[index] and any(key in row[4] for key in shoot_keys)
+                for index, row in enumerate(PLAYER_CONTROLS))
         return self.focused and any(key in self.held
             or self.fire_deadlines.get(key, -1) >= now for key in shoot_keys)
 
@@ -1400,16 +1408,26 @@ def life_share_keys():
 
 
 def sprint_keys():
-    """Keep a nearby hold key for each pilot, including older custom mappings."""
-    preferred = (pygame.K_e, pygame.K_DELETE, pygame.K_p, pygame.K_KP3)
+    """Keep sprint on a free thumb/pinky key without changing any fire aliases."""
+    preferred = (pygame.K_LCTRL, pygame.K_RALT, pygame.K_m, pygame.K_KP1)
     nearby = (
-        (pygame.K_r, pygame.K_f, pygame.K_c, pygame.K_z, pygame.K_x, pygame.K_TAB),
-        (pygame.K_HOME, pygame.K_PAGEDOWN, pygame.K_PAGEUP, pygame.K_BACKSPACE),
-        (pygame.K_y, pygame.K_n, pygame.K_m, pygame.K_COMMA, pygame.K_PERIOD),
-        (pygame.K_KP1, pygame.K_KP2, pygame.K_KP_PERIOD, pygame.K_KP_DIVIDE,
+        (pygame.K_LCTRL, pygame.K_LSHIFT, pygame.K_z, pygame.K_x, pygame.K_c,
+         pygame.K_v, pygame.K_BACKQUOTE),
+        (pygame.K_RCTRL, pygame.K_RSHIFT, pygame.K_DELETE, pygame.K_PAGEDOWN,
+         pygame.K_HOME, pygame.K_PAGEUP, pygame.K_BACKSPACE, pygame.K_SLASH),
+        (pygame.K_n, pygame.K_COMMA, pygame.K_PERIOD, pygame.K_SLASH,
+         pygame.K_QUOTE, pygame.K_SEMICOLON),
+        (pygame.K_KP0, pygame.K_KP_PERIOD, pygame.K_KP2, pygame.K_KP3, pygame.K_KP_DIVIDE,
          pygame.K_KP_MULTIPLY, pygame.K_KP_MINUS, pygame.K_KP_PLUS),
     )
-    fallback = (*range(pygame.K_a, pygame.K_z + 1),
+    fallback = (pygame.K_LALT, pygame.K_LCTRL, pygame.K_RALT, pygame.K_RCTRL,
+                pygame.K_CAPSLOCK, pygame.K_TAB, pygame.K_BACKQUOTE,
+                pygame.K_KP0, pygame.K_KP1, pygame.K_KP2, pygame.K_KP3,
+                pygame.K_KP4, pygame.K_KP5, pygame.K_KP6, pygame.K_KP7,
+                pygame.K_KP8, pygame.K_KP9, pygame.K_KP_PERIOD,
+                pygame.K_KP_DIVIDE, pygame.K_KP_MULTIPLY, pygame.K_KP_MINUS,
+                pygame.K_KP_PLUS, pygame.K_KP_ENTER,
+                *range(pygame.K_a, pygame.K_z + 1),
                 pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5,
                 pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9, pygame.K_0,
                 pygame.K_F1, pygame.K_F2, pygame.K_F3, pygame.K_F4, pygame.K_F5,
@@ -1420,10 +1438,14 @@ def sprint_keys():
     used = {key for row in PLAYER_CONTROLS for key in (*row[:4], *row[4])}
     used.update(life_share_keys())
     used.update(KEYBOARD_RESERVED_KEYS)
+    used.update((pygame.K_LALT, pygame.K_TAB, pygame.K_CAPSLOCK, pygame.K_F4))
     chosen = []
     for index, key in enumerate(preferred):
+        # A remap for one pilot should not displace another pilot's preferred
+        # sprint key when a fallback elsewhere is available.
+        protected = set(preferred) - {key}
         available = next(candidate for candidate in (key, *nearby[index], *fallback, *preferred)
-                         if candidate not in used)
+                         if candidate not in used and candidate not in protected)
         chosen.append(available)
         used.add(available)
     return tuple(chosen)
@@ -1462,17 +1484,17 @@ def player_display_name(player_or_number):
 
 
 def restored_player_name(pilot, number):
-    """Local profiles win; a portable save supplies names on a new computer."""
-    return (PLAYER_NAMES[number - 1] if _PLAYER_NAME_PROFILE_CONFIGURED
-            else clean_player_name(pilot.get("name", "")))
+    """A saved pilot's name belongs to that run, independent of menu drafts."""
+    return clean_player_name(pilot.get("name", ""))
 
 
 def restore_portable_player_names(pilots):
-    """Keep numeric labels in the keyboard editor consistent with a continued run."""
+    """Keep the editor and UI consistent with the explicitly restored pilots."""
     global PLAYER_NAMES
-    if not _PLAYER_NAME_PROFILE_CONFIGURED:
-        PLAYER_NAMES = tuple(clean_player_name(pilot.get("name", "")) for pilot in pilots)
-        PLAYER_NAMES += ("",) * (4 - len(PLAYER_NAMES))
+    names = list(PLAYER_NAMES)
+    for index, pilot in enumerate(pilots[:4]):
+        names[index] = clean_player_name(pilot.get("name", ""))
+    PLAYER_NAMES = tuple(names)
 
 
 def saved_player_display_name(pilot, number):
@@ -1485,21 +1507,9 @@ def apply_names_to_players(players):
 
 
 def load_player_names(filename=None):
-    """Names are a separate, optional profile; old saves need no migration."""
-    global PLAYER_NAMES, _PLAYER_NAME_PROFILE_CONFIGURED
+    """Start with defaults; legacy machine-wide name files are left untouched."""
+    global PLAYER_NAMES
     PLAYER_NAMES = ("", "", "", "")
-    _PLAYER_NAME_PROFILE_CONFIGURED = False
-    filename = player_names_path() if filename is None else Path(filename)
-    try:
-        if filename.exists() and filename.stat().st_size <= 8192:
-            data = json.loads(filename.read_text(encoding="utf-8"))
-            names = data.get("names") if isinstance(data, dict) else None
-            if (isinstance(names, list) and len(names) == 4
-                    and all(valid_saved_player_name({"name": name}) for name in names)):
-                PLAYER_NAMES = tuple(clean_player_name(name) for name in names)
-                _PLAYER_NAME_PROFILE_CONFIGURED = True
-    except (OSError, ValueError, TypeError, RecursionError):
-        pass
     return PLAYER_NAMES
 
 
@@ -1530,7 +1540,7 @@ def player_names_menu_layout():
 
 
 class PlayerNameMenu:
-    """Edit all four profiles without feeding text keys into flight controls."""
+    """Edit the next run's names without writing a machine-wide profile."""
 
     def __init__(self, filename=None):
         self.filename = player_names_path() if filename is None else Path(filename)
@@ -1538,18 +1548,14 @@ class PlayerNameMenu:
         self.selected = 0
         self.select_all = True
         self.accepted = False
-        self.status = "Blank names use Player 1-4. Tab changes pilot. Enter saves; Esc cancels."
+        self.status = "Names stay with this run's save. Tab changes pilot. Enter applies; Esc cancels."
         pygame.key.start_text_input()
 
     def _finish(self, accept):
-        global PLAYER_NAMES, _PLAYER_NAME_PROFILE_CONFIGURED
+        global PLAYER_NAMES
         if accept:
             names = tuple(clean_player_name(name) for name in self.names)
-            if not save_display_preferences({"names": list(names)}, self.filename):
-                self.status = "Names could not be saved. Check folder permissions or press Esc to cancel."
-                return False
             PLAYER_NAMES = names
-            _PLAYER_NAME_PROFILE_CONFIGURED = True
             self.accepted = True
         pygame.key.stop_text_input()
         return True
@@ -1620,7 +1626,7 @@ class PlayerNameMenu:
                     pygame.draw.line(screen, color, (field.x, field.bottom), (field.right, field.bottom))
             draw_fitted_text(screen, self.status, small_font, UI_MUTED, layout["help"])
             draw_neon_button(screen, layout["cancel"], "CANCEL", small_font, UI_CORAL)
-            draw_neon_button(screen, layout["done"], "SAVE NAMES", small_font, UI_MINT)
+            draw_neon_button(screen, layout["done"], "APPLY NAMES", small_font, UI_MINT)
 
 
 def default_keyboard_preferences():
@@ -1654,14 +1660,7 @@ def validate_keyboard_preferences(data):
 
 
 def load_keyboard_preferences(filename=None):
-    filename = keyboard_preferences_path() if filename is None else Path(filename)
-    try:
-        if filename.exists() and filename.stat().st_size <= 8192:
-            validated = validate_keyboard_preferences(json.loads(filename.read_text(encoding="utf-8")))
-            if validated is not None:
-                return validated
-    except (OSError, ValueError, TypeError, RecursionError):
-        pass
+    """Legacy settings files no longer change controls when the game opens."""
     return default_keyboard_preferences()
 
 
@@ -1669,6 +1668,41 @@ def apply_keyboard_preferences(preferences):
     global PLAYER_CONTROLS, PLAYER_AUTOFIRE
     PLAYER_CONTROLS = tuple((*row[:4], tuple(row[4])) for row in preferences["bindings"])
     PLAYER_AUTOFIRE = tuple(preferences["auto_fire"])
+
+
+def current_keyboard_preferences():
+    """Snapshot editable lists without sharing them with any cached save."""
+    return {"bindings": [[*row[:4], list(row[4])] for row in PLAYER_CONTROLS],
+            "auto_fire": list(PLAYER_AUTOFIRE)}
+
+
+def reset_run_profile():
+    """Return to an unselected/default run without touching stored saves."""
+    load_player_names()
+    apply_keyboard_preferences(default_keyboard_preferences())
+
+
+def toggle_player_fire(key, players):
+    """One physical press starts/stops this pilot's continuous fire."""
+    for player in players:
+        index = player["number"] - 1
+        if (key in PLAYER_CONTROLS[index][4] and not player["eliminated"]
+                and player["respawn_until"] == 0):
+            preferences = current_keyboard_preferences()
+            preferences["auto_fire"][index] = not preferences["auto_fire"][index]
+            apply_keyboard_preferences(preferences)
+            return True
+    return False
+
+
+def restore_run_profile(snapshot):
+    """Only playing a selected save activates its names and keyboard layout."""
+    global PLAYER_NAMES
+    names = snapshot.get("player_names", ["", "", "", ""])
+    PLAYER_NAMES = tuple(clean_player_name(name) for name in names)
+    restore_portable_player_names(snapshot["pilots"])
+    preferences = validate_keyboard_preferences(snapshot.get("keyboard"))
+    apply_keyboard_preferences(preferences or default_keyboard_preferences())
 
 
 def control_key_label(key):
@@ -1679,12 +1713,21 @@ def control_key_label(key):
     return names.get(key, pygame.key.name(key).upper().replace("[", "NUM ").replace("]", ""))
 
 
+def hud_control_key_label(key):
+    """Short modifier/numpad labels keep all four pilot docks compact."""
+    return {pygame.K_LCTRL: "CTRL", pygame.K_RCTRL: "RCTRL",
+            pygame.K_LALT: "ALT", pygame.K_RALT: "RALT",
+            pygame.K_LSHIFT: "SHIFT", pygame.K_RSHIFT: "RSHIFT",
+            pygame.K_DELETE: "DEL", pygame.K_KP1: "N1", pygame.K_KP2: "N2",
+            pygame.K_KP3: "N3", pygame.K_KP0: "N0",
+            pygame.K_KP_PERIOD: "N."}.get(key, control_key_label(key))
+
+
 def player_control_labels(index):
     left, right, up, down, fire = PLAYER_CONTROLS[index]
     movement = " / ".join(control_key_label(key) for key in (up, left, down, right))
     firing = " / ".join(control_key_label(key) for key in fire)
-    if PLAYER_AUTOFIRE[index]:
-        firing = "AUTO FIRE ON"
+    firing += " (TOGGLE)" + (" / ON" if PLAYER_AUTOFIRE[index] else " / OFF")
     firing += f"  /  HOLD {control_key_label(sprint_keys()[index])} SPRINT"
     return movement, firing
 
@@ -1714,7 +1757,7 @@ class KeyboardControls:
 
     def __init__(self, settings_file=None):
         self.settings_file = keyboard_preferences_path() if settings_file is None else Path(settings_file)
-        self.preferences = load_keyboard_preferences(self.settings_file)
+        self.preferences = current_keyboard_preferences()
         self.player = 0
         self.waiting_action = None
         self.held = set()
@@ -1722,16 +1765,14 @@ class KeyboardControls:
         apply_keyboard_preferences(self.preferences)
 
     def begin(self):
+        self.preferences = current_keyboard_preferences()
         self.held.clear()
         self.waiting_action = None
         self.status = "Click an action, then press a key. Escape cancels a change."
 
     def _save(self):
         apply_keyboard_preferences(self.preferences)
-        # The shared atomic JSON writer does not touch any run-save files.
-        if not save_display_preferences(self.preferences, self.settings_file):
-            self.status = "Controls apply now; the settings file could not be saved."
-            return False
+        # The main loop persists successful edits to the selected run only.
         return True
 
     def bind(self, action, key):
@@ -1789,7 +1830,7 @@ class KeyboardControls:
             if layout["auto_fire"].collidepoint(event.pos):
                 self.waiting_action = None
                 self.preferences["auto_fire"][self.player] = not self.preferences["auto_fire"][self.player]
-                self.status = "Auto-fire reduces the number of keys held during a fight."
+                self.status = "Firing toggled. The shoot key starts/stops firing during gameplay."
                 self._save()
             elif layout["reset"].collidepoint(event.pos):
                 self.preferences = default_keyboard_preferences()
@@ -1825,7 +1866,7 @@ class KeyboardControls:
             draw_neon_button(screen, rect, f"{KEYBOARD_ACTIONS[action]}: {label}", small_font, color,
                              selected=self.waiting_action == action)
         auto = "ON" if self.preferences["auto_fire"][self.player] else "OFF"
-        draw_neon_button(screen, layout["auto_fire"], f"AUTO-FIRE: {auto}", small_font, UI_MINT)
+        draw_neon_button(screen, layout["auto_fire"], f"FIRING: {auto}", small_font, UI_MINT)
         draw_neon_button(screen, layout["reset"], "RESTORE ALL DEFAULTS", small_font, UI_GOLD)
         draw_neon_button(screen, layout["done"], "DONE", small_font, UI_CYAN)
         share_key = control_key_label(life_share_keys()[self.player])
@@ -2386,7 +2427,7 @@ POWERUP_JOURNAL = (
     ("rapid_fire", f"Normal shots and bombs fire about {RAPID_FIRE_MULTIPLIERS[0]:g}x faster solo, up to {RAPID_FIRE_MULTIPLIERS[-1]:g}x with four pilots; laser pulses are {(RAPID_FIRE_LASER_MULTIPLIER - 1):.0%} faster. Extra fire-rate bonuses add."),
     ("speed", "Boosts movement in every direction. Stacks with Bullet Time Momentum."),
     ("triple_shot", "Fires three parallel shots or piercing laser lanes. Bomb blasts do not stack on one foe; each laser pulse hits each boss once."),
-    ("laser", "Hold fire for an upward piercing beam: 3 base damage per pulse. Triple Shot widens coverage; each boss takes one hit per pulse. Overrides bombs."),
+    ("laser", "Toggle fire on for an upward piercing beam: 3 base damage per pulse. Triple Shot widens coverage; each boss takes one hit per pulse. Overrides bombs."),
     ("magnet", "Pulls dropped powerups toward your ship from anywhere on the screen."),
     ("bomb", f"Blasts one-shot unshielded regular foes within {BOMB_BLAST_RADIUS} pixels; bosses take 3 base damage. Shields block a hit. Triple-shot blasts hit each foe once."),
     ("bullet_time", f"A {BULLET_TIME_RADIUS}-pixel field keeps ordinary shots at {BULLET_TIME_SLOWDOWN:.0%} speed; lasers and gates are unaffected. Each slowed shot grants Momentum, max {BULLET_TIME_MAX_STACKS}. Buff expiry or life loss clears stacks."),
@@ -7934,8 +7975,6 @@ def draw_start_screen(
                                   player_count, save_error, saved_slots)
         return
     cx = SCREEN_WIDTH // 2
-    micro_title = player_choice_font.render("NEON FRONTIER  /  PLANETARY DEFENSE", True, UI_PINK)
-    screen.blit(micro_title, micro_title.get_rect(center=(cx, int(SCREEN_HEIGHT * 0.052))))
     draw_neon_title(screen, "SPACE INVADERS", title_font, (cx, int(SCREEN_HEIGHT * 0.13)), UI_CYAN)
     tagline = player_choice_font.render(f"{MAX_CAMPAIGN_ROUND} WAVES. ONE PLANET. YOUR SQUAD.", True, UI_GOLD)
     screen.blit(tagline, tagline.get_rect(center=(cx, int(SCREEN_HEIGHT * 0.205))))
@@ -9159,6 +9198,7 @@ def draw_scoreboard(screen, players, font, now=None, background_only=False, fore
         now = pygame.time.get_ticks()
     compact = SCREEN_WIDTH < 1000 or SCREEN_HEIGHT < 600
     share_keys = life_share_keys()
+    sprint_bindings = sprint_keys()
     for player in players:
         upgraded = player.get("durability_bonus", 0) > 0
         panel = scoreboard_layout(player["number"], upgraded)
@@ -9193,11 +9233,22 @@ def draw_scoreboard(screen, players, font, now=None, background_only=False, fore
         lives_cell = pygame.Rect(panel.x + inset, lives_y, 76 if compact else 84, text_height)
         draw_hud_label(screen, label_font, f"LIVES {player['lives']}/{player_life_capacity(player)}",
                        player["color"], lives_cell, max_height=text_height)
-        damage_cell = pygame.Rect(lives_cell.right + 5, lives_y, 57 if compact else 63, text_height)
+        damage_cell = pygame.Rect(panel.x + inset,
+                                  panel.y + gameplay_hud_slot_layout(player["number"])["score_height"] - 11,
+                                  panel.width // 2 - inset - 4, 9)
         draw_hud_label(screen, label_font, f"DMG +{player.get('damage_bonus', 0)}", UI_GOLD,
-                       damage_cell, max_height=text_height)
-        status_cell = pygame.Rect(damage_cell.right + 4, lives_y,
-                                  panel.right - inset - damage_cell.right - 4, text_height)
+                       damage_cell, max_height=9)
+        remaining_width = panel.right - inset - lives_cell.right - 8
+        status_cell = pygame.Rect(lives_cell.right + 4, lives_y,
+                                  remaining_width // 2, text_height)
+        sprint_cell = pygame.Rect(status_cell.right + 4, lives_y,
+                                  panel.right - inset - status_cell.right - 4, text_height)
+        if player["eliminated"] or player["respawn_until"] > now:
+            status_cell.width = panel.right - inset - status_cell.left
+        else:
+            draw_hud_label(screen, label_font,
+                           f"SPR {hud_control_key_label(sprint_bindings[player['number'] - 1])}",
+                           UI_MINT, sprint_cell, align="right", max_height=text_height)
         if status_text:
             draw_hud_label(screen, label_font, status_text, status_color, status_cell,
                            align="right", max_height=text_height)
@@ -10894,6 +10945,8 @@ def build_saved_run(round_num, players, checkpoint, infinite_mode=False, now=Non
         pilots.append(pilot)
     return {
         "version": SAVE_FORMAT_VERSION,
+        "keyboard": current_keyboard_preferences(),
+        "player_names": current_run_names(players),
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "wave": int(round_num),
         "player_count": len(players),
@@ -10943,6 +10996,33 @@ def save_slot_path(slot):
     return SAVE_FILE.parent / f"save_slot_{slot}.json"
 
 
+def current_run_names(players):
+    """Include inactive names while live pilot names stay authoritative."""
+    names = list(PLAYER_NAMES)
+    for player in players:
+        names[player["number"] - 1] = clean_player_name(player.get("name", ""))
+    return names
+
+
+def save_run_profile(previous_save, players, *, slot):
+    """Update names/controls without banking any mid-wave combat progress."""
+    warning = "CONTROLS APPLY NOW - SAVE FAILED; previous saved profile kept."
+    if (previous_save is None or previous_save.get("slot", slot) != slot
+            or previous_save.get("player_count") != len(players)):
+        return previous_save, warning
+    snapshot = deepcopy(previous_save)
+    snapshot["keyboard"] = current_keyboard_preferences()
+    snapshot["player_names"] = current_run_names(players)
+    for index, player in enumerate(players):
+        name = clean_player_name(player.get("name", ""))
+        snapshot["pilots"][index]["name"] = name
+        snapshot["checkpoint"]["pilots"][index]["name"] = name
+    snapshot["saved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if write_saved_run(snapshot, save_slot_path(slot)):
+        return snapshot, None
+    return previous_save, warning
+
+
 def save_life_transfer(previous_save, players, donor_number, recipient_number, *,
                        slot, round_num, revived=False):
     """Persist the gift without banking mid-wave score, upgrades or other buffs.
@@ -10958,6 +11038,8 @@ def save_life_transfer(previous_save, players, donor_number, recipient_number, *
                 or previous_save.get("slot", slot) != slot):
             return previous_save, warning
         snapshot = deepcopy(previous_save)
+        snapshot["keyboard"] = current_keyboard_preferences()
+        snapshot["player_names"] = current_run_names(players)
         for number in (donor_number, recipient_number):
             player = next(player for player in players if player["number"] == number)
             saved = snapshot["pilots"][number - 1]
@@ -11074,6 +11156,12 @@ def load_saved_run(filename=SAVE_FILE):
         data = json.loads(filename.read_text(encoding="utf-8"))
         if (not isinstance(data, dict) or type(data.get("version")) is not int
                 or data["version"] != SAVE_FORMAT_VERSION):
+            return None
+        if "keyboard" in data and validate_keyboard_preferences(data["keyboard"]) is None:
+            return None
+        if "player_names" in data and (
+                not isinstance(data["player_names"], list) or len(data["player_names"]) != 4
+                or any(not valid_saved_player_name({"name": name}) for name in data["player_names"])):
             return None
         if "slot" in data and (type(data["slot"]) is not int
                                or not 1 <= data["slot"] <= SAVE_SLOT_COUNT):
@@ -11248,7 +11336,7 @@ def delete_saved_slot(slot):
 
 def restore_saved_run(snapshot, player_sprites):
     """Continue with saved pilots/buffs at the start of the recorded wave."""
-    restore_portable_player_names(snapshot["pilots"])
+    restore_run_profile(snapshot)
     players = create_player_states(snapshot["player_count"], player_sprites)
     now = pygame.time.get_ticks()
     for player, pilot in zip(players, snapshot["pilots"]):
@@ -11318,7 +11406,7 @@ def main():
 
     round_num = STARTING_ROUND
     player_count = 1
-    load_player_names()
+    reset_run_profile()
     display_manager.activate(False)
     spawn_controls = menu_control_layout()
     spawn_controls["display_button_rect"] = gameplay_display_button_rect(spawn_controls["pause_button_rect"])
@@ -11343,6 +11431,7 @@ def main():
     simulation_accumulator = 0.0
     simulation_step_ms = 1000.0 / 60.0
     keyboard = HeldInput()
+    keyboard.toggle_firing = True
     keyboard_controls = KeyboardControls()
     game_started = False
     enemy_journal_open = False
@@ -11439,7 +11528,7 @@ def main():
     def close_life_share_menu():
         nonlocal life_share_menu, life_share_resume_after_close, simulation_accumulator
         life_share_menu = None
-        blocked_game_keys.update(physical_keys_down)
+        blocked_game_keys.update(physical_keys_down - KEYBOARD_RESERVED_KEYS)
         keyboard.clear()
         simulation_accumulator = 0.0
         if life_share_resume_after_close:
@@ -11450,6 +11539,7 @@ def main():
         nonlocal settings_open, keyboard_controls_open, settings_resume_after_close
         settings_open = False
         keyboard_controls_open = False
+        blocked_game_keys.update(physical_keys_down - KEYBOARD_RESERVED_KEYS)
         keyboard.clear()
         if settings_resume_after_close:
             set_game_paused(False)
@@ -11465,6 +11555,22 @@ def main():
         keyboard.clear()
         if settings_resume_after_close:
             set_game_paused(True)
+
+    def persist_current_profile():
+        nonlocal saved_run, save_error
+        if game_started and active_slot is not None:
+            saved_run, save_error = save_run_profile(saved_run, players, slot=active_slot)
+            saved_slots[active_slot - 1] = saved_run
+
+    def reset_menu_profile():
+        nonlocal active_slot, saved_run
+        reset_run_profile()
+        apply_names_to_players(players)
+        active_slot = None
+        saved_run = None
+        keyboard_controls.begin()
+        blocked_game_keys.update(physical_keys_down - KEYBOARD_RESERVED_KEYS)
+        keyboard.clear()
 
     running = True
 
@@ -11519,7 +11625,11 @@ def main():
                 physical_keys_down.discard(event.key)
                 blocked_game_keys.discard(event.key)
             if keyboard_controls_open:
-                if keyboard_controls.process_event(event):
+                before_controls = current_keyboard_preferences()
+                editor_closed = keyboard_controls.process_event(event)
+                if current_keyboard_preferences() != before_controls:
+                    persist_current_profile()
+                if editor_closed:
                     close_display_settings()
                 keyboard.clear()
                 continue
@@ -11550,7 +11660,7 @@ def main():
                     if player_names_menu.accepted:
                         apply_names_to_players(players)
                     player_names_menu = None
-                    blocked_game_keys.update(physical_keys_down)
+                    blocked_game_keys.update(physical_keys_down - KEYBOARD_RESERVED_KEYS)
                 keyboard.clear()
                 continue
             if life_share_menu is not None:
@@ -11644,6 +11754,11 @@ def main():
                     register_ui_click(event.pos, UI_GOLD)
                     continue
             keyboard.process_event(event)
+            if (arena and not paused and new_press
+                    and event.type == pygame.KEYDOWN
+                    and toggle_player_fire(event.key, players)):
+                persist_current_profile()
+                continue
             if (arena and not transitioning and event.type == pygame.KEYDOWN
                     and event.key in life_share_keys()):
                 if new_press and keyboard.focused:
@@ -11864,6 +11979,7 @@ def main():
                             transition_timer = TRANSITION_DURATION
                             transition_started_at = pygame.time.get_ticks()
                     elif cutscene_finished and controls["play_again_rect"].collidepoint(event.pos):
+                        reset_menu_profile()
                         game_started = False
                         game_over = False
                         infinite_mode = False
@@ -11916,6 +12032,7 @@ def main():
                         transition_timer = TRANSITION_DURATION
                         transition_started_at = pygame.time.get_ticks()
                     elif cutscene_finished and controls["play_again_rect"].collidepoint(event.pos):
+                        reset_menu_profile()
                         campaign_complete = False
                         victory_started_at = None
                         infinite_mode = False
@@ -11938,6 +12055,7 @@ def main():
                     elif paused and controls["main_menu_button_rect"].collidepoint(event.pos):
                         keyboard.discard_taps()
                         set_game_paused(False)
+                        reset_menu_profile()
                         game_started = False
                         game_over = False
                         campaign_complete = False
@@ -11947,6 +12065,7 @@ def main():
                         pending_save_action = None
                         saved_slots = list_saved_runs()
                     elif paused and controls["exit_button_rect"].collidepoint(event.pos):
+                        reset_menu_profile()
                         keyboard.discard_taps()
                         paused = False
                         paused_at = None
@@ -11984,6 +12103,7 @@ def main():
                     save_error = None
                     retries_remaining = saved_run.get("retries_remaining", MAX_RUN_RETRIES)
                     round_num, players, checkpoint, infinite_mode = restore_saved_run(saved_run, player_sprites)
+                    keyboard_controls.begin()
                     player_count = len(players)
                 enemies, bunkers, enemy_bullets, player_bullets, particles, powerups, enemy_dx = reset_game_state(
                     round_num, infinite_mode=infinite_mode)
@@ -12007,7 +12127,8 @@ def main():
                 transitioning = True
                 transition_timer = TRANSITION_DURATION
                 transition_started_at = pygame.time.get_ticks()
-                keyboard.discard_taps()
+                blocked_game_keys.update(physical_keys_down - KEYBOARD_RESERVED_KEYS)
+                keyboard.clear()
 
         arena, ui_surface, controls = activate_frame_ui()
         screen = display_manager.world_surface if arena else ui_surface
@@ -12243,7 +12364,7 @@ def main():
                 if not paused:
                     lives_message = draw_lives_text(ui_surface, lives_message)
                 if pending_save_action is None and pending_replace_slot is None:
-                    display_label = "GUI" if controls["display_button_rect"].width < 80 else "DISPLAY"
+                    display_label = settings_button_label(controls["display_button_rect"])
                     draw_neon_button(ui_surface, controls["display_button_rect"], display_label, journal_font, UI_CYAN)
                 draw_ui_feedback(ui_surface)
                 if settings_open:
@@ -12255,7 +12376,7 @@ def main():
         else:
             with ui_dimensions(screen.get_size()):
                 if pending_save_action is None and pending_replace_slot is None:
-                    display_label = "GUI" if controls["display_button_rect"].width < 80 else "DISPLAY"
+                    display_label = settings_button_label(controls["display_button_rect"])
                     draw_neon_button(screen, controls["display_button_rect"], display_label, journal_font, UI_CYAN)
                     if not game_started and not save_browser_open and not enemy_journal_open:
                         draw_neon_button(screen, player_names_button_rect(controls["display_button_rect"]),
