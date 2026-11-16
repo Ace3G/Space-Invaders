@@ -20,7 +20,7 @@ import pygame
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
-GAME_BUILD_ID = "2026.11.16-save-profiles"
+GAME_BUILD_ID = "2026.11.16-compact-boss-pause"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
@@ -946,10 +946,10 @@ def gameplay_status_bounds(size, players, enemies=(), world_size=None):
                 panel = boss_status_layout(projected, pygame.Rect((0, 0), size))["panel"]
                 height = max(height, panel.bottom + 4)
                 if enemy.get("signature_warning"):
-                    caption_top = max(110, projected["rect"].bottom + 24)
+                    caption_top = max(108, projected["rect"].bottom + 8)
                     if panel.top >= projected["rect"].bottom:
-                        caption_top = max(caption_top, panel.bottom + 12)
-                    height = max(height, caption_top + 28)
+                        caption_top = max(caption_top, panel.bottom + 4)
+                    height = max(height, caption_top + 20)
     return pygame.Rect(0, 0, size[0], min(size[1], height))
 
 
@@ -5419,14 +5419,18 @@ def draw_milestone_warning_caption(screen, enemy, color=None):
     color = enemy["color"] if color is None else color
     warning_label = warning["name"]
     if warning["beams"] or warning.get("walls"):
-        warning_label += " / PIERCES DURABILITY"
-    label = cached_ui_text(hud_font(22), warning_label, color,
-                           max_width=max(1, screen.get_width() - 32), max_height=24)
-    label_y = max(110, enemy["rect"].bottom + 24)
+        warning_label += " / PIERCES DUR"
+    caption_width = max(1, min(260, screen.get_width() - 32))
+    if screen.get_width() < 900 and enemy.get("is_boss"):
+        caption_width = min(caption_width,
+                            boss_status_layout(enemy, screen.get_rect())["panel"].width - 12)
+    label = cached_ui_text(hud_font(16), warning_label, color,
+                           max_width=caption_width, max_height=12)
+    label_y = max(108, enemy["rect"].bottom + 8)
     if enemy.get("is_boss"):
         status = boss_status_layout(enemy, screen.get_rect())["panel"]
         if status.top >= enemy["rect"].bottom:
-            label_y = max(label_y, status.bottom + 12)
+            label_y = max(label_y, status.bottom + 4)
     label_rect = label.get_rect(midtop=(screen.get_width() // 2, label_y))
     label_rect.clamp_ip(screen.get_rect().inflate(-16, -16))
     pygame.draw.rect(screen, UI_BG, label_rect.inflate(12, 8), border_radius=4)
@@ -7426,8 +7430,19 @@ def draw_main_menu_button(screen, main_menu_button_rect, font):
 
 
 def draw_pause_button(screen, pause_button_rect, font, paused):
-    label = "RESUME" if paused else "PAUSE"
-    draw_neon_button(screen, pause_button_rect, label, font, UI_MINT if paused else UI_CYAN)
+    title = "RESUME" if paused else "PAUSE"
+    accent = UI_MINT if paused else UI_CYAN
+    if pause_button_rect.width >= 88:
+        draw_neon_button(screen, pause_button_rect, f"{title} (ESC)", font, accent)
+        return
+    # Keep the original narrow center lane free around the bunker homes.
+    draw_neon_button(screen, pause_button_rect, "", font, accent)
+    title_cell = pygame.Rect(pause_button_rect.x + 4, pause_button_rect.y + 3,
+                             pause_button_rect.width - 8, 12)
+    hint_cell = pygame.Rect(pause_button_rect.x + 4, pause_button_rect.y + 17,
+                            pause_button_rect.width - 8, 8)
+    draw_hud_label(screen, hud_font(17), title, UI_TEXT, title_cell, align="center")
+    draw_hud_label(screen, hud_font(12), "(ESC)", UI_MUTED, hint_cell, align="center")
 
 
 @ui_scene
@@ -7438,14 +7453,14 @@ def draw_pause_overlay(screen, font, save_error=None):
     panel = pygame.Rect(0, 0, min(560, SCREEN_WIDTH - 40), 172)
     panel.center = (SCREEN_WIDTH // 2, max(panel.height // 2 + 12, SCREEN_HEIGHT // 2 - 32))
     draw_neon_panel(screen, panel, UI_VIOLET)
-    draw_neon_title(screen, "PAUSED", font, (panel.centerx, panel.y + 46), UI_CYAN)
+    draw_neon_title(screen, "PAUSED (ESC)", font, (panel.centerx, panel.y + 46), UI_CYAN)
     note_font = pygame.font.SysFont(None, 24)
     draw_fitted_text(screen, "Autosave failed. Progress may not be saved." if save_error
                      else "Auto-saved at wave start. CONTINUE restarts the wave.",
                      note_font, UI_CORAL if save_error else UI_MUTED,
                      pygame.Rect(panel.x + 16, panel.y + 82, panel.width - 32, 28))
     draw_fitted_text(screen, "Check disk space and folder permissions before quitting." if save_error
-                     else "Select RESUME below to return to the fight.", note_font, UI_TEXT,
+                     else "Press Esc or select RESUME to return to the fight.", note_font, UI_TEXT,
                      pygame.Rect(panel.x + 16, panel.y + 118, panel.width - 32, 28))
 
 
@@ -7472,7 +7487,7 @@ def compact_menu_layout():
 def compact_start_layout():
     margin = 20 if SCREEN_WIDTH >= 700 else 14
     low = SCREEN_HEIGHT < 500
-    top = 70 if low else 138
+    top = 70 if low else 156
     launch = pygame.Rect(margin, top, SCREEN_WIDTH - margin * 2, 104 if low else 142)
     choices = []
     gap = 10
@@ -7954,6 +7969,18 @@ def draw_save_action_dialog(screen, action, layout, button_font, font):
     draw_neon_button(screen, layout["cancel"], "CANCEL", font, UI_CYAN)
 
 
+def menu_objective_lines():
+    return ("Clear the fleet, survive enemy fire, and face a boss every fifth wave.",
+            f"Clear all {MAX_CAMPAIGN_ROUND} waves to save Earth!")
+
+
+def draw_menu_objective(screen, rect, font_size):
+    line_height = rect.height // 2
+    for index, line in enumerate(menu_objective_lines()):
+        cell = pygame.Rect(rect.x, rect.y + index * line_height, rect.width, line_height)
+        draw_hud_label(screen, hud_font(font_size), line, UI_TEXT, cell, align="center")
+
+
 @ui_scene
 def draw_start_screen(
     screen,
@@ -7976,35 +8003,11 @@ def draw_start_screen(
         return
     cx = SCREEN_WIDTH // 2
     draw_neon_title(screen, "SPACE INVADERS", title_font, (cx, int(SCREEN_HEIGHT * 0.13)), UI_CYAN)
-    tagline = player_choice_font.render(f"{MAX_CAMPAIGN_ROUND} WAVES. ONE PLANET. YOUR SQUAD.", True, UI_GOLD)
-    screen.blit(tagline, tagline.get_rect(center=(cx, int(SCREEN_HEIGHT * 0.205))))
     controls_panel, launch_panel = start_screen_panels()
-    objective_panel = pygame.Rect(controls_panel.x, int(SCREEN_HEIGHT * 0.25), SCREEN_WIDTH - controls_panel.x * 2, 64)
+    objective_panel = pygame.Rect(controls_panel.x, int(SCREEN_HEIGHT * 0.22), SCREEN_WIDTH - controls_panel.x * 2, 80)
     draw_neon_panel(screen, objective_panel, UI_VIOLET)
-    objective = (
-        "Clear the fleet, survive enemy fire, and face a boss every fifth wave. "
-        f"Retry from the start of each {WAVES_PER_SECTOR}-wave sector. Regular enemy HP increases "
-        "only once, after wave 50; bosses scale separately. "
-        f"Clear all {MAX_CAMPAIGN_ROUND} waves to save Earth!"
-    )
-    objective_lines = []
-    current_line = ""
-    max_objective_width = objective_panel.width - 36
-    for word in objective.split():
-        candidate = f"{current_line} {word}".strip()
-        if current_line and player_choice_font.size(candidate)[0] > max_objective_width:
-            objective_lines.append(current_line)
-            current_line = word
-        else:
-            current_line = candidate
-    if current_line:
-        objective_lines.append(current_line)
-
-    line_height = player_choice_font.get_linesize()
-    first_line_y = objective_panel.centery - (len(objective_lines) - 1) * line_height // 2
-    for index, line in enumerate(objective_lines):
-        objective_text = player_choice_font.render(line, True, UI_TEXT)
-        screen.blit(objective_text, objective_text.get_rect(center=(cx, first_line_y + index * line_height)))
+    draw_menu_objective(screen, objective_panel.inflate(-32, -12),
+                         34 if SCREEN_WIDTH < 1600 else 38)
 
     draw_neon_panel(screen, controls_panel, UI_CYAN)
     draw_neon_panel(screen, launch_panel, UI_PINK)
@@ -8049,10 +8052,10 @@ def draw_compact_start_screen(screen, title_font, button_font, font, player_coun
     low = SCREEN_HEIGHT < 500
     title_right = player_names_button_rect(menu_control_layout()["display_button_rect"]).left - 12
     draw_fitted_text(screen, "SPACE INVADERS", title_font, UI_CYAN,
-                     pygame.Rect(20, 12 if low else 28, max(100, title_right - 20), 44 if low else 68))
-    if not low:
-        draw_fitted_text(screen, f"{MAX_CAMPAIGN_ROUND} WAVES. ONE PLANET. YOUR SQUAD.", font, UI_GOLD,
-                         pygame.Rect(20, 102, SCREEN_WIDTH - 40, 24))
+                     pygame.Rect(20, 12 if low else 28, max(100, title_right - 20), 32 if low else 60))
+    draw_menu_objective(screen, pygame.Rect(14 if low else 20, 45 if low else 96,
+                         SCREEN_WIDTH - (28 if low else 40), 24 if low else 44),
+                         20 if low else 24)
     layout = compact_start_layout()
     draw_neon_panel(screen, layout["launch"], UI_PINK)
     draw_fitted_text(screen, "ASSEMBLE YOUR SQUAD", font, UI_PINK,
@@ -9788,33 +9791,39 @@ def draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, 
 
 
 def boss_status_layout(enemy, bounds):
-    """Separate caption and meter cells, kept below the fixed top HUD area."""
+    """Small native captions with thin separate hull/core meters."""
     bounds = pygame.Rect(bounds)
     guardian = bool(enemy.get("milestone_kind"))
-    width = min(max(280, enemy["rect"].width + 80), 360, max(1, bounds.width - 16))
-    height = 76 if guardian else 56
-    panel = pygame.Rect(0, 0, width, min(height, bounds.height - 16))
-    panel.midbottom = (enemy["rect"].centerx, enemy["rect"].top - 12)
-    # Moving an above-hull block to the bottom keeps it off wave/sector badges.
+    with ui_dimensions(bounds.size):
+        reserved = [gameplay_hud_slot_layout(number)["rect"].move(bounds.topleft)
+                    for number in range(1, 5)]
+        center_width = bounds.width - 2 * (gameplay_hud_slot_layout(1)["rect"].right + 6)
+    width = min(220, max(140, round(bounds.width * .22)), max(1, bounds.width - 16))
+    if bounds.width < 900:
+        width = min(width, max(96, center_width))
+    height = 44 if guardian else 34
+    panel = pygame.Rect(0, 0, width, min(height, max(1, bounds.height - 16)))
+    panel.midbottom = (enemy["rect"].centerx, enemy["rect"].top - 8)
     hud_bottom = min(bounds.bottom - panel.height - 8, bounds.top + 108)
     if panel.top < hud_bottom:
-        panel.top = max(hud_bottom, enemy["rect"].bottom + 16)
+        panel.top = max(hud_bottom, enemy["rect"].bottom + 8)
     panel.clamp_ip(bounds.inflate(-16, -16))
-    inset, phase_width = 10, 72
-    name = pygame.Rect(panel.x + inset, panel.y + 7, max(1, panel.width - phase_width - 28), 22)
-    phase = pygame.Rect(panel.right - inset - phase_width, panel.y + 7, phase_width, 22)
-    label_width = min(80, max(45, panel.width // 3))
+    if any(panel.colliderect(slot) for slot in reserved):
+        panel.centerx = bounds.centerx
+    inset, phase_width, label_width = 6, 28, 32
+    name = pygame.Rect(panel.x + inset, panel.y + 3, panel.width - phase_width - inset * 2 - 6, 12)
+    phase = pygame.Rect(panel.right - inset - phase_width, panel.y + 4, phase_width, 10)
     label_x = panel.x + inset
-    meter_x = label_x + label_width + 8
+    meter_x = label_x + label_width + 6
     meter_width = max(1, panel.right - inset - meter_x)
-    health_label = pygame.Rect(label_x, panel.y + 31, label_width, 16)
-    health = pygame.Rect(meter_x, panel.y + 35, meter_width, 8)
+    health_label = pygame.Rect(label_x, panel.y + 19, label_width, 9)
+    health = pygame.Rect(meter_x, panel.y + 21, meter_width, 5)
     result = {"panel": panel, "name": name, "phase": phase,
               "health_label": health_label, "health": health}
     if guardian:
-        result["core_label"] = pygame.Rect(label_x, panel.y + 52, label_width, 16)
-        result["core"] = pygame.Rect(meter_x, panel.y + 56, meter_width, 8)
-        result["status"] = pygame.Rect(meter_x, panel.y + 51, meter_width, 18)
+        result["core_label"] = pygame.Rect(label_x, panel.y + 31, label_width, 9)
+        result["core"] = pygame.Rect(meter_x, panel.y + 33, meter_width, 5)
+        result["status"] = pygame.Rect(meter_x, panel.y + 30, meter_width, 10)
     return result
 
 
@@ -9842,13 +9851,13 @@ def draw_boss_status(screen, enemy):
     cells = boss_status_layout(enemy, screen.get_rect())
     phase = milestone_boss_phase(enemy)
     phase_color = UI_CORAL if phase == 3 else UI_GOLD if phase == 2 else UI_TEXT
-    draw_gameplay_hud_panel(screen, cells["panel"], enemy["color"], radius=6)
-    draw_hud_label(screen, hud_font(22), enemy.get("boss_name", "BOSS"), enemy["color"],
-                   cells["name"], max_height=20, themed=False)
-    draw_hud_label(screen, hud_font(17), f"PHASE {phase}", phase_color, cells["phase"],
-                   align="right", max_height=16, themed=False)
-    draw_hud_label(screen, hud_font(16), "HULL", UI_TEXT, cells["health_label"],
-                   max_height=14, themed=False)
+    draw_gameplay_hud_panel(screen, cells["panel"], enemy["color"], radius=3)
+    draw_hud_label(screen, hud_font(17), enemy.get("boss_name", "BOSS"), enemy["color"],
+                   cells["name"], max_height=12, themed=False)
+    draw_hud_label(screen, hud_font(13), f"PH {phase}", phase_color, cells["phase"],
+                   align="right", max_height=10, themed=False)
+    draw_hud_label(screen, hud_font(13), "HP", UI_TEXT, cells["health_label"],
+                   max_height=9, themed=False)
     ratio = max(0, min(1, enemy["hp"] / max(1, enemy["max_hp"])))
     health = cells["health"]
     pygame.draw.rect(screen, (51, 23, 49), health, border_radius=3)
@@ -9863,11 +9872,11 @@ def draw_boss_status(screen, enemy):
     if "core" not in cells:
         return
     stunned = enemy.get("stagger_remaining", 0) > 0
-    draw_hud_label(screen, hud_font(15), "CORE" if stunned else "BREAK CORE", UI_MINT,
-                   cells["core_label"], max_height=14, themed=False)
+    draw_hud_label(screen, hud_font(13), "CORE", UI_MINT,
+                   cells["core_label"], max_height=9, themed=False)
     if stunned:
-        draw_hud_label(screen, hud_font(17), "BROKEN / STUNNED", UI_MINT,
-                       cells["status"], max_height=15, themed=False)
+        draw_hud_label(screen, hud_font(13), "STUNNED", UI_MINT,
+                       cells["status"], max_height=10, themed=False)
         return
     core = cells["core"]
     pygame.draw.rect(screen, (39, 47, 63), core, border_radius=2)
@@ -11754,6 +11763,12 @@ def main():
                     register_ui_click(event.pos, UI_GOLD)
                     continue
             keyboard.process_event(event)
+            if (arena and event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+                    and new_press and keyboard.focused):
+                keyboard.discard_taps()
+                set_game_paused(not paused)
+                simulation_accumulator = 0.0
+                continue
             if (arena and not paused and new_press
                     and event.type == pygame.KEYDOWN
                     and toggle_player_fire(event.key, players)):
