@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import math
+from bisect import bisect_left, bisect_right
 import random
 import sys
 
@@ -20,7 +21,7 @@ import pygame
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
-GAME_BUILD_ID = "2026.11.16-compact-boss-pause"
+GAME_BUILD_ID = "2026.11.17-curved-laser"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
@@ -886,6 +887,9 @@ def resize_arena_state(old_size, new_size, players=(), enemies=(), enemy_bullets
             owner = next((player for player in players if player["number"] == shot.get("owner")), None)
             if owner is not None:
                 shot["rect"].update(player_laser_rect(owner, shot.get("offset", 0)))
+                for key in ("laser_path", "laser_path_ys", "laser_segment_grid", "laser_path_anchor",
+                            "laser_path_world", "laser_path_homing"):
+                    shot.pop(key, None)
     for particle in particles:
         move_entity(particle)
         if "points" in particle:
@@ -939,6 +943,7 @@ def gameplay_status_bounds(size, players, enemies=(), world_size=None):
                     continue
                 projected = dict(enemy)
                 rect = enemy["rect"]
+                projected["_status_scale"] = min(size[0] / world_size[0], size[1] / world_size[1])
                 projected["rect"] = pygame.Rect(round(rect.x * size[0] / world_size[0]),
                     round(rect.y * size[1] / world_size[1]),
                     max(1, round(rect.width * size[0] / world_size[0])),
@@ -946,10 +951,9 @@ def gameplay_status_bounds(size, players, enemies=(), world_size=None):
                 panel = boss_status_layout(projected, pygame.Rect((0, 0), size))["panel"]
                 height = max(height, panel.bottom + 4)
                 if enemy.get("signature_warning"):
-                    caption_top = max(108, projected["rect"].bottom + 8)
-                    if panel.top >= projected["rect"].bottom:
-                        caption_top = max(caption_top, panel.bottom + 4)
-                    height = max(height, caption_top + 20)
+                    caption_top = projected["rect"].bottom + max(4, round(10 * projected["_status_scale"]))
+                    height = max(height, caption_top + max(6, round(13 * projected["_status_scale"])) + 4)
+
     return pygame.Rect(0, 0, size[0], min(size[1], height))
 
 
@@ -2434,7 +2438,7 @@ POWERUP_JOURNAL = (
     ("piercing", "Normal shots deal 2 base damage and can hit up to three different foes. Does not change bombs or lasers."),
     ("damage_up", f"1-in-100 pickup: +1 main-shot and drone damage for this run, up to +{MAX_DAMAGE_BONUS}. Other support shots stay fixed. Extras grant Double Score."),
     ("health_up", f"1-in-100 pickup: +1 hit per life, max {MAX_DURABILITY_BONUS}. Repair starts after {DURABILITY_REGEN_DELAY_MS // 1000}s without damage, then 1 hit/{DURABILITY_REGEN_INTERVAL_MS // 1000}s. Boss lasers and gates pierce it. Does not add lives; extras grant Double Score."),
-    ("homing", "Normal shots and bombs steer toward foes; lasers add a weaker guided arc while keeping their main beam. Extends Lightning's reach."),
+    ("homing", "Shots and bombs steer toward foes. Lasers become one smooth piercing beam, curving through targets and continuing up to one arena beyond the screen. Off-axis laser hits deal 1 less damage. Lightning still requires its separate pickup."),
     ("lightning", f"Main shots, bombs and laser pulses arc for reduced damage. First hop needs a foe in range; later chances are {', '.join(f'{chance:.0%}' for chance in LIGHTNING_HOP_CHANCES[1:])}. Up to {1 + len(LIGHTNING_HOP_CHANCES)} foes total. Homing extends reach."),
     ("score_boost", "Doubles the score you earn from defeating enemies while active."),
     ("cryo", f"Hits slow regular foes 65% and bosses 25% for {CRYO_SLOW_MS // 1000}s. Kills grant Shatter: +{SHATTER_SPEED_PER_STACK:g} speed and +{SHATTER_FIRE_PER_STACK:.0%} fire per stack, max {SHATTER_MAX_STACKS}. Below full Momentum; bonuses do not add."),
@@ -5412,29 +5416,21 @@ def draw_milestone_attack_warning(screen, enemy, show_label=True):
 
 
 def draw_milestone_warning_caption(screen, enemy, color=None):
-    """Fit the signature caption beneath the entire boss status block."""
     warning = enemy.get("signature_warning")
     if warning is None:
         return
-    color = enemy["color"] if color is None else color
-    warning_label = warning["name"]
+    scale = enemy.get("_status_scale", 1.0)
+    text = warning["name"]
     if warning["beams"] or warning.get("walls"):
-        warning_label += " / PIERCES DUR"
-    caption_width = max(1, min(260, screen.get_width() - 32))
-    if screen.get_width() < 900 and enemy.get("is_boss"):
-        caption_width = min(caption_width,
-                            boss_status_layout(enemy, screen.get_rect())["panel"].width - 12)
-    label = cached_ui_text(hud_font(16), warning_label, color,
-                           max_width=caption_width, max_height=12)
-    label_y = max(108, enemy["rect"].bottom + 8)
-    if enemy.get("is_boss"):
-        status = boss_status_layout(enemy, screen.get_rect())["panel"]
-        if status.top >= enemy["rect"].bottom:
-            label_y = max(label_y, status.bottom + 4)
-    label_rect = label.get_rect(midtop=(screen.get_width() // 2, label_y))
-    label_rect.clamp_ip(screen.get_rect().inflate(-16, -16))
-    pygame.draw.rect(screen, UI_BG, label_rect.inflate(12, 8), border_radius=4)
-    screen.blit(label, label_rect)
+        text += " / PIERCES DUR"
+    color = enemy["color"] if color is None else color
+    label = cached_ui_text(hud_font(max(8, round(18 * scale))), text, color,
+                           max_width=max(enemy["rect"].width, round(280 * scale)),
+                           max_height=max(6, round(13 * scale)))
+    rect = label.get_rect(midtop=(enemy["rect"].centerx,
+                                  enemy["rect"].bottom + max(4, round(10 * scale))))
+    pygame.draw.rect(screen, UI_BG, rect.inflate(6, 4))
+    screen.blit(label, rect)
 
 
 def choose_powerup_type(players=None):
@@ -6583,56 +6579,186 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
             enemy_bullets.remove(bullet)
 
 
-def assign_laser_homing_targets(beams, enemies, player):
-    """Branch each piercing laser toward a different visible enemy if possible.
+LASER_GUIDE_LIMIT = 6
+LASER_TARGET_POOL = 32
+LASER_PATH_SEGMENTS = 256
+LASER_GRID_SIZE = 128
 
-    The full-height original laser remains intact. Target references are refreshed
-    every frame, so a dead enemy can never permanently trap a homing beam.
+
+def player_projectile_bounds():
+    """One full arena of margin on each side; incoming rows are valid targets."""
+    return pygame.Rect(-SCREEN_WIDTH, -SCREEN_HEIGHT, SCREEN_WIDTH * 3, SCREEN_HEIGHT * 3)
+
+
+def build_player_laser_path(beam, guides=()):
+    """One smooth upward ray, continuing beyond its guides to the world boundary.
+
+    Each join has zero slope/curvature, unlike the old jittering side connector.
+    A bounded number of samples and guides keeps four-pilot scenes inexpensive.
     """
-    available = [e for e in enemies if enemy_is_visible(e)
-                 and e["rect"].centery < player["y"]]
-    claimed = set()
-    for beam in beams:
-        beam["homing_target"] = None
-        if not beam.get("homing") or not available:
-            continue
-        # Favor enemies nearest to the beam; evenly distribute a triple volley.
-        choices = [e for e in available if id(e) not in claimed] or available
-        best = min(choices, key=lambda enemy:
-                   abs(enemy["rect"].centerx - beam["rect"].centerx)
-                   + 0.10 * abs(enemy["rect"].centery - beam["rect"].centery))
-        beam["homing_target"] = best
-        claimed.add(id(best))
+    bounds = player_projectile_bounds()
+    x0, y0 = beam["rect"].midbottom
+    if not beam.get("homing") or not guides:
+        return ((x0, y0), (x0, bounds.top))
+    anchors = [(float(x0), float(y0))]
+    for enemy in guides:
+        tx, ty = enemy["rect"].center
+        tx = max(bounds.left, min(bounds.right - 1, tx))
+        ty = max(bounds.top, ty)
+        if ty < anchors[-1][1] - 8:
+            anchors.append((float(tx), float(ty)))
+    anchors.append((anchors[-1][0], float(bounds.top)))
+    lengths = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(anchors, anchors[1:])]
+    total = max(1, sum(lengths))
+    budget = min(LASER_PATH_SEGMENTS, max(2, math.ceil(total / 18)))
+    points = [(x0, y0)]
+    for (ax, ay), (bx, by), length in zip(anchors, anchors[1:], lengths):
+        steps = max(1, math.ceil(budget * length / total))
+        for index in range(1, steps + 1):
+            t = index / steps
+            ease = t * t * t * (t * (t * 6 - 15) + 10)
+            point = (round(ax + (bx - ax) * ease), round(ay + (by - ay) * t))
+            if points[-1] != point:
+                points.append(point)
 
-
-def laser_homing_points(beam, time_ms):
-    """A gently animated energy tendril from the main beam to its locked enemy."""
-    target = beam.get("homing_target")
-    if target is None:
-        return ()
-    x0 = beam["rect"].centerx
-    x1, y1 = target["rect"].center
-    y0 = max(GAMEPLAY_TOP + 3, min(beam["rect"].bottom - 10, y1 + 35))
-    if abs(x0 - x1) < 7:
-        return ((x0, y0), (x1, y1))
-    points = []
-    for index in range(9):
-        t = index / 8
-        wave = math.sin(t * math.pi) * math.sin(time_ms / 115 + index * 1.7) * 6
-        points.append((round(x0 + (x1 - x0) * t),
-                       round(y0 + (y1 - y0) * t + wave)))
     return tuple(points)
 
 
+def laser_path_grid(points, width):
+    """Occupied cells for broad-phase hits; exact hits use the monotonic path."""
+    cells = set()
+    radius = max(1, math.ceil(width / 2))
+    for a, b in zip(points, points[1:]):
+        left, right = min(a[0], b[0]) - radius, max(a[0], b[0]) + radius
+        top, bottom = min(a[1], b[1]) - radius, max(a[1], b[1]) + radius
+        for gy in range(top // LASER_GRID_SIZE, bottom // LASER_GRID_SIZE + 1):
+            for gx in range(left // LASER_GRID_SIZE, right // LASER_GRID_SIZE + 1):
+                cells.add((gx, gy))
+    return frozenset(cells)
+
+
+def store_player_laser_path(beam, points):
+    beam["laser_path"] = points
+    beam["laser_path_ys"] = tuple(-point[1] for point in points)
+    beam["laser_segment_grid"] = (laser_path_grid(points, beam["rect"].width)
+                                  if beam.get("damage_ready", False) else None)
+    beam["laser_path_anchor"] = beam["rect"].midbottom
+    beam["laser_path_world"] = (SCREEN_WIDTH, SCREEN_HEIGHT)
+    beam["laser_path_homing"] = bool(beam.get("homing"))
+
+
+def player_laser_points(beam):
+    """Read-only geometry for drawing, including an uncached resize preview."""
+    if (beam.get("laser_path_anchor") == beam["rect"].midbottom
+            and beam.get("laser_path_world") == (SCREEN_WIDTH, SCREEN_HEIGHT)
+            and beam.get("laser_path_homing") == bool(beam.get("homing"))):
+        return beam["laser_path"]
+    target = beam.get("homing_target")
+    guides = beam.get("laser_guides", (target,) if target is not None else ())
+    return build_player_laser_path(beam, tuple(enemy for enemy in guides if enemy.get("hp", 1) > 0))
+
+
+def laser_homing_points(beam, time_ms):
+    # Retain the public renderer helper, but homing is now the entire beam.
+    return player_laser_points(beam) if beam.get("homing") else ()
+
+
+def laser_geometry(beam):
+    points = player_laser_points(beam)
+    if points is beam.get("laser_path"):
+        grid = beam.get("laser_segment_grid")
+        if grid is None:
+            grid = laser_path_grid(points, beam["rect"].width)
+            beam["laser_segment_grid"] = grid
+        return points, grid
+    return points, laser_path_grid(points, beam["rect"].width)
+
+
+def laser_hits_rect(beam, rect):
+    if (rect.right <= -SCREEN_WIDTH or rect.left >= SCREEN_WIDTH * 2
+            or rect.bottom <= -SCREEN_HEIGHT or rect.top >= SCREEN_HEIGHT * 2):
+        return False
+    points = player_laser_points(beam)
+    levels = (beam["laser_path_ys"] if points is beam.get("laser_path")
+              else tuple(-point[1] for point in points))
+    radius = math.ceil(beam["rect"].width / 2)
+    first = max(0, bisect_left(levels, -rect.bottom - radius) - 1)
+    last = min(len(points) - 2, bisect_right(levels, -rect.top + radius))
+    if first > last:
+        return False
+    padded = rect.inflate(beam["rect"].width, beam["rect"].width)
+    return any(padded.clipline(points[index], points[index + 1])
+               for index in range(first, last + 1))
+
+
+def laser_enemy_candidates(beam, enemy_grid):
+    _, grid = laser_geometry(beam)
+    seen, result = set(), []
+    for cell in grid:
+        for enemy in enemy_grid.get(cell, ()):
+            identity = id(enemy)
+            if identity not in seen:
+                seen.add(identity)
+                result.append(enemy)
+    return result
+
+
+def assign_laser_homing_targets(beams, enemies, player):
+    """Guide complete rays through successive live foes, including incoming rows."""
+    bounds = player_projectile_bounds()
+    available = [enemy for enemy in enemies if enemy.get("hp", 0) > 0
+                 and bounds.colliderect(enemy["rect"])
+                 and enemy["rect"].centery < player["y"] - 8]
+    available_ids = {id(enemy) for enemy in available}
+    pool = None
+    claimed = set()
+    for beam in beams:
+        previous = beam.get("laser_guides", ())
+        x, y = beam["rect"].midbottom
+        refresh = (beam.get("damage_ready", False)
+                   or beam.get("laser_path_world") != (SCREEN_WIDTH, SCREEN_HEIGHT)
+                   or beam.get("laser_path_homing") != bool(beam.get("homing"))
+                   or any(id(enemy) not in available_ids for enemy in previous))
+        if previous and (previous[0]["rect"].centery >= y - 40
+                         or abs(previous[0]["rect"].centerx - x)
+                         > 32 + .75 * (y - previous[0]["rect"].centery)):
+            refresh = True
+        guides = [] if refresh else list(previous)
+        seen = set()
+        if beam.get("homing") and refresh:
+            if pool is None:
+                pool = sorted(available, key=lambda enemy:
+                              abs(enemy["rect"].centerx - (player["x"] + PLAYER_WIDTH / 2))
+                              + .35 * (player["y"] - enemy["rect"].centery))[:LASER_TARGET_POOL]
+            for _ in range(LASER_GUIDE_LIMIT):
+                choices = [enemy for enemy in pool if id(enemy) not in seen
+                           and enemy["rect"].centery < y - 40
+                           and abs(enemy["rect"].centerx - x)
+                           <= 32 + .75 * (y - enemy["rect"].centery)]
+                if not choices:
+                    break
+                if not guides:
+                    distinct = [enemy for enemy in choices if id(enemy) not in claimed]
+                    choices = distinct or choices
+                target = min(choices, key=lambda enemy:
+                             abs(enemy["rect"].centerx - x) + .35 * (y - enemy["rect"].centery))
+                guides.append(target)
+                seen.add(id(target))
+                x, y = target["rect"].center
+        if not beam.get("homing"):
+            guides = []
+        beam["homing_target"] = guides[0] if guides else None
+        beam["laser_guides"] = tuple(guides)
+        if guides:
+            claimed.add(id(guides[0]))
+        store_player_laser_path(beam, build_player_laser_path(beam, guides))
+
+
 def player_laser_rect(player, shot_offset=0):
-    # A charged laser reaches the very top of the playfield, including bosses.
-    beam_bottom = max(0, int(round(player["y"])))
-    return pygame.Rect(
-        int(round(player["x"] + PLAYER_WIDTH / 2 - 5 + shot_offset)),
-        0,
-        10,
-        beam_bottom,
-    )
+    beam_bottom = int(round(player["y"]))
+    top = -SCREEN_HEIGHT
+    return pygame.Rect(int(round(player["x"] + PLAYER_WIDTH / 2 - 5 + shot_offset)),
+                       top, 10, max(1, beam_bottom - top))
 
 
 def update_homing_heading(bullet, velocity_x, velocity_y, resize_hitbox=True):
@@ -6730,6 +6856,7 @@ def update_orbit_drones(players, player_bullets, active_count, now):
 def update_player_projectiles(keys, players, player_count, player_bullets, enemies=()):
     now = pygame.time.get_ticks()
     audio = ensure_audio_manager()
+    projectile_bounds = player_projectile_bounds()
     active_count = max(1, sum(not p["eliminated"] and p["respawn_until"] == 0 for p in players))
     update_orbit_drones(players, player_bullets, active_count, now)
 
@@ -6804,8 +6931,7 @@ def update_player_projectiles(keys, players, player_count, player_bullets, enemi
                             "cryo": player.get("cryo_until", 0) > now,
                             "lightning_chained": False,
                         })
-                # Keep the existing full-height piercing beams AND attach a
-                # living, retargetable homing arc when both pickups are active.
+                # Rebuild the one physical beam path before collision/rendering.
                 active_beams = [b for b in player_bullets
                                 if isinstance(b, dict) and b.get("type") == "laser"
                                 and b.get("owner") == player["number"]]
@@ -6910,6 +7036,7 @@ def update_player_projectiles(keys, players, player_count, player_bullets, enemi
         # could orbit that invulnerable-to-this-bullet enemy forever.
         candidates = (
             [enemy for enemy in enemies if enemy["hp"] > 0
+             and projectile_bounds.colliderect(enemy["rect"])
              and id(enemy) not in bullet.get("hit_enemies", ())]
             if isinstance(bullet, dict) and bullet.get("homing") else []
         )
@@ -7312,8 +7439,8 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
             continue
         for boss in bosses:
             direct = beam["rect"].colliderect(boss["rect"])
-            guided = beam.get("homing") and beam.get("homing_target") is boss
-            if direct or guided:
+            guided = beam.get("homing") and laser_hits_rect(beam, boss["rect"])
+            if laser_hits_rect(beam, boss["rect"]):
                 damage = beam.get("damage", 3)
                 if guided and not direct:
                     damage = max(1, damage - 1)
@@ -7330,25 +7457,21 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
             if not bullet.get("damage_ready", False):
                 continue
             bullet["damage_ready"] = False
-        candidates = nearby_enemy_candidates(
-            enemy_grid, rect.centerx, rect.centery,
-            max(rect.width, rect.height) // 2 + 128, 128)
-        if kind == "laser" and bullet.get("homing"):
-            # A guided arc can reach well beyond the main beam's grid cells.
-            # Keep its selected live target in the same collision pass.
-            target = bullet.get("homing_target")
-            if (target is not None and id(target) in active_enemy_ids
-                    and all(candidate is not target for candidate in candidates)):
-                candidates.append(target)
+        candidates = (laser_enemy_candidates(bullet, enemy_grid) if kind == "laser" else
+                      nearby_enemy_candidates(enemy_grid, rect.centerx, rect.centery,
+                                              max(rect.width, rect.height) // 2 + 128, 128))
         for enemy in candidates:
             if id(enemy) not in active_enemy_ids:
                 continue
             if isinstance(bullet, dict) and id(enemy) in bullet.get("hit_enemies", ()):
                 continue
-            guided = (kind == "laser" and bullet.get("homing")
-                      and bullet.get("homing_target") is enemy)
             direct = rect.colliderect(enemy["rect"])
-            if not direct and not guided:
+            guided = False
+            if kind == "laser":
+                if not laser_hits_rect(bullet, enemy["rect"]):
+                    continue
+                guided = bool(bullet.get("homing"))
+            elif not direct:
                 continue
             if kind == "bomb":
                 center = rect.center
@@ -9791,99 +9914,91 @@ def draw_gameplay_ui_overlay(screen, exit_button_rect, pause_button_rect, font, 
 
 
 def boss_status_layout(enemy, bounds):
-    """Small native captions with thin separate hull/core meters."""
-    bounds = pygame.Rect(bounds)
-    guardian = bool(enemy.get("milestone_kind"))
-    with ui_dimensions(bounds.size):
-        reserved = [gameplay_hud_slot_layout(number)["rect"].move(bounds.topleft)
-                    for number in range(1, 5)]
-        center_width = bounds.width - 2 * (gameplay_hud_slot_layout(1)["rect"].right + 6)
-    width = min(220, max(140, round(bounds.width * .22)), max(1, bounds.width - 16))
-    if bounds.width < 900:
-        width = min(width, max(96, center_width))
-    height = 44 if guardian else 34
-    panel = pygame.Rect(0, 0, width, min(height, max(1, bounds.height - 16)))
-    panel.midbottom = (enemy["rect"].centerx, enemy["rect"].top - 8)
-    hud_bottom = min(bounds.bottom - panel.height - 8, bounds.top + 108)
-    if panel.top < hud_bottom:
-        panel.top = max(hud_bottom, enemy["rect"].bottom + 8)
-    panel.clamp_ip(bounds.inflate(-16, -16))
-    if any(panel.colliderect(slot) for slot in reserved):
-        panel.centerx = bounds.centerx
-    inset, phase_width, label_width = 6, 28, 32
-    name = pygame.Rect(panel.x + inset, panel.y + 3, panel.width - phase_width - inset * 2 - 6, 12)
-    phase = pygame.Rect(panel.right - inset - phase_width, panel.y + 4, phase_width, 10)
-    label_x = panel.x + inset
-    meter_x = label_x + label_width + 6
-    meter_width = max(1, panel.right - inset - meter_x)
-    health_label = pygame.Rect(label_x, panel.y + 19, label_width, 9)
-    health = pygame.Rect(meter_x, panel.y + 21, meter_width, 5)
-    result = {"panel": panel, "name": name, "phase": phase,
-              "health_label": health_label, "health": health}
-    if guardian:
-        result["core_label"] = pygame.Rect(label_x, panel.y + 31, label_width, 9)
-        result["core"] = pygame.Rect(meter_x, panel.y + 33, meter_width, 5)
-        result["status"] = pygame.Rect(meter_x, panel.y + 30, meter_width, 10)
+    """Original hull-width meters and captions: no HUD docking or edge snapping."""
+    scale = enemy.get("_status_scale", 1.0)
+    gap = max(2, round(3 * scale))
+    label_height = max(5, round(9 * scale))
+    label_width = max(12, round(32 * scale))
+    rect = enemy["rect"]
+    health = pygame.Rect(rect.x, 0, rect.width, max(2, round(6 * scale)))
+    if enemy.get("milestone_kind"):
+        core = pygame.Rect(rect.x, 0, rect.width, max(2, round(4 * scale)))
+        core.bottom = rect.top - 2
+        health.centery = core.centery - max(label_height + 1,
+                                             (health.height + core.height) // 2 + gap)
+    else:
+        core = None
+        health.bottom = rect.top - max(2, round(6 * scale))
+    phase = pygame.Rect(0, 0, max(rect.width, round(80 * scale)), max(7, round(11 * scale)))
+    phase.midbottom = (rect.centerx, health.top - gap)
+    name = pygame.Rect(0, 0, max(rect.width, round(220 * scale)), max(8, round(16 * scale)))
+    name.midbottom = (rect.centerx, phase.top - gap)
+    health_label = pygame.Rect(0, 0, label_width, label_height)
+    health_label.midright = (health.left - gap, health.centery)
+    result = {"name": name, "phase": phase, "health_label": health_label, "health": health}
+    if core is not None:
+        core_label = pygame.Rect(0, 0, label_width, label_height)
+        core_label.midright = (core.left - gap, core.centery)
+        result.update(core=core, core_label=core_label,
+                      status=pygame.Rect(core.x, min(core.centery - label_height // 2,
+                                                   rect.top - 2 - label_height),
+                                         core.width, label_height))
+    result["panel"] = name.unionall(list(result.values()))
     return result
 
 
 def draw_boss_status_layer(screen, enemies, world_size):
-    """Project boss anchors into the native GUI so labels stay readable at 640px."""
+    """Native glyphs use the old world-sized tag, anchored to the moving hull."""
     sx, sy = screen.get_width() / world_size[0], screen.get_height() / world_size[1]
     with ui_dimensions(screen.get_size()):
         for enemy in enemies:
             if not enemy.get("is_boss"):
                 continue
-            world_rect = enemy["rect"]
-            if not pygame.Rect((0, 0), world_size).inflate(160, 160).colliderect(world_rect):
+            if not pygame.Rect((0, 0), world_size).inflate(160, 160).colliderect(enemy["rect"]):
                 continue
             projected = dict(enemy)
+            world_rect = enemy["rect"]
             projected["rect"] = pygame.Rect(round(world_rect.x * sx), round(world_rect.y * sy),
-                                             max(1, round(world_rect.width * sx)),
-                                             max(1, round(world_rect.height * sy)))
+                max(1, round(world_rect.width * sx)), max(1, round(world_rect.height * sy)))
+            projected["_status_scale"] = min(sx, sy)
             draw_boss_status(screen, projected)
             if enemy.get("signature_warning"):
                 draw_milestone_warning_caption(screen, projected)
 
 
 def draw_boss_status(screen, enemy):
-    """Boss captions never share pixels with the health or core meters."""
+    """Small attached name/phase and thin bars, without the new floating card."""
     cells = boss_status_layout(enemy, screen.get_rect())
+    scale = enemy.get("_status_scale", 1.0)
     phase = milestone_boss_phase(enemy)
     phase_color = UI_CORAL if phase == 3 else UI_GOLD if phase == 2 else UI_TEXT
-    draw_gameplay_hud_panel(screen, cells["panel"], enemy["color"], radius=3)
-    draw_hud_label(screen, hud_font(17), enemy.get("boss_name", "BOSS"), enemy["color"],
-                   cells["name"], max_height=12, themed=False)
-    draw_hud_label(screen, hud_font(13), f"PH {phase}", phase_color, cells["phase"],
-                   align="right", max_height=10, themed=False)
-    draw_hud_label(screen, hud_font(13), "HP", UI_TEXT, cells["health_label"],
-                   max_height=9, themed=False)
-    ratio = max(0, min(1, enemy["hp"] / max(1, enemy["max_hp"])))
+    draw_hud_label(screen, hud_font(max(10, round(22 * scale))), enemy.get("boss_name", "BOSS"),
+                   enemy["color"], cells["name"], align="center", themed=False)
+    draw_hud_label(screen, hud_font(max(8, round(16 * scale))), f"PHASE {phase}", phase_color,
+                   cells["phase"], align="center", themed=False)
+    draw_hud_label(screen, hud_font(max(8, round(13 * scale))), "HP", UI_TEXT,
+                   cells["health_label"], align="right", themed=False)
     health = cells["health"]
-    pygame.draw.rect(screen, (51, 23, 49), health, border_radius=3)
+    ratio = max(0, min(1, enemy["hp"] / max(1, enemy["max_hp"])))
+    pygame.draw.rect(screen, (51, 23, 49), health)
     if ratio:
-        filled = pygame.Rect(health.x, health.y, max(1, round(health.width * ratio)), health.height)
-        pygame.draw.rect(screen, blend_color(UI_CORAL, UI_MINT, ratio), filled, border_radius=3)
-    pygame.draw.rect(screen, UI_TEXT, health, 1, border_radius=3)
-    # Phase thresholds remain visible as small fixed ticks in the hull meter.
-    for threshold in (.35, .65):
-        x = health.x + round(health.width * threshold)
-        pygame.draw.line(screen, UI_BG, (x, health.y + 1), (x, health.bottom - 2), 1)
+        pygame.draw.rect(screen, blend_color(UI_CORAL, UI_MINT, ratio),
+                         (health.x, health.y, max(1, round(health.width * ratio)), health.height))
+    pygame.draw.rect(screen, UI_TEXT, health, 1)
     if "core" not in cells:
         return
-    stunned = enemy.get("stagger_remaining", 0) > 0
-    draw_hud_label(screen, hud_font(13), "CORE", UI_MINT,
-                   cells["core_label"], max_height=9, themed=False)
-    if stunned:
-        draw_hud_label(screen, hud_font(13), "STUNNED", UI_MINT,
-                       cells["status"], max_height=10, themed=False)
+    draw_hud_label(screen, hud_font(max(8, round(13 * scale))), "CORE", UI_MINT,
+                   cells["core_label"], align="right", themed=False)
+    if enemy.get("stagger_remaining", 0) > 0:
+        draw_hud_label(screen, hud_font(max(8, round(13 * scale))), "STUNNED", UI_MINT,
+                       cells["status"], align="center", themed=False)
         return
     core = cells["core"]
-    pygame.draw.rect(screen, (39, 47, 63), core, border_radius=2)
-    filled_width = round(core.width * milestone_stagger_ratio(enemy))
-    if filled_width:
-        pygame.draw.rect(screen, UI_MINT, (core.x, core.y, filled_width, core.height), border_radius=2)
-    pygame.draw.rect(screen, UI_TEXT, core, 1, border_radius=2)
+    pygame.draw.rect(screen, (39, 47, 63), core)
+    width = round(core.width * milestone_stagger_ratio(enemy))
+    if width:
+        pygame.draw.rect(screen, UI_MINT, (core.x, core.y, width, core.height))
+    pygame.draw.rect(screen, UI_TEXT, core, 1)
 
 
 def composite_gameplay_ui(screen, ui_surface, bounds=None):
@@ -10008,9 +10123,9 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
             draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error)
     else:
         ui_surface.fill((0, 0, 0, 0))
-        draw_gameplay_ui_underlay(ui_surface, players, font, now, round_num, save_error)
         if defer_native_ui:
             draw_boss_status_layer(ui_surface, enemies, screen.get_size())
+        draw_gameplay_ui_underlay(ui_surface, players, font, now, round_num, save_error)
         if not defer_native_ui:
             composite_gameplay_ui(screen, ui_surface)
     # Tall fleets can have many rows waiting above the arena. Skip only ships
@@ -10044,32 +10159,21 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
     for bullet in player_bullets:
         rect = bullet["rect"] if isinstance(bullet, dict) else bullet
         shot_color = player_projectile_color(bullet, player_colors)
+        if isinstance(bullet, dict) and bullet.get("type") == "laser":
+            points = player_laser_points(bullet)
+            if len(points) >= 2:
+                pygame.draw.lines(screen, shot_color, False, points, bullet["rect"].width)
+                if not _POTATO_MODE:
+                    pygame.draw.lines(screen, UI_TEXT, False, points, 2)
+            continue
         if _POTATO_MODE:
-            if isinstance(bullet, dict) and bullet.get("homing") and bullet.get("type") != "laser":
+            if isinstance(bullet, dict) and bullet.get("homing"):
                 draw_homing_projectile(screen, bullet, shot_color)
             else:
                 pygame.draw.rect(screen, shot_color, rect)
-            if isinstance(bullet, dict) and bullet.get("type") == "laser":
-                # The guided tendril damages targets along this exact path.
-                # Keep its full extent, using a single cheap solid stroke.
-                points = laser_homing_points(bullet, now)
-                if len(points) >= 2:
-                    pygame.draw.lines(screen, shot_color, False, points, 6)
             continue
         if isinstance(bullet, dict):
-            if bullet.get("type") == "laser":
-                pygame.draw.rect(screen, blend_color(shot_color, UI_GOLD, 0.4), rect, 2)
-                pygame.draw.line(screen, UI_TEXT, rect.midtop, rect.midbottom, 2)
-                # HOMING + LASER still adds an aiming tendril. LIGHTNING is
-                # a separate optional chain effect with its own damage/visuals.
-                # A normal
-                # beam still pierces vertically through every enemy in its path.
-                points = laser_homing_points(bullet, now)
-                if len(points) >= 2:
-                    pygame.draw.lines(screen, shot_color, False, points, 6)
-                    pygame.draw.lines(screen, UI_TEXT, False, points, 2)
-                    pygame.draw.circle(screen, shot_color, points[-1], 9, 2)
-            elif bullet.get("homing"):
+            if bullet.get("homing"):
                 draw_homing_projectile(screen, bullet, shot_color)
             elif bullet.get("type") == "bomb":
                 draw_soft_glow(screen, rect.center, shot_color, radius=17, strength=65)
