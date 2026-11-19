@@ -22,7 +22,6 @@ import json
 import os
 from pathlib import Path
 import math
-from bisect import bisect_left, bisect_right
 import random
 import sys
 
@@ -35,7 +34,7 @@ import pygame
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
-GAME_BUILD_ID = "2026.11.17-ui-polish"
+GAME_BUILD_ID = "2026.11.19-bombs-homing"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
@@ -43,6 +42,7 @@ GRAPHICS_DEFAULTS = {
     "graphics_preset": "default",
     "particles": "full",
     "animations": True,
+    "laser_motion": True,
     "glow": True,
     "background": "full",
     "trails": True,
@@ -56,6 +56,7 @@ GRAPHICS_DEFAULTS = {
 GRAPHICS_SETTING_OPTIONS = {
     "particles": ("off", "reduced", "full"),
     "animations": (True, False),
+    "laser_motion": (True, False),
     "glow": (True, False),
     "background": ("off", "stars", "full"),
     "trails": (True, False),
@@ -70,8 +71,8 @@ GRAPHICS_PRESET_OPTIONS = ("default", "performance", "potato")
 # Presets tune rendering cost while keeping interface and readability choices.
 GRAPHICS_PRESETS = {
     "default": {key: GRAPHICS_DEFAULTS[key] for key in (
-        "particles", "animations", "glow", "background", "trails", "auto_effects", "world_filter")},
-    "performance": {"particles": "reduced", "animations": False,
+        "particles", "animations", "laser_motion", "glow", "background", "trails", "auto_effects", "world_filter")},
+    "performance": {"particles": "reduced", "animations": False, "laser_motion": True,
                     "glow": False, "background": "stars", "trails": False,
                     "auto_effects": True, "world_filter": "pixel"},
 }
@@ -897,6 +898,14 @@ def resize_arena_state(old_size, new_size, players=(), enemies=(), enemy_bullets
             extra = required - warning["remaining_frames"]
             warning["remaining_frames"] += extra
             warning["warning_frames"] += extra
+        elif warning.get("area_attack") and warning.get("beams"):
+            positions = [(player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
+                         for player in players if not player.get("eliminated", False)
+                         and player.get("respawn_until", 0) <= now]
+            required = milestone_beam_warning_frames(warning["remaining_frames"], warning["beams"], positions)
+            extra = required - warning["remaining_frames"]
+            warning["remaining_frames"] += extra
+            warning["warning_frames"] += extra
         elif fronts:
             positions = [(player["x"] + PLAYER_WIDTH / 2, player["y"] + PLAYER_HEIGHT / 2)
                          for player in players if not player.get("eliminated", False)
@@ -922,7 +931,8 @@ def resize_arena_state(old_size, new_size, players=(), enemies=(), enemy_bullets
             warning["warning_frames"] += extra
 
     for shot in enemy_bullets:
-        move_entity(shot, area=bool(shot.get("laser_state") or shot.get("milestone_wall")))
+        move_entity(shot, area=bool((shot.get("laser_state") or shot.get("milestone_wall"))
+                                   and not shot.get("boss_bomb_echo")))
         if shot.get("milestone_gap") is not None:
             move_rect(shot["milestone_gap"], area=True)
         sync_boss_laser_attachment(shot)
@@ -1063,7 +1073,7 @@ def gameplay_status_bounds(size, players, enemies=(), world_size=None):
 SETTINGS_PAGES = ("display", "graphics", "interface")
 SETTINGS_ROWS = {
     "graphics": (("preset", "Graphics preset"), ("particles", "Decorative particles"),
-                 ("animations", "Ship animation"), ("glow", "Glow"),
+                 ("animations", "Ship animation"), ("laser_motion", "Laser motion"), ("glow", "Glow"),
                  ("background", "Background"), ("trails", "Projectile trails"),
                  ("auto_effects", "Auto reduce effects"), ("world_filter", "World scaling")),
     "interface": (("ui_theme", "Color theme"), ("hud_opacity", "HUD background"),
@@ -1089,9 +1099,11 @@ def display_settings_layout(page="display"):
     keyboard = close.copy()
     keyboard.bottomleft = (panel.left + margin, panel.bottom - 10)
     note = pygame.Rect(panel.x + margin, close.top - 23, panel.width - margin * 2, 18)
-    top, bottom = tabs["display"].bottom + 8, note.top - 5
-    row_gap = 3 if compact else 7
-    row_height = min(38, max(20, (bottom - top - row_gap * 7) // 8))
+    row_count = max(8, len(SETTINGS_ROWS.get(page, ())))
+    tight = compact and row_count > 8
+    top, bottom = tabs["display"].bottom + (6 if tight else 8), note.top - 5
+    row_gap = 2 if tight else 3 if compact else 7
+    row_height = min(38, max(20, (bottom - top - row_gap * (row_count - 1)) // row_count))
     label_width = (panel.width - margin * 2) * 43 // 100
 
     def row(index):
@@ -1292,8 +1304,9 @@ WEAVING_ENEMY_TYPES = frozenset(("weaver", "orbit", "stormglass"))
 FLEET_MIN_TRAVEL = 120  # Leave turning room after a resize or uneven slowing.
 DIVER_DIVE_DEPTH = 75
 DIVER_MAX_ARENA_FRACTION = 0.60  # Keep dive attacks away from the player floor.
-# When no enemies remain visible, hurry hidden stragglers into view.
-HIDDEN_ENEMY_CATCHUP_SPEED = 7  # Pixels per frame; preserves partial reveals.
+# When no full hull remains revealed, hurry hidden stragglers into view.
+HIDDEN_ENEMY_CATCHUP_SPEED = 7  # Pixels per frame; no catch-up teleport.
+HIDDEN_ENEMY_REVEAL_MARGIN = 12  # Reveal the whole incoming hull below the top.
 # Restrict projectile crowding, particularly from multi-shot enemy types.
 BASE_ENEMY_BULLET_CAP = 22
 ENEMY_BULLET_CAP_PER_EXTRA_PLAYER = 6
@@ -1342,6 +1355,10 @@ NORMAL_BOSS_LASER_ACTIVE_FRAMES = 270  # 4.5 seconds after the separate warning.
 BOSS_ENCOUNTER_RECOVERY_FRAMES = 48
 HEAVY_ORB_FUSE_FRAMES = 84  # Pulses visibly for 1.4 seconds before bursting.
 HEAVY_ORB_BURST_COUNT = 8
+HEAVY_ORB_CLUSTER_SPOKES = 10  # Maximum spokes in each of the boss's two rings.
+HEAVY_ORB_ECHO_FRAMES = 30  # A second, visibly charged pulse follows after 0.5s.
+HEAVY_ORB_FRAGMENT_LIFETIME = 360  # Bound slowed/deflected fragments to six seconds.
+HEAVY_ORB_FRAGMENT_SPEEDS = (5.2, 6.0)
 
 # Player Configuration Constants
 PLAYER_WIDTH = 30
@@ -1365,11 +1382,13 @@ COOP_FIRE_COOLDOWN_STEP = 0.65  # A modest team boost; each pilot still fires sl
 RAPID_FIRE_MULTIPLIERS = (3.0, 3.4, 3.7, 4.0)
 RAPID_FIRE_LASER_MULTIPLIER = 1.75
 MAX_DAMAGE_BONUS = 3
-MAX_DURABILITY_BONUS = 3
-MAX_HEALTH_BONUS = MAX_DURABILITY_BONUS  # Legacy save compatibility.
+HOMING_LASER_HITS_PER_SECOND = 8
+MAX_DURABILITY_BONUS = 2  # Base hull + two upgrades = three hits per life.
+MAX_HEALTH_BONUS = 3  # Old save files could contain three capacity upgrades.
+LEGACY_MAX_DURABILITY_BONUS = 3
 BASE_MAX_LIVES = 5
 STARTING_LIVES = 3
-DURABILITY_REGEN_DELAY_MS = 15000
+DURABILITY_REGEN_DELAY_MS = 20000
 DURABILITY_REGEN_INTERVAL_MS = 2000
 DURABILITY_HIT_INVULN_MS = 450
 # Eligible discharges arc to a second foe if one is in range, then roll for
@@ -1403,6 +1422,9 @@ PLAYER_NAMES = ("", "", "", "")
 PLAYER_NAME_MAX_LENGTH = 16
 FIRE_INPUT_BUFFER_MS = 150
 EMERGENCY_WARP_SHIELD_MS = 1500
+MAX_WARP_CHARGES = 3
+REFLECTOR_CHARGES_PER_PICKUP = 3
+MAX_REFLECTOR_CHARGES = 9
 CRYO_SLOW_MS = 2000
 FROSTBITE_ENEMY_SPEED_MULTIPLIER = 0.35
 FROSTBITE_BOSS_SPEED_MULTIPLIER = 0.75
@@ -2413,11 +2435,11 @@ ENEMY_JOURNAL = (
     ("Devastator", "Late-game armored unit with a slow heavy shell that detonates into eight projectiles."),
     ("Echo", "Late-game edge fighter that sends paired aimed shots capable of bouncing twice off arena walls."),
     ("Sentinel", "Late-game support unit that starts with two shield charges and fires one careful aimed bolt."),
-    ("Boss", "One every fifth wave. Faster shots, tighter volleys and shorter recoveries; low hull health sharpens attacks. Orbs burst eight ways after 1.4s. Moving lasers warn for 1.5s, fire for 4.5s and pierce Durability. 25/50/75 are guardians; 100 is final."),
-    ("Iron Citadel", "Wave 25: 12 faster moves and shorter recovery. Gates warn, then laser the whole arena outside green for 1s. Twin Portcullis warns twice with opposite green shelters. Sweep adds aimed bolts. A 28% HP core break stuns for 3.5s. Every pilot earns Rapid Fire."),
-    ("Helix Matriarch", "Wave 50: 12 faster moves with shorter recovery, Woven Rings and Helix Scissors. Hunts use wider committed spreads; Prism Sweep shifts lanes with aimed follow-ups. All shots lock before the full tell. A 28% HP core break stuns for 3.5s. Every pilot earns Homing Shots."),
-    ("Tempest Archon", "Wave 75: 12 faster moves and shorter recovery. Gust Wall lasers everything outside green after its tell. Eye adds wider spreads; Lightning Grid shifts beams and adds aimed bolts. A 28% HP core break stuns for 3.5s. Every pilot earns Bullet Time."),
-    ("Eclipse Sovereign", "Final boss: 12 faster moves and shorter recovery, stepped Lunar Partition and paired Binary Corona. Gates and Black Horizon laser everything outside green after a full reachable tell. Hunts use wider spreads. A 28% HP core break stuns for 3.5s. Every pilot earns Emergency Warp."),
+    ("Boss", "One every fifth wave. Cluster bombs warn for 1.4s, then burst in two offset rings 0.5s apart; the second is faster. Weave through both. Moving lasers warn for 1.5s, fire for 4.5s and pierce Durability. Waves 25/50/75 are guardians; 100 is final."),
+    ("Iron Citadel", "Wave 25: 22 moves, including five new area and five new projectile attacks. Projectile breathers separate area moves. Green shelters protect against instant gate pulses; Twin Portcullis switches sides. A 34% HP core break stuns for 2.5s. Every pilot earns Rapid Fire."),
+    ("Helix Matriarch", "Wave 50: 22 moves, including five new area and five new projectile attacks. Beams, Woven Rings and Helix Scissors alternate with projectile relief. Shots lock before the tell. A 34% HP core break stuns for 2.5s. Every pilot earns Homing Shots."),
+    ("Tempest Archon", "Wave 75: 22 moves, including five new area and five new projectile attacks. Target pillars, crossbeams and storm fans force movement; projectile breathers prevent area spam. Green shelters block instant pulses. A 34% HP core break stuns for 2.5s. Every pilot earns Bullet Time."),
+    ("Eclipse Sovereign", "Final boss: 22 moves, including five new area and five new projectile attacks. Crossroads, lattices and faster salvos alternate with projectile relief. Enter green before exclusion pulses. A 34% HP core break stuns for 2.5s. Every pilot earns Emergency Warp."),
 )
 ENEMY_MUTATIONS = (
     (
@@ -2479,16 +2501,36 @@ POWERUP_TYPES = (
     "missile_swarm", "reflector", "chain_reaction", "revive",
 )
 # Utility pickups appear more often than powerful weapons and defensive fields.
-# Integer weights total 300; each permanent upgrade has weight three, or 1 in 100.
+# Weights total 600: Damage Up is 1 in 100; Durability is rarer at 1 in 200.
 POWERUP_SPAWN_WEIGHTS = {
-    "life": 12, "shield": 9, "rapid_fire": 9, "speed": 33,
-    "triple_shot": 9, "laser": 6, "magnet": 36, "bomb": 12,
-    "bullet_time": 6, "piercing": 15, "damage_up": 3, "health_up": 3, "homing": 12,
-    "lightning": 6, "score_boost": 42, "cryo": 9, "orbit_drones": 12,
-    "supply_beacon": 9, "gravity_well": 9, "emergency_warp": 9,
-    "nova_pulse": 4,     "missile_swarm": 9, "reflector": 12, "chain_reaction": 9, "revive": 8,
+    'life': 24,
+    'shield': 18,
+    'rapid_fire': 18,
+    'speed': 66,
+    'triple_shot': 18,
+    'laser': 12,
+    'magnet': 72,
+    'bomb': 24,
+    'bullet_time': 12,
+    'piercing': 30,
+    'damage_up': 6,
+    'health_up': 3,
+    'homing': 24,
+    'lightning': 12,
+    'score_boost': 81,
+    'cryo': 18,
+    'orbit_drones': 24,
+    'supply_beacon': 18,
+    'gravity_well': 18,
+    'emergency_warp': 18,
+    'nova_pulse': 8,
+    'missile_swarm': 18,
+    'reflector': 24,
+    'chain_reaction': 18,
+    'revive': 16,
 }
 RARE_POWERUP_CHANCE = POWERUP_SPAWN_WEIGHTS["damage_up"] / sum(POWERUP_SPAWN_WEIGHTS.values())
+DURABILITY_POWERUP_CHANCE = POWERUP_SPAWN_WEIGHTS["health_up"] / sum(POWERUP_SPAWN_WEIGHTS.values())
 COMMON_POWERUP_TYPES = tuple(powerup_type for powerup_type in POWERUP_TYPES
                              if powerup_type not in ("damage_up", "health_up"))
 POWERUP_COLORS = {
@@ -2603,18 +2645,18 @@ POWERUP_JOURNAL = (
     ("bullet_time", f"A {BULLET_TIME_RADIUS}-pixel field keeps ordinary shots at {BULLET_TIME_SLOWDOWN:.0%} speed; lasers and gates are unaffected. Each slowed shot grants Momentum, max {BULLET_TIME_MAX_STACKS}. Buff expiry or life loss clears stacks."),
     ("piercing", "Normal shots deal 2 base damage and can hit up to three different foes. Does not change bombs or lasers."),
     ("damage_up", f"1-in-100 pickup: +1 main-shot and drone damage for this run, up to +{MAX_DAMAGE_BONUS}. Other support shots stay fixed. Extras grant Double Score."),
-    ("health_up", f"1-in-100 pickup: +1 hit per life, max {MAX_DURABILITY_BONUS}. Repair starts after {DURABILITY_REGEN_DELAY_MS // 1000}s without damage, then 1 hit/{DURABILITY_REGEN_INTERVAL_MS // 1000}s. Boss lasers and gates pierce it. Does not add lives; extras grant Double Score."),
-    ("homing", "Shots and bombs steer toward foes. Lasers become one smooth piercing beam, curving through targets and continuing up to one arena beyond the screen. Off-axis laser hits deal 1 less damage. Lightning still requires its separate pickup."),
+    ("health_up", f"1-in-200 pickup: +1 hit per life, max {1 + MAX_DURABILITY_BONUS} total hits. Repair starts after {DURABILITY_REGEN_DELAY_MS // 1000}s without damage, then 1 hit/{DURABILITY_REGEN_INTERVAL_MS // 1000}s. Boss lasers and gates pierce it. Does not add lives; extras grant Double Score."),
+    ("homing", f"Shots and bombs steer toward foes. Lasers curve freely toward targets anywhere within one arena beyond the screen, without a forward turning limit. Their real path shares a cap of {HOMING_LASER_HITS_PER_SECOND} enemy hits per second per pilot, including Triple Shot and shield contacts. Off-axis laser hits deal 1 less damage. Lightning still requires its separate pickup."),
     ("lightning", f"Main shots, bombs and laser pulses arc for reduced damage. First hop needs a foe in range; later chances are {', '.join(f'{chance:.0%}' for chance in LIGHTNING_HOP_CHANCES[1:])}. Up to {1 + len(LIGHTNING_HOP_CHANCES)} foes total. Homing extends reach."),
     ("score_boost", "Doubles the score you earn from defeating enemies while active."),
     ("cryo", f"Hits slow regular foes 65% and bosses 25% for {CRYO_SLOW_MS // 1000}s. Kills grant Shatter: +{SHATTER_SPEED_PER_STACK:g} speed and +{SHATTER_FIRE_PER_STACK:.0%} fire per stack, max {SHATTER_MAX_STACKS}. Below full Momentum; bonuses do not add."),
     ("orbit_drones", f"Two helpers fire for {POWERUP_DURATIONS['orbit_drones'] // 1000}s. Shots match your weapon's base damage plus Damage Up, without blasts, heavy one-shot bonuses or fire-rate buffs."),
     ("supply_beacon", "Stores eight credited-kill charges. Ordinary kills get better drop odds; boss kills spend a charge too. Drop limits still apply."),
     ("gravity_well", f"A {POWERUP_DURATIONS['gravity_well'] // 1000}-second, {GRAVITY_FIELD_RADIUS}-pixel field gently bends ordinary moving hostile shots away. Lasers and energy gates are unaffected."),
-    ("emergency_warp", "Stored across waves and saves. After Reflector, warps only when a hit would cost a life. Nonlethal Durability hits keep the charge; lasers and gates count as lethal. Duplicates grant Double Score."),
+    ("emergency_warp", f"Adds one stored Warp, max {MAX_WARP_CHARGES}, across waves and saves. After Reflector, spends one only when a hit would cost a life. Nonlethal Durability hits keep charges; lasers/gates count as lethal. Pickups at the cap grant Double Score."),
     ("nova_pulse", "After 3-2-1, an expanding shock wave crosses the whole arena. At detonation, about 70% of visible regular foes are chosen and defeated through shields; at least one is spared when two or more are present. A lone foe has a 70% chance. Each boss takes at most 1 damage. Ordinary shots and mines in the wave clear; lasers and energy gates stay. Life loss cancels the charge. Rare pickup."),
     ("missile_swarm", "Stores up to six guided missiles. Each one-shots an unshielded regular foe; bosses take 1 damage. Shields block a hit; weapon buffs do not multiply the swarm."),
-    ("reflector", "Stores three blocks. Each damaging hit spends a block and returns a basic bolt toward the nearest foe."),
+    ("reflector", f"Adds {REFLECTOR_CHARGES_PER_PICKUP} stored blocks, max {MAX_REFLECTOR_CHARGES}. Each damaging hit spends one and returns a basic bolt toward the nearest foe. Partial stacks add; pickups at the cap grant Double Score."),
     ("chain_reaction", f"For {POWERUP_DURATIONS['chain_reaction'] // 1000} seconds, credited kills can send up to three shards at nearby visible foes. Support shots and Nova Pulse do not start bursts."),
     ("revive", "Multiplayer only: revives one randomly selected eliminated teammate with one life."),
 )
@@ -4541,6 +4583,14 @@ def enemy_is_visible(enemy):
     return enemy["rect"].bottom > GAMEPLAY_TOP
 
 
+def enemy_reveal_top(enemy):
+    """Topmost hull position through its local animation, not its lowest dip."""
+    top = enemy_invasion_y(enemy)
+    if enemy.get("type") in WEAVING_ENEMY_TYPES:
+        top -= abs(enemy.get("weave_y_amplitude", 0))
+    return top
+
+
 def enemy_movement_mode(enemy):
     """Only ordinary Hivemind ships can steer the shared formation."""
     kind = enemy.get("type")
@@ -4780,13 +4830,14 @@ def update_enemies(enemies, fleet_dx, enemy_dy, round_num, infinite_mode=False):
             move_enemy_down(enemy, descent)
             enemy["descent_remaining"] -= descent
 
-    # Without a visible enemy to fight, don't make players wait for an
-    # offscreen row to crawl down by a few pixels on each screen bounce.
-    # Only hidden enemies are accelerated; never teleport or reveal all at once.
-    if enemies and not any(enemy_is_visible(enemy) for enemy in enemies):
-        hidden = [enemy for enemy in enemies if not enemy_is_visible(enemy)]
-        for enemy in hidden:
-            distance = GAMEPLAY_TOP + 3 - enemy["rect"].bottom
+    # A few visible feet are not a revealed enemy. Keep bringing the incoming
+    # row down until a complete hull clears the top, without changing partial
+    # sprite rendering/hits or accelerating an already revealed formation.
+    reveal_y = GAMEPLAY_TOP + HIDDEN_ENEMY_REVEAL_MARGIN
+    if enemies and not any(enemy_is_visible(enemy) and enemy_reveal_top(enemy) >= reveal_y
+                           for enemy in enemies):
+        for enemy in enemies:
+            distance = reveal_y - enemy_reveal_top(enemy)
             if distance > 0:
                 move_enemy_down(enemy, min(HIDDEN_ENEMY_CATCHUP_SPEED * enemy_cryo_multiplier(enemy), distance))
 
@@ -5061,7 +5112,19 @@ def fire_boss_burst(enemy, enemy_bullets, target_positions, max_bullets, encount
 # GUARDIANS: plan -> warning -> release -> recovery is a small state machine.
 # The warning contains the exact eventual collision geometry. Do not re-aim it
 # while drawing or releasing: pilots need to trust the announced escape route.
-MILESTONE_STUN_FRAMES = 210
+MILESTONE_EXTRA_ATTACKS = {
+    "bulwark": {"area": ("citadel_lockdown", "iron_crossroads", "bastion_grid", "citadel_bisect", "pressure_vault"),
+                "projectile": ("cannon_barrage", "hammerfall_salvo", "bastion_pincer", "shrapnel_wheel", "iron_sweep")},
+    "helix": {"area": ("prism_lockdown", "helix_crossroads", "mirror_grid", "prism_bisect", "helix_vault"),
+              "projectile": ("spiral_barrage", "ribbon_salvo", "mirror_pincer", "prism_wheel", "helix_sweep")},
+    "tempest": {"area": ("storm_lockdown", "thunder_crossroads", "tempest_grid", "storm_bisect", "cyclone_vault"),
+                "projectile": ("thunder_barrage", "rainfall_salvo", "gust_pincer", "storm_wheel", "tempest_sweep")},
+    "eclipse": {"area": ("sovereign_lockdown", "shadow_crossroads", "eclipse_grid", "void_bisect", "umbra_vault"),
+                "projectile": ("void_barrage", "starfall_salvo", "shadow_pincer", "corona_wheel", "eclipse_sweep")},
+}
+
+
+MILESTONE_STUN_FRAMES = 150
 MILESTONE_SPEED_MULTIPLIER = 1.18
 # Mixed or layered formations keep a clear arena before and after their tell,
 # even when faster travel and shorter recovery tighten the encounter's pace.
@@ -5080,7 +5143,7 @@ def milestone_boss_phase(enemy):
 
 def milestone_stagger_threshold(enemy):
     """Break resistance rises with the guardian's maximum HP, so cores do not fill after a few hits."""
-    return max(18, round(enemy["max_hp"] * .28))
+    return max(18, round(enemy["max_hp"] * .34))
 
 
 def start_milestone_stagger(enemy):
@@ -5096,14 +5159,16 @@ def milestone_stagger_ratio(enemy):
 
 
 def milestone_attack_patterns(enemy):
-    """Return each guardian's twelve-move themed signature cycle in every phase."""
+    """Return all 22 themed moves; actual release pacing separates area attacks."""
     cycles = {
         "bulwark": ("gates", "hammer", "anvil", "siege", "barricade", "mortars", "breaker_wall", "fortress_fan", "crush_marks", "citadel_sweep", "portcullis", "bunker_lattice"),
         "helix": ("helix", "bloom", "braid", "orbit_break", "ribbon_split", "prism_sweep", "spiral_lane", "double_braid", "helix_hunt", "twin_burst", "woven_ring", "helix_scissors"),
         "tempest": ("channels", "crosswind", "thunder", "forked", "cyclone", "lightning_grid", "gust_wall", "eye_of_storm", "rain_marks", "tempest_spiral", "thunderhead", "rain_lanes"),
         "eclipse": ("eclipse_gates", "corona", "lances", "horizon", "hunt", "oblivion", "singularity", "shadow_cross", "eclipse_storm", "black_horizon", "lunar_partition", "binary_corona"),
     }
-    return cycles[enemy["milestone_kind"]]
+    extras = MILESTONE_EXTRA_ATTACKS[enemy["milestone_kind"]]
+    added = tuple(move for pair in zip(extras["area"], extras["projectile"]) for move in pair)
+    return cycles[enemy["milestone_kind"]] + added
 
 
 def milestone_front_separation(first_gap, second_gap, speed, thickness):
@@ -5148,6 +5213,137 @@ def milestone_exclusion_warning_frames(warning_frames, gap, targets):
     return warning_frames
 
 
+def milestone_beam_warning_frames(warning_frames, beams, targets):
+    """Allow normal keyboard movement out of the entire committed beam union."""
+    half_w, half_h = PLAYER_WIDTH / 2, PLAYER_HEIGHT / 2
+    forbidden = [(rect.left - half_w - 9, rect.top - half_h - 9,
+                  rect.right + half_w + 9, rect.bottom + half_h + 9) for rect in beams]
+    for px, py in targets:
+        xs, ys = {half_w, SCREEN_WIDTH - half_w, px}, {half_h + 2, SCREEN_HEIGHT - half_h, py}
+        for left, top, right, bottom in forbidden:
+            xs.update((left - 1, right + 1))
+            ys.update((top - 1, bottom + 1))
+        travel = []
+        for x in xs:
+            for y in ys:
+                if not (half_w <= x <= SCREEN_WIDTH - half_w and
+                        half_h + 2 <= y <= SCREEN_HEIGHT - half_h):
+                    continue
+                if any(left < x < right and top < y < bottom for left, top, right, bottom in forbidden):
+                    continue
+                dx, dy = abs(x - px), abs(y - py)
+                travel.append(max(dx, dy) + (math.sqrt(2) - 1) * min(dx, dy))
+        if not travel:
+            raise ValueError("Guardian beam layout has no ship-sized escape")
+        warning_frames = max(warning_frames, math.ceil(min(travel) / PLAYER_SPEED + 20))
+    return warning_frames
+
+
+def plan_extra_milestone_attack(enemy, pattern, phase, cycle, targets):
+    """Five area and five projectile families, themed and tuned per guardian.
+
+    Every area commits physical rectangles before its tell. Projectile families
+    use broad lanes or angled fans rather than tracking a pilot after launch.
+    """
+    kind = enemy["milestone_kind"]
+    families = MILESTONE_EXTRA_ATTACKS[kind]
+    style = ("bulwark", "helix", "tempest", "eclipse").index(kind)
+    area = pattern in families["area"]
+    index = families["area" if area else "projectile"].index(pattern)
+    color = enemy["color"]
+    ox, oy = enemy["rect"].midbottom
+    shots, beams, marks = [], [], []
+    gap = None
+    targets = targets or ((SCREEN_WIDTH / 2, SCREEN_HEIGHT - 48),)
+    boost = MILESTONE_SPEED_MULTIPLIER + .02 * (phase - 1)
+    speed = (6.6 + .24 * phase + .18 * style) * boost
+    width = 68 + 6 * phase + 4 * style
+    def vertical(x, w=width):
+        return pygame.Rect(max(0, min(SCREEN_WIDTH - w, round(x - w / 2))), GAMEPLAY_TOP,
+                           w, SCREEN_HEIGHT - GAMEPLAY_TOP)
+    def horizontal(y, h=40):
+        return pygame.Rect(0, max(GAMEPLAY_TOP, min(SCREEN_HEIGHT - h, round(y - h / 2))),
+                           SCREEN_WIDTH, h)
+    if area:
+        if index == 0:
+            for x, y in targets[:4]:
+                beams.append(vertical(x))
+                marks.append((x, y))
+        elif index == 1:
+            target_y = targets[cycle % len(targets)][1]
+            beams.extend((horizontal(target_y, 44 + 4 * phase),
+                          vertical(SCREEN_WIDTH * (.30 if cycle % 2 else .70))))
+        elif index == 2:
+            shift = (.025 if cycle % 2 else -.025) * SCREEN_WIDTH
+            beams.extend(vertical(SCREEN_WIDTH * f + shift, 42 + 4 * phase)
+                         for f in (.18, .50, .82))
+            beams.extend(horizontal(SCREEN_HEIGHT * f, 32 + 4 * phase) for f in (.38, .74))
+        elif index == 3:
+            x = round(SCREEN_WIDTH * (.28 if (cycle + style) % 2 else .72))
+            beams.append(vertical(x, 88 + 8 * phase))
+            beams.append(pygame.Rect(0, round(SCREEN_HEIGHT * .62), max(1, x - width), 40))
+            beams.append(pygame.Rect(min(SCREEN_WIDTH - 1, x + width), round(SCREEN_HEIGHT * .42),
+                                     max(1, SCREEN_WIDTH - x - width), 40))
+        else:
+            if (cycle + style) % 2:
+                h = min(220, max(160, round(SCREEN_HEIGHT * .22)))
+                top = round(SCREEN_HEIGHT * (.35 if cycle % 2 else .65) - h / 2)
+                gap = pygame.Rect(0, top, SCREEN_WIDTH, h)
+                beams = [pygame.Rect(0, GAMEPLAY_TOP, SCREEN_WIDTH, gap.top - GAMEPLAY_TOP),
+                         pygame.Rect(0, gap.bottom, SCREEN_WIDTH, SCREEN_HEIGHT - gap.bottom)]
+            else:
+                w = 220 - style * 8
+                center = SCREEN_WIDTH * (.30 if cycle % 2 else .70)
+                gap = pygame.Rect(round(center - w / 2), GAMEPLAY_TOP, w, SCREEN_HEIGHT - GAMEPLAY_TOP)
+                beams = [pygame.Rect(0, GAMEPLAY_TOP, gap.left, SCREEN_HEIGHT - GAMEPLAY_TOP),
+                         pygame.Rect(gap.right, GAMEPLAY_TOP, SCREEN_WIDTH - gap.right, SCREEN_HEIGHT - GAMEPLAY_TOP)]
+    else:
+        if index == 0:
+            for port, (tx, ty) in enumerate(targets[:4]):
+                x = ox + (port - (min(4, len(targets)) - 1) / 2) * 32
+                angle = math.atan2(ty - oy, tx - x)
+                marks.append((tx, ty))
+                for spread in (-.15 - style * .01, 0, .15 + style * .01):
+                    shots.append((x, oy, math.cos(angle + spread) * speed,
+                                  math.sin(angle + spread) * speed, 11, color))
+        elif index == 1:
+            for i in range(12):
+                x = SCREEN_WIDTH * (.06 + .88 * i / 11)
+                shots.append((x, oy, (-1 if i % 2 else 1) * (1.6 + .15 * style),
+                              speed * (.88 if i % 2 else 1), 12, color))
+        elif index == 2:
+            tx, ty = targets[cycle % len(targets)]
+            for fraction in (.08, .92):
+                x = SCREEN_WIDTH * fraction
+                heading = math.atan2(ty - oy, tx - x)
+                for spread in (-.18, -.06, .06, .18):
+                    shots.append((x, oy, math.cos(heading + spread) * speed,
+                                  math.sin(heading + spread) * speed, 12, color))
+        elif index == 3:
+            for i in range(18):
+                angle = math.tau * i / 18 + (cycle % 3) * math.pi / 27 + style * .035
+                shots.append((ox, oy, math.cos(angle) * speed * .86,
+                              math.sin(angle) * speed * .86, 10, color))
+        else:
+            tx, ty = targets[cycle % len(targets)]
+            heading = math.atan2(ty - oy, tx - ox)
+            for i in range(14):
+                angle = heading - .78 + 1.56 * i / 13
+                shots.append((ox, oy, math.cos(angle) * speed,
+                              math.sin(angle) * speed, 11, color))
+    warning = milestone_beam_warning_frames(BOSS_LASER_WARNING_FRAMES, beams, targets) if beams else BOSS_LASER_WARNING_FRAMES
+    if gap is not None:
+        warning = milestone_exclusion_warning_frames(warning, gap, targets)
+    return {"name": pattern.replace("_", " ").upper(), "pattern": pattern,
+            "shots": shots, "beams": beams, "walls": [], "safe_gap": gap,
+            "safe_gaps": [gap] if gap is not None else [], "wall_fronts": [],
+            "target_marks": marks, "exclusion_zone": gap is not None,
+            "active_frames": 60 if gap is not None else 90,
+            "sequence_stage": 0, "remaining_frames": warning, "warning_frames": warning,
+            "phase": phase, "area_attack": area, "is_breather": False,
+            "advance_signature": True}
+
+
 def plan_milestone_attack(enemy, target_positions=()):
     """Commit the whole signature before its tell; no tracking after the warning."""
     # signature_index chooses a move; complete passes through its roster vary
@@ -5167,6 +5363,9 @@ def plan_milestone_attack(enemy, target_positions=()):
     targets = tuple((max(PLAYER_WIDTH / 2, min(SCREEN_WIDTH - PLAYER_WIDTH / 2, x)),
                      max(PLAYER_HEIGHT / 2, min(SCREEN_HEIGHT - PLAYER_HEIGHT / 2, y)))
                     for x, y in target_positions)
+    extras = MILESTONE_EXTRA_ATTACKS[kind]
+    if pattern in extras["area"] or pattern in extras["projectile"]:
+        return plan_extra_milestone_attack(enemy, pattern, phase, cycle, targets)
     warning_frames = BOSS_LASER_WARNING_FRAMES
     exclusion_zone = False
     sequence_stage = 0
@@ -5513,11 +5712,14 @@ def plan_milestone_attack(enemy, target_positions=()):
     if safe_gaps:
         safe_gap = safe_gaps[0]
         warning_frames = milestone_exclusion_warning_frames(warning_frames, safe_gap, targets)
+    elif beams:
+        warning_frames = milestone_beam_warning_frames(warning_frames, beams, targets)
     return {"name": names[pattern], "pattern": pattern, "shots": shots,
             "beams": beams, "walls": walls, "safe_gap": safe_gap,
             "safe_gaps": safe_gaps, "wall_fronts": wall_fronts,
             "target_marks": target_marks,
-            "exclusion_zone": exclusion_zone, "active_frames": 60,
+            "exclusion_zone": exclusion_zone, "active_frames": 60 if exclusion_zone else BOSS_LASER_ACTIVE_FRAMES,
+            "area_attack": bool(beams or walls), "is_breather": False, "advance_signature": True,
             "sequence_stage": sequence_stage,
             "remaining_frames": warning_frames,
             "warning_frames": warning_frames, "phase": phase}
@@ -5552,6 +5754,7 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
         for x, y, dx, dy, size, color in warning["shots"]:
             projectile = create_enemy_projectile(x, y, dx, dy, size, color)
             projectile["milestone_signature"] = warning["pattern"]
+            projectile["milestone_area_attack"] = warning.get("area_attack", False)
             enemy_bullets.append(projectile)
         # One energy attack may use several rectangles. Share its hit history
         # so crossing between halves cannot spend another defense or life.
@@ -5559,9 +5762,7 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
         for rect in warning["beams"]:
             enemy_bullets.append({"rect": rect.copy(), "dx": 0, "dy": 0,
                                   "color": enemy["color"], "laser_state": "active",
-                                  "remaining_frames": (warning["active_frames"]
-                                                       if warning.get("exclusion_zone")
-                                                       else BOSS_LASER_ACTIVE_FRAMES) + 1,
+                                  "remaining_frames": warning.get("active_frames", BOSS_LASER_ACTIVE_FRAMES) + 1,
                                   "milestone_signature": warning["pattern"],
                                   "milestone_hit_players": wall_hit_players,
                                   "exclusion_zone": warning.get("exclusion_zone", False),
@@ -5584,16 +5785,20 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
                 projectile["wall_lifetime"] = BOSS_LASER_ACTIVE_FRAMES
             enemy_bullets.append(projectile)
         enemy["signature_warning"] = None
+        enemy["last_completed_area"] = warning.get("area_attack", bool(warning["beams"] or warning.get("walls")))
         if warning["pattern"] == "portcullis" and warning.get("sequence_stage", 0) == 0:
             enemy["portcullis_stage"] = 1
             enemy["portcullis_pending"] = True
             enemy["attack_cooldown"] = 0
         else:
-            enemy["signature_index"] = enemy.get("signature_index", 0) + 1
+            if warning.get("advance_signature", True):
+                enemy["signature_index"] = enemy.get("signature_index", 0) + 1
             enemy["portcullis_stage"] = 0
             enemy["portcullis_pending"] = False
-            enemy["attack_cooldown"] = max(84, 110 - warning["phase"] * 10
-                                           - (8 if enemy["milestone_kind"] == "eclipse" else 0))
+            enemy["attack_cooldown"] = max(78, 100 - warning["phase"] * 8
+                                           - (6 if enemy["milestone_kind"] == "eclipse" else 0))
+            if warning.get("area_attack"):
+                enemy["attack_cooldown"] += 24
         return
     # The beam and its escape lanes finish before the next warning can begin.
     if any(shot.get("laser_state") for shot in enemy_bullets):
@@ -5616,20 +5821,21 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
         return
     if enemy["attack_cooldown"] > 0:
         return
-    # Only the added layered signatures reserve a wholly clear arena. They
-    # cannot start on top of a previous formation or hide the following tell.
-    next_pattern = milestone_attack_patterns(enemy)[
-        enemy.get("signature_index", 0) % len(milestone_attack_patterns(enemy))]
-    if enemy_bullets and (next_pattern in MILESTONE_SOLO_PATTERNS
-                          or any(shot.get("milestone_signature") in MILESTONE_SOLO_PATTERNS
-                                 for shot in enemy_bullets)):
+    warning = plan_milestone_attack(enemy, target_positions)
+    if warning["area_attack"] and enemy.get("last_completed_area", False):
+        roster = milestone_attack_patterns(enemy)
+        breather = {"bulwark": "hammer", "helix": "helix", "tempest": "crosswind", "eclipse": "corona"}[enemy["milestone_kind"]]
+        preview = dict(enemy)
+        preview["signature_index"] = roster.index(breather)
+        warning = plan_milestone_attack(preview, target_positions)
+        warning.update(is_breather=True, advance_signature=False)
+    if enemy_bullets and (warning["area_attack"] or warning["pattern"] in MILESTONE_SOLO_PATTERNS
+            or any(shot.get("milestone_area_attack") or shot.get("milestone_signature") in MILESTONE_SOLO_PATTERNS
+                   for shot in enemy_bullets)):
         return
-    # Let previous waves disperse. There is no extra aimed/homing stream hiding
-    # behind the signature, even during the final boss's last phase.
     if len(enemy_bullets) > max_bullets // 3:
         enemy["attack_cooldown"] = 15
         return
-    warning = plan_milestone_attack(enemy, target_positions)
     enemy["signature_warning"] = warning
     enemy["attack_pattern"] = warning["pattern"]
     enemy["last_attack_pattern"] = warning["pattern"]
@@ -5637,37 +5843,58 @@ def update_milestone_boss_attack(enemy, enemy_bullets, max_bullets, target_posit
 
 # THREAT ART: these routines visualize committed hazards without moving them.
 # Keep decorative work bounded; full-arena effects also run on the native HUD layer.
-def draw_energy_flow(screen, rect, color, time_ms, *, horizontal=False, reverse=False):
-    """At most twelve clipped energy streaks; artwork never changes the hitbox."""
-    if (low_effects_mode() or not graphics_feature_enabled("animations")
-            or not graphics_feature_enabled("glow")):
+def draw_energy_flow(screen, rect, color, time_ms, *, horizontal=False, reverse=False,
+                     warning=False):
+    """Scroll broad energy ribbons over exact hazard geometry, without a canvas.
+
+    Laser motion is an independent readability cue, not a ship/glow effect.
+    Potato/adaptive modes keep two cheap bands instead of removing the cue.
+    The supplied clock freezes with pause; no artwork changes combat state.
+    """
+    if not graphics_feature_enabled("laser_motion"):
         return
     rect = pygame.Rect(rect)
-    clipped = rect.clip(screen.get_clip())
+    # Leave the true damage boundary and its existing outline unobscured.
+    interior = rect.inflate(-4, -4)
+    clipped = interior.clip(screen.get_clip())
     if not clipped.width or not clipped.height:
         return
-    length = rect.width if horizontal else rect.height
-    breadth = rect.height if horizontal else rect.width
-    lanes = min(3, max(1, breadth // 130))
-    bands = min(4, max(2, length // 180))
+    length = interior.width if horizontal else interior.height
+    breadth = interior.height if horizontal else interior.width
+    simple = low_effects_mode()
+    bands = 2 if simple or warning else 4
     step = max(1.0, length / bands)
-    travel = (time_ms * .25 * (-1 if reverse else 1)) % step
-    streak = max(8, min(40, round(step * .18)))
-    bright = blend_color(color, UI_TEXT, .6)
+    direction = -1 if reverse else 1
+    travel = (time_ms * (.12 if warning else .22) * direction) % step
+    band_length = max(4, round(step * (.18 if warning else .34)))
+    bend = min(28, max(2, band_length // 3))
+    alpha = 28 if warning else 84
+    bright = blend_color(color, UI_TEXT, .46)
+    fill = (*bright, alpha) if screen.get_flags() & pygame.SRCALPHA else bright
+    edge = (*UI_TEXT, 36 if warning else 96) if screen.get_flags() & pygame.SRCALPHA else UI_TEXT
     old_clip = screen.get_clip()
     screen.set_clip(clipped)
     try:
-        for lane in range(lanes):
-            cross = (lane + .5) * breadth / lanes
-            for band in range(bands):
-                along = band * step + travel
-                if horizontal:
-                    start = (round(rect.left + along), round(rect.top + cross))
-                    end = (start[0] + streak, start[1])
-                else:
-                    start = (round(rect.left + cross), round(rect.top + along))
-                    end = (start[0], start[1] + streak)
-                pygame.draw.line(screen, bright, start, end, 2 if breadth < 100 else 3)
+        # A wrapped leading ribbon gives seamless motion with at most five
+        # polygons and five edge lines (three of each in simple modes).
+        for band in range(-1, bands):
+            along = round(band * step + travel)
+            if horizontal:
+                x, y = interior.left + along, interior.top
+                points = ((x, y), (x + bend, y + breadth // 2), (x, y + breadth),
+                          (x + band_length, y + breadth),
+                          (x + band_length + bend, y + breadth // 2),
+                          (x + band_length, y))
+                edge_points = points[:3]
+            else:
+                x, y = interior.left, interior.top + along
+                points = ((x, y), (x + breadth // 2, y + bend), (x + breadth, y),
+                          (x + breadth, y + band_length),
+                          (x + breadth // 2, y + band_length + bend),
+                          (x, y + band_length))
+                edge_points = points[:3]
+            pygame.draw.polygon(screen, fill, points)
+            pygame.draw.lines(screen, edge, False, edge_points, 1 if warning else 2)
     finally:
         screen.set_clip(old_clip)
 
@@ -5771,13 +5998,14 @@ def draw_milestone_attack_warning(screen, enemy, show_label=True):
         return
     color = enemy["color"]
     animated = graphics_feature_enabled("animations") and not low_effects_mode()
-    elapsed = warning["warning_frames"] - warning["remaining_frames"] if animated else 0
+    elapsed = warning["warning_frames"] - warning["remaining_frames"]
     bright = blend_color(color, UI_TEXT, .3 + .2 * math.sin(elapsed * .2)) if animated else color
     for rect in warning["beams"]:
         pygame.draw.rect(screen, color, rect, 2)
         pygame.draw.line(screen, bright, rect.midtop, rect.midbottom, 1)
         draw_energy_flow(screen, rect, color, elapsed * (1000 / 60),
-                         horizontal=rect.width > rect.height and not warning.get("exclusion_zone"))
+                         horizontal=rect.width > rect.height and not warning.get("exclusion_zone"),
+                         warning=True)
     draw_milestone_wall_warning(screen, warning, color, bright, elapsed)
     for x, y in warning.get("target_marks", ()):
         center = (round(x), round(y))
@@ -5822,8 +6050,12 @@ def choose_powerup_type(players=None):
     can_revive = len(players or ()) > 1 and bool(eliminated)
     if not can_revive:
         available = [kind for kind in available if kind != "revive"]
+    weights = dict(POWERUP_SPAWN_WEIGHTS)
+    if not can_revive:
+        # Keep permanent-upgrade odds fixed when Revive cannot be selected.
+        weights["score_boost"] += weights["revive"]
     return random.choices(
-        available, weights=[POWERUP_SPAWN_WEIGHTS[kind] for kind in available], k=1,
+        available, weights=[weights[kind] for kind in available], k=1,
     )[0]
 
 
@@ -5947,6 +6179,38 @@ def migrate_legacy_health_state(pilot):
         pilot.setdefault("durability_bonus", pilot.pop("health_bonus"))
         if "lives" in pilot:
             pilot["lives"] = min(BASE_MAX_LIVES, pilot["lives"])
+    pilot["durability_bonus"] = min(MAX_DURABILITY_BONUS, max(0, pilot.get("durability_bonus", 0)))
+    if "durability_damage" in pilot:
+        pilot["durability_damage"] = min(pilot["durability_bonus"], max(0, pilot["durability_damage"]))
+    return pilot
+
+
+def warp_charge_count(player):
+    """Read stored Warps, accepting the old ready flag on legacy/live callers.
+
+    Production writes keep both fields aligned. The fallback also supports
+    older extensions that still set ``warp_ready`` on a fresh pilot directly.
+    Saved data uses its explicit count when present, including an empty stack.
+    """
+    count = player.get("warp_charges", 0)
+    if type(count) is int and count > 0:
+        return min(MAX_WARP_CHARGES, count)
+    return 1 if player.get("warp_ready", False) is True else 0
+
+
+def set_warp_charges(player, count):
+    """Keep the canonical count and backward-compatible ready flag together."""
+    if type(count) is not int:
+        raise ValueError("Warp charges must be an integer count.")
+    count = max(0, min(MAX_WARP_CHARGES, count))
+    player["warp_charges"] = count
+    player["warp_ready"] = count > 0
+
+
+def migrate_saved_defense_state(pilot):
+    """Old boolean-only snapshots contain either zero or one stored Warp."""
+    count = pilot.get("warp_charges", 1 if pilot.get("warp_ready", False) else 0)
+    set_warp_charges(pilot, count)
     return pilot
 
 
@@ -5963,8 +6227,8 @@ def grant_powerup(player, powerup_type, enemy_bullets=None, team_players=None):
         powerup_type = "score_boost"
     if powerup_type == "health_up" and player.get("durability_bonus", 0) >= MAX_DURABILITY_BONUS:
         powerup_type = "score_boost"
-    if ((powerup_type == "emergency_warp" and player.get("warp_ready", False))
-            or (powerup_type == "reflector" and player.get("reflector_charges", 0) >= 3)
+    if ((powerup_type == "emergency_warp" and warp_charge_count(player) >= MAX_WARP_CHARGES)
+            or (powerup_type == "reflector" and player.get("reflector_charges", 0) >= MAX_REFLECTOR_CHARGES)
             or (powerup_type == "supply_beacon" and player.get("supply_kills_left", 0) >= 8)):
         powerup_type = "score_boost"
     duration = POWERUP_DURATIONS.get(powerup_type, 0)
@@ -5998,9 +6262,10 @@ def grant_powerup(player, powerup_type, enemy_bullets=None, team_players=None):
     elif powerup_type == "health_up":
         player["durability_bonus"] = player.get("durability_bonus", 0) + 1
     elif powerup_type == "emergency_warp":
-        player["warp_ready"] = True
+        set_warp_charges(player, warp_charge_count(player) + 1)
     elif powerup_type == "reflector":
-        player["reflector_charges"] = 3
+        player["reflector_charges"] = min(MAX_REFLECTOR_CHARGES,
+            player.get("reflector_charges", 0) + REFLECTOR_CHARGES_PER_PICKUP)
     elif powerup_type == "supply_beacon":
         player["supply_kills_left"] = 8
     elif powerup_type == "nova_pulse":
@@ -6285,6 +6550,45 @@ def sync_boss_laser_attachment(beam):
     beam["x"], beam["y"] = float(rect.x), float(rect.y)
 
 
+def release_boss_cluster(orb, enemy_bullets, max_bullets, particles=None):
+    """Release one committed ring, reserving a harmless core for its echo.
+
+    Both rings are spread evenly even when room is limited. The charge marker
+    counts against the ordinary budget and never waits for free slots: its
+    timer finishes once, releasing only what fits. Normal enemy shells keep
+    their separate single-burst behavior below.
+    """
+    enemy_bullets.remove(orb)
+    center_x, center_y = orb["rect"].center
+    stage = orb.get("boss_bomb_stage", 0)
+    heading = orb.get("boss_bomb_heading", math.atan2(orb.get("dy", 1), orb.get("dx", 0)))
+    planned = orb.get("cluster_ring_count", min(HEAVY_ORB_CLUSTER_SPOKES, max_bullets // 2))
+    available = max(0, max_bullets - len(enemy_bullets))
+    reserve = 1 if stage == 0 and available else 0
+    emitted = min(planned, max(0, available - reserve))
+    phase = math.pi / max(1, planned) if stage else 0
+    speed = HEAVY_ORB_FRAGMENT_SPEEDS[stage] * orb.get("burst_speed_multiplier", 1.0)
+    for index in range(emitted):
+        angle = heading + phase + math.tau * index / emitted
+        child = create_enemy_projectile(center_x, center_y, math.cos(angle) * speed,
+                                        math.sin(angle) * speed, 9, orb["color"])
+        child.update(orb_fragment=True, boss_bomb_stage=stage,
+                     lifetime=HEAVY_ORB_FRAGMENT_LIFETIME)
+        enemy_bullets.append(child)
+    if reserve:
+        core = create_enemy_projectile(center_x, center_y, 0, 0, 18, orb["color"])
+        core.update(heavy_orb=True, boss_cluster=True, boss_bomb_echo=True,
+                    boss_bomb_stage=1, boss_bomb_heading=heading,
+                    cluster_ring_count=planned, split_count=planned,
+                    split_timer=HEAVY_ORB_ECHO_FRAMES,
+                    orb_fuse_frames=HEAVY_ORB_ECHO_FRAMES,
+                    burst_speed_multiplier=orb.get("burst_speed_multiplier", 1.0),
+                    laser_state="warning", remaining_frames=HEAVY_ORB_ECHO_FRAMES)
+        enemy_bullets.append(core)
+    if particles is not None:
+        spawn_pop_particles(center_x, center_y, orb["color"], particles)
+
+
 def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), players=(), particles=None, round_num=1):
     """Run one 60 Hz hostile tick: support, emission, then projectile lifecycles.
 
@@ -6480,9 +6784,10 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
                         rotated_y = velocity_x * math.sin(spread) + velocity_y * math.cos(spread)
                         shots.append((origin_x, origin_y, rotated_x, rotated_y, 11, enemy["color"]))
                 elif pattern == "heavy_orb":
-                    shots = [(origin_x, origin_y, velocity_x, velocity_y, 28, enemy["color"],
+                    shots = [(origin_x, origin_y, velocity_x, velocity_y, 32, enemy["color"],
                               {"heavy_orb": True, "split_timer": HEAVY_ORB_FUSE_FRAMES,
                                "split_count": HEAVY_ORB_BURST_COUNT,
+                               "boss_cluster": True, "boss_bomb_stage": 0,
                                "orb_fuse_frames": HEAVY_ORB_FUSE_FRAMES})]
                 elif pattern == "triple_burst":
                     shots = []
@@ -6862,7 +7167,13 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
                     collect_bullet_momentum(bullet, player, now, particles)
                 # Other pilots in overlapping fields also earn a charge.
 
-        if "laser_state" in bullet:
+        if bullet.get("orb_fragment") and "lifetime" in bullet:
+            bullet["lifetime"] -= 1
+            if bullet["lifetime"] <= 0:
+                enemy_bullets.remove(bullet)
+                continue
+
+        if "laser_state" in bullet and not bullet.get("boss_bomb_echo"):
             owner = bullet.get("laser_owner")
             if owner is not None:
                 # The emitter owns both its harmless tell and live beam. A
@@ -6886,6 +7197,9 @@ def update_enemy_projectiles(enemies, enemy_bullets, target_positions=(), player
         if "split_timer" in bullet:
             bullet["split_timer"] -= 1
             if bullet["split_timer"] <= 0:
+                if bullet.get("boss_cluster"):
+                    release_boss_cluster(bullet, enemy_bullets, max_bullets, particles)
+                    continue
                 center_x = bullet["rect"].centerx
                 center_y = bullet["rect"].centery
                 split_count = bullet["split_count"]
@@ -6998,57 +7312,89 @@ def player_projectile_bounds():
 
 
 def build_player_laser_path(beam, guides=()):
-    """One smooth upward ray, continuing beyond its guides to the world boundary.
+    """Join targets in any direction with one bounded, smooth physical beam.
 
-    Each join has zero slope/curvature, unlike the old jittering side connector.
-    A bounded number of samples and guides keeps four-pilot scenes inexpensive.
+    Cubic handles share tangent directions at targets, including U-turns. The
+    ray leaves the muzzle upward and continues to the extended top edge;
+    neither target selection nor collision assumes monotonic height.
     """
     bounds = player_projectile_bounds()
     x0, y0 = beam["rect"].midbottom
     if not beam.get("homing") or not guides:
         return ((x0, y0), (x0, bounds.top))
-    anchors = [(float(x0), float(y0))]
-    for enemy in guides:
-        tx, ty = enemy["rect"].center
-        tx = max(bounds.left, min(bounds.right - 1, tx))
-        ty = max(bounds.top, ty)
-        if ty < anchors[-1][1] - 8:
-            anchors.append((float(tx), float(ty)))
-    anchors.append((anchors[-1][0], float(bounds.top)))
-    lengths = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(anchors, anchors[1:])]
-    total = max(1, sum(lengths))
-    budget = min(LASER_PATH_SEGMENTS, max(2, math.ceil(total / 18)))
-    points = [(x0, y0)]
-    for (ax, ay), (bx, by), length in zip(anchors, anchors[1:], lengths):
-        steps = max(1, math.ceil(budget * length / total))
-        for index in range(1, steps + 1):
-            t = index / steps
-            ease = t * t * t * (t * (t * 6 - 15) + 10)
-            point = (round(ax + (bx - ax) * ease), round(ay + (by - ay) * t))
-            if points[-1] != point:
-                points.append(point)
 
+    def bounded(point):
+        return (max(bounds.left, min(bounds.right - 1, point[0])),
+                max(bounds.top, min(bounds.bottom - 1, point[1])))
+
+    def unit(dx, dy, fallback=(0.0, -1.0)):
+        length = math.hypot(dx, dy)
+        return (dx / length, dy / length) if length > .001 else fallback
+
+    anchors = [bounded((float(x0), float(y0)))]
+    for enemy in guides[:LASER_GUIDE_LIMIT]:
+        point = bounded(enemy["rect"].center)
+        if math.dist(anchors[-1], point) >= 1:
+            anchors.append(point)
+    anchors.append((anchors[-1][0], float(bounds.top)))
+    tangents = [(0.0, -1.0)]
+    for index in range(1, len(anchors) - 1):
+        before, here, after = anchors[index - 1:index + 2]
+        incoming = unit(here[0] - before[0], here[1] - before[1])
+        outgoing = unit(after[0] - here[0], after[1] - here[1])
+        if incoming[0] * outgoing[0] + incoming[1] * outgoing[1] < -.85:
+            # Round a reversal instead of retracing a sharp straight connector.
+            tangents.append((-incoming[1], incoming[0]))
+        else:
+            tangents.append(unit(incoming[0] + outgoing[0], incoming[1] + outgoing[1], outgoing))
+    tangents.append((0.0, -1.0))
+    curves, lengths = [], []
+    for index, (a, b) in enumerate(zip(anchors, anchors[1:])):
+        handle = math.dist(a, b) / 3
+        first = bounded((a[0] + tangents[index][0] * handle,
+                         a[1] + tangents[index][1] * handle))
+        second = bounded((b[0] - tangents[index + 1][0] * handle,
+                          b[1] - tangents[index + 1][1] * handle))
+        curves.append((a, first, second, b))
+        lengths.append(math.dist(a, first) + math.dist(first, second) + math.dist(second, b))
+    total = max(1, sum(lengths))
+    budget = min(LASER_PATH_SEGMENTS, max(2 * len(curves), math.ceil(total / 18)))
+    spare = budget - 2 * len(curves)
+    fractions = [spare * length / total for length in lengths]
+    steps = [2 + math.floor(value) for value in fractions]
+    remainders = sorted(range(len(steps)), key=lambda i: fractions[i] % 1, reverse=True)
+    for index in remainders[:budget - sum(steps)]:
+        steps[index] += 1
+    points = [(round(anchors[0][0]), round(anchors[0][1]))]
+    for (a, first, second, b), count in zip(curves, steps):
+        for index in range(1, count + 1):
+            t = index / count
+            s = 1 - t
+            points.append((round(s ** 3 * a[0] + 3 * s * s * t * first[0]
+                                 + 3 * s * t * t * second[0] + t ** 3 * b[0]),
+                           round(s ** 3 * a[1] + 3 * s * s * t * first[1]
+                                 + 3 * s * t * t * second[1] + t ** 3 * b[1])))
     return tuple(points)
 
 
 def laser_path_grid(points, width):
-    """Occupied cells for broad-phase hits; exact hits use the monotonic path."""
-    cells = set()
+    """Index segment IDs by occupied cells, valid for tight turns and loops."""
+    cells = {}
     radius = max(1, math.ceil(width / 2))
-    for a, b in zip(points, points[1:]):
+    for index, (a, b) in enumerate(zip(points, points[1:])):
         left, right = min(a[0], b[0]) - radius, max(a[0], b[0]) + radius
         top, bottom = min(a[1], b[1]) - radius, max(a[1], b[1]) + radius
         for gy in range(top // LASER_GRID_SIZE, bottom // LASER_GRID_SIZE + 1):
             for gx in range(left // LASER_GRID_SIZE, right // LASER_GRID_SIZE + 1):
-                cells.add((gx, gy))
-    return frozenset(cells)
+                cells.setdefault((gx, gy), set()).add(index)
+    return {cell: tuple(indices) for cell, indices in cells.items()}
 
 
 def store_player_laser_path(beam, points):
-    """Cache a path and its invalidation keys; only damage pulses need a grid."""
+    """Cache the real path; only damage pulses need its segment/cell index."""
     beam["laser_path"] = points
-    # Rays travel upward, so negating Y creates an ascending sequence for bisect.
-    beam["laser_path_ys"] = tuple(-point[1] for point in points)
+    # Arbitrary turns invalidate the old upward-only Y-bisect optimization.
+    beam.pop("laser_path_ys", None)
     beam["laser_segment_grid"] = (laser_path_grid(points, beam["rect"].width)
                                   if beam.get("damage_ready", False) else None)
     beam["laser_path_anchor"] = beam["rect"].midbottom
@@ -7084,23 +7430,17 @@ def laser_geometry(beam):
 
 
 def laser_hits_rect(beam, rect):
-    """Test the actual curved beam width, not its target ID or straight anchor."""
+    """Test the actual curved beam width, never target identity or its anchor."""
     if (rect.right <= -SCREEN_WIDTH or rect.left >= SCREEN_WIDTH * 2
             or rect.bottom <= -SCREEN_HEIGHT or rect.top >= SCREEN_HEIGHT * 2):
         return False
-    points = player_laser_points(beam)
-    levels = (beam["laser_path_ys"] if points is beam.get("laser_path")
-              else tuple(-point[1] for point in points))
-    radius = math.ceil(beam["rect"].width / 2)
-    # Restrict exact segment/rectangle tests to this enemy's vertical slice.
-    # The broad-phase grid finds nearby foes; it is not a damage decision.
-    first = max(0, bisect_left(levels, -rect.bottom - radius) - 1)
-    last = min(len(points) - 2, bisect_right(levels, -rect.top + radius))
-    if first > last:
-        return False
+    points, grid = laser_geometry(beam)
+    indices = set()
+    for gy in range(rect.top // LASER_GRID_SIZE, rect.bottom // LASER_GRID_SIZE + 1):
+        for gx in range(rect.left // LASER_GRID_SIZE, rect.right // LASER_GRID_SIZE + 1):
+            indices.update(grid.get((gx, gy), ()))
     padded = rect.inflate(beam["rect"].width, beam["rect"].width)
-    return any(padded.clipline(points[index], points[index + 1])
-               for index in range(first, last + 1))
+    return any(padded.clipline(points[index], points[index + 1]) for index in indices)
 
 
 def laser_enemy_candidates(beam, enemy_grid):
@@ -7116,11 +7456,10 @@ def laser_enemy_candidates(beam, enemy_grid):
 
 
 def assign_laser_homing_targets(beams, enemies, player):
-    """Guide complete rays through successive live foes, including incoming rows."""
+    """Guide complete rays through live foes anywhere in the extended arena."""
     bounds = player_projectile_bounds()
     available = [enemy for enemy in enemies if enemy.get("hp", 0) > 0
-                 and bounds.colliderect(enemy["rect"])
-                 and enemy["rect"].centery < player["y"] - 8]
+                 and bounds.colliderect(enemy["rect"])]
     available_ids = {id(enemy) for enemy in available}
     pool = None
     claimed = set()
@@ -7131,29 +7470,21 @@ def assign_laser_homing_targets(beams, enemies, player):
                    or beam.get("laser_path_world") != (SCREEN_WIDTH, SCREEN_HEIGHT)
                    or beam.get("laser_path_homing") != bool(beam.get("homing"))
                    or any(id(enemy) not in available_ids for enemy in previous))
-        if previous and (previous[0]["rect"].centery >= y - 40
-                         or abs(previous[0]["rect"].centerx - x)
-                         > 32 + .75 * (y - previous[0]["rect"].centery)):
-            refresh = True
         guides = [] if refresh else list(previous)
         seen = set()
         if beam.get("homing") and refresh:
             if pool is None:
                 pool = sorted(available, key=lambda enemy:
-                              abs(enemy["rect"].centerx - (player["x"] + PLAYER_WIDTH / 2))
-                              + .35 * (player["y"] - enemy["rect"].centery))[:LASER_TARGET_POOL]
+                              math.dist((player["x"] + PLAYER_WIDTH / 2, player["y"]),
+                                        enemy["rect"].center))[:LASER_TARGET_POOL]
             for _ in range(LASER_GUIDE_LIMIT):
-                choices = [enemy for enemy in pool if id(enemy) not in seen
-                           and enemy["rect"].centery < y - 40
-                           and abs(enemy["rect"].centerx - x)
-                           <= 32 + .75 * (y - enemy["rect"].centery)]
+                choices = [enemy for enemy in pool if id(enemy) not in seen]
                 if not choices:
                     break
                 if not guides:
                     distinct = [enemy for enemy in choices if id(enemy) not in claimed]
                     choices = distinct or choices
-                target = min(choices, key=lambda enemy:
-                             abs(enemy["rect"].centerx - x) + .35 * (y - enemy["rect"].centery))
+                target = min(choices, key=lambda enemy: math.dist((x, y), enemy["rect"].center))
                 guides.append(target)
                 seen.add(id(target))
                 x, y = target["rect"].center
@@ -7765,9 +8096,10 @@ def grant_milestone_rewards(players, reward, enemy_bullets, particles):
     """Every pilot earns a guardian reward; no race for a falling pickup."""
     now = pygame.time.get_ticks()
     for player in players:
-        # A stored Warp cannot stack. Match ordinary pickup overflow behavior
-        # and clearly name the actual fallback awarded to an already charged pilot.
-        actual = "score_boost" if reward == "emergency_warp" and player.get("warp_ready") else reward
+        # Guardian rewards fill the same bounded stack as ordinary pickups.
+        # Only a completely full stack converts its reward to Double Score.
+        actual = ("score_boost" if reward == "emergency_warp"
+                  and warp_charge_count(player) >= MAX_WARP_CHARGES else reward)
         grant_powerup(player, reward, enemy_bullets)
         player["powerup_notice"] = f"GUARDIAN REWARD: {POWERUP_LABELS[actual]}"
         player["powerup_notice_until"] = now + 3000
@@ -7843,13 +8175,38 @@ def powerup_impact_damage(bullet, enemy, base_damage):
     return base_damage
 
 
+def consume_homing_laser_hit(state, now):
+    """Spend one of a pilot's rolling hit slots, shared by all three beams.
+
+    The history is transient combat state, not a saved resource. Main rebases
+    these timestamps while paused so waiting in a menu cannot refill a salvo.
+    Shield contacts count as pierces; target selection alone never spends one.
+    """
+    history = state.setdefault("homing_laser_hit_times", [])
+    history[:] = [stamp for stamp in history if stamp > now - 1000]
+    if len(history) >= HOMING_LASER_HITS_PER_SECOND:
+        return False
+    history.append(now)
+    return True
+
+
 def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bullets, powerups, players):
     """Uniform collision rules for normal/piercing/bomb/laser + Lightning."""
     # All weapon types converge on damage_enemy()/finish_defeated_enemy().
     # Avoid awarding score/drops directly in a branch: splashes, arcs and
     # splitters can otherwise process the same defeated foe more than once.
     audio = ensure_audio_manager()
+    now = pygame.time.get_ticks()
     player_colors = {player["number"]: player["color"] for player in players}
+    laser_hit_states = {player["number"]: player for player in players}
+    # Small standalone callers can construct beams without a pilot dictionary;
+    # keep their fallback history shared by owner too, never one pool per lane.
+    for beam in player_bullets:
+        if isinstance(beam, dict) and beam.get("type") == "laser" and beam.get("homing"):
+            state = laser_hit_states.setdefault(beam.get("owner"), beam)
+            if state is not beam and beam.get("owner") not in player_colors:
+                beam["homing_laser_hit_times"] = state.setdefault("homing_laser_hit_times", [])
+    deferred_laser_arcs = []
     # Entity dictionaries are large. Searching the list by dictionary equality
     # inside every shot/target pair made even missed shots cost O(shots*ships^2).
     # Refresh identities after hit effects, which can remove chain targets or
@@ -7938,6 +8295,10 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
                 key = (bullet.get("owner"), id(enemy))
                 if key in laser_boss_hits:
                     continue
+            if (kind == "laser" and bullet.get("homing")
+                    and not consume_homing_laser_hit(laser_hit_states[bullet.get("owner")], now)):
+                break
+            if kind == "laser" and enemy.get("is_boss", False):
                 laser_boss_hits.add(key)
                 damage = laser_boss_damage[key]
             damage = powerup_impact_damage(bullet, enemy, damage)
@@ -7949,10 +8310,15 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
                 enemy["no_chain_reaction"] = True
             spawn_pop_particles(*enemy["rect"].center if kind == "laser" else rect.center,
                                 color, particles)
-            lightning_chain(bullet, enemy, enemies, players, powerups,
-                            enemy_bullets, particles,
-                            laser_boss_reserved=laser_boss_damage if kind == "laser" else (),
-                            laser_boss_hits=laser_boss_hits if kind == "laser" else None)
+            if kind == "laser":
+                # Resolve main beams first: an exhausted Homing budget must
+                # not reserve a boss hit that never happened, blocking the
+                # independent Lightning pickup's reduced-damage hop.
+                if bullet.get("lightning"):
+                    deferred_laser_arcs.append((bullet, enemy))
+            else:
+                lightning_chain(bullet, enemy, enemies, players, powerups,
+                                enemy_bullets, particles)
             finish_defeated_enemy(enemy, enemies, players, powerups,
                                   enemy_bullets, particles)
             active_enemy_ids = {id(remaining) for remaining in enemies}
@@ -7970,6 +8336,10 @@ def check_player_bullet_collisions(player_bullets, enemies, particles, enemy_bul
             if bullet in player_bullets:
                 player_bullets.remove(bullet)
             break
+    for beam, origin in deferred_laser_arcs:
+        lightning_chain(beam, origin, enemies, players, powerups, enemy_bullets,
+                        particles, laser_boss_reserved=laser_boss_hits,
+                        laser_boss_hits=laser_boss_hits)
 
 
 # Menu and HUD drawing share widgets, but the frontmost modal alone owns hover.
@@ -9129,6 +9499,7 @@ def create_player_states(player_count, player_sprites):
             "durability_regen_until": 0,
             "durability_invuln_until": 0,
             "warp_ready": False,
+            "warp_charges": 0,
             "reflector_charges": 0,
             "supply_kills_left": 0,
             "cryo_until": 0,
@@ -9898,7 +10269,7 @@ def draw_boss_laser_warning(screen, bullet, now):
     if not _POTATO_MODE and graphics_feature_enabled("glow"):
         progress = 1 - min(1.0, remaining / bullet.get("warning_frames", BOSS_LASER_WARNING_FRAMES))
         pulse = ((math.sin(now / 70) + 1) / 2
-                 if graphics_feature_enabled("animations") else 0)
+                 if graphics_feature_enabled("laser_motion") else 0)
         pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"],
                                             .13 + .16 * progress + .07 * pulse), rect)
     pygame.draw.rect(screen, UI_GOLD, rect, 2)
@@ -9911,6 +10282,7 @@ def draw_boss_laser_warning(screen, bullet, now):
             pygame.draw.lines(screen, UI_GOLD, False,
                               [(edge_x - side * 5, y - 4), (edge_x, y),
                                (edge_x - side * 5, y + 4)], 2)
+    draw_energy_flow(screen, rect, bullet["color"], now, warning=True)
     warning_text = f"LASER {remaining / 60:.1f}s / PIERCES DURABILITY"
     label = cached_ui_text(hud_font(24), warning_text, UI_GOLD)
     label_rect = label.get_rect(midtop=(rect.centerx, rect.top + 18))
@@ -9928,7 +10300,7 @@ def powerup_hud_entries(player, now):
             seconds = max(1, math.ceil((until - now) / 1000))
             entries.append((key, f"{POWERUP_TIMER_LABELS[key]} {seconds}s", POWERUP_COLORS[key]))
     for key, value, label in (
-        ("emergency_warp", player.get("warp_ready", False), "WARP READY"),
+        ("emergency_warp", warp_charge_count(player), f"WARP x{warp_charge_count(player)}"),
         ("reflector", player.get("reflector_charges", 0), f"REFLECT {player.get('reflector_charges', 0)}"),
         ("supply_beacon", player.get("supply_kills_left", 0), f"SUPPLY {player.get('supply_kills_left', 0)}"),
         ("missile_swarm", player.get("pending_missiles", False), "MISSILES READY"),
@@ -9993,7 +10365,7 @@ def compact_powerup_label(key, text):
     if key == "momentum":
         return text.replace("MOMENTUM", "MOM")
     if key == "emergency_warp":
-        return "WARP READY"
+        return text
     if key == "missile_swarm":
         return "MISSILES"
     return text
@@ -10216,11 +10588,14 @@ def draw_support_powerups(screen, player, now):
         pygame.draw.lines(effects, color("chain_reaction", 110), False, points, 1)
         for position in points:
             pygame.draw.circle(effects, color("chain_reaction", 145), position, 2, 1)
-    if player.get("warp_ready", False):
+    if warp_charge_count(player):
         pygame.draw.arc(effects, color("emergency_warp", 110),
                         pygame.Rect(cx - 23, cy - 31, 46, 62), 0.1, 1.2, 1)
         pygame.draw.arc(effects, color("emergency_warp", 110),
                         pygame.Rect(cx - 23, cy - 31, 46, 62), math.pi + 0.1, math.pi + 1.2, 1)
+    # The HUD gives the exact stack; keep decorative satellite work bounded.
+    # Cosmetic markers stay bounded even with nine blocks; the HUD shows the
+    # exact stored count rather than adding more effects around the ship.
     for index in range(min(3, player.get("reflector_charges", 0))):
         angle = -math.pi / 2 + (index - 1) * 0.55
         x, y = point(angle, 26)
@@ -10551,7 +10926,7 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
             draw_energy_flow(screen, rect, bullet["color"], now,
                              horizontal=abs(bullet.get("dx", 0)) > abs(bullet.get("dy", 0)),
                              reverse=(bullet.get("dx", 0) < 0 or bullet.get("dy", 0) < 0))
-        elif bullet.get("laser_state") == "warning":
+        elif bullet.get("laser_state") == "warning" and not bullet.get("boss_bomb_echo"):
             draw_boss_laser_warning(screen, bullet, now)
         elif bullet.get("laser_state") == "active":
             rect = bullet["rect"]
@@ -10568,7 +10943,7 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
                 remaining = max(0, bullet.get("remaining_frames", 0))
                 fade = min(1.0, remaining / 24.0)
                 pulse = ((math.sin(now / 55.0) + 1.0) / 2.0
-                         if graphics_feature_enabled("animations") else 0)
+                         if graphics_feature_enabled("laser_motion") else 0)
                 pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"],
                                                     (.42 + .08 * pulse) * fade), rect)
                 core_width = max(6, round(rect.width * (0.18 + 0.025 * pulse)))
@@ -10604,14 +10979,25 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
             pygame.draw.circle(screen, bullet["color"], center, radius)
             pygame.draw.circle(screen, color, center, radius + 3 + round(2 * pulse), 2)
             pygame.draw.circle(screen, UI_TEXT, center, max(2, radius // 3))
-            lit = max(1, math.ceil(HEAVY_ORB_BURST_COUNT * remaining / total))
+            spokes = (HEAVY_ORB_CLUSTER_SPOKES if bullet.get("boss_cluster")
+                      else HEAVY_ORB_BURST_COUNT)
+            lit = max(1, math.ceil(spokes * remaining / total))
             for index in range(lit):
-                angle = -math.pi / 2 + index * math.tau / HEAVY_ORB_BURST_COUNT
+                angle = -math.pi / 2 + index * math.tau / spokes
                 start = (round(center[0] + math.cos(angle) * (radius + 6)),
                          round(center[1] + math.sin(angle) * (radius + 6)))
                 end = (round(center[0] + math.cos(angle) * (radius + 10)),
                        round(center[1] + math.sin(angle) * (radius + 10)))
                 pygame.draw.line(screen, color, start, end, 2)
+            if bullet.get("boss_cluster"):
+                # Two orbit rails mark the boss's extra pulse. The echo keeps
+                # one rail and a shrinking ring, never a hidden damage radius.
+                rails = 1 if bullet.get("boss_bomb_echo") else 2
+                for index in range(rails):
+                    pygame.draw.circle(screen, bullet["color"], center,
+                                       radius + 13 + index * 4, 1)
+                charge_radius = radius + 4 + round(8 * remaining / total)
+                pygame.draw.circle(screen, UI_TEXT, center, charge_radius, 1)
         elif bullet.get("homing"):
             draw_homing_projectile(screen, bullet, bullet["color"], hostile=True)
         else:
@@ -10859,9 +11245,9 @@ def absorb_stored_defense(player, player_rect, particles, enemies=(), enemy_bull
         player["powerup_notice_until"] = now + 1200
         spawn_pop_particles(origin_x, origin_y, POWERUP_COLORS["reflector"], particles)
         return True
-    if not allow_warp or not player.get("warp_ready", False):
+    if not allow_warp or not warp_charge_count(player):
         return False
-    player["warp_ready"] = False
+    set_warp_charges(player, warp_charge_count(player) - 1)
     origin = player_rect.center
     player["x"], player["y"] = safest_warp_position(player, enemies, enemy_bullets)
     player_rect.topleft = (round(player["x"]), round(player["y"]))
@@ -10869,7 +11255,7 @@ def absorb_stored_defense(player, player_rect, particles, enemies=(), enemy_bull
     player["ram_bounce_x"] = player["ram_bounce_y"] = 0
     player["ram_bounce_frames"] = 0
     player["shield_until"] = max(player["shield_until"], now + EMERGENCY_WARP_SHIELD_MS)
-    player["powerup_notice"] = "EMERGENCY WARP"
+    player["powerup_notice"] = f"EMERGENCY WARP / {warp_charge_count(player)} LEFT"
     player["powerup_notice_until"] = now + 1800
     spawn_pop_particles(*origin, POWERUP_COLORS["emergency_warp"], particles)
     spawn_pop_particles(*player_rect.center, POWERUP_COLORS["emergency_warp"], particles)
@@ -10905,6 +11291,7 @@ def register_player_hit(player, player_rect, particles, lives_font, lives_messag
         return lives_message
     reset_durability(player)
     player["momentum_stacks"] = 0  # Losing a ship dumps its captured energy.
+    player["homing_laser_hit_times"] = []
     player["shatter_stacks"] = 0
     player["shatter_flash_until"] = 0
     player["pending_nova"] = False
@@ -11505,8 +11892,9 @@ def save_sector_checkpoint(players, round_num):
         "pilots": [{"name": clean_player_name(p.get("name", "")),
                     "score": p["score"], "kills": p["kills"],
                     "damage_bonus": p["damage_bonus"],
-                    "durability_bonus": p.get("durability_bonus", 0),
-                    "warp_ready": p.get("warp_ready", False),
+                    "durability_bonus": min(MAX_DURABILITY_BONUS, p.get("durability_bonus", 0)),
+                    "warp_ready": warp_charge_count(p) > 0,
+                    "warp_charges": warp_charge_count(p),
                     "reflector_charges": p.get("reflector_charges", 0),
                     "supply_kills_left": p.get("supply_kills_left", 0),
                     "pending_missiles": p.get("pending_missiles", False)} for p in players],
@@ -11525,7 +11913,8 @@ def restore_sector_checkpoint(checkpoint, player_sprites):
             pilot[field] = saved[field]
         for field, default in SAVED_OPTIONAL_PILOT_DEFAULTS.items():
             pilot[field] = saved.get(field, default)
-        pilot["durability_bonus"] = saved.get("durability_bonus", saved.get("health_bonus", 0))
+        set_warp_charges(pilot, saved.get("warp_charges", 1 if saved.get("warp_ready", False) else 0))
+        pilot["durability_bonus"] = min(MAX_DURABILITY_BONUS, saved.get("durability_bonus", saved.get("health_bonus", 0)))
         pilot["lives"] = STARTING_LIVES
         reset_durability(pilot)
         pilot["shield_until"] = now + SPAWN_SHIELD_DURATION
@@ -11539,7 +11928,7 @@ def restore_sector_checkpoint(checkpoint, player_sprites):
 # reliable restart even if the window is closed mid-fight. Saves contain only
 # JSON primitives (no pickle or executable data) and are atomically replaced.
 SAVED_OPTIONAL_PILOT_DEFAULTS = {"durability_bonus": 0, "durability_damage": 0,
-                                 "warp_ready": False, "reflector_charges": 0,
+                                 "warp_ready": False, "warp_charges": 0, "reflector_charges": 0,
                                  "supply_kills_left": 0, "pending_missiles": False}
 SAVED_PILOT_FIELDS = ("score", "kills", "lives", "damage_bonus", "eliminated",
                       *SAVED_OPTIONAL_PILOT_DEFAULTS)
@@ -11565,7 +11954,10 @@ def build_saved_run(round_num, players, checkpoint, infinite_mode=False, now=Non
         pilot = {key: player.get(key, SAVED_OPTIONAL_PILOT_DEFAULTS[key])
                  if key in SAVED_OPTIONAL_PILOT_DEFAULTS else player[key]
                  for key in SAVED_PILOT_FIELDS}
+        set_warp_charges(pilot, warp_charge_count(player))
         pilot["name"] = clean_player_name(player.get("name", ""))
+        pilot["durability_bonus"] = min(MAX_DURABILITY_BONUS, max(0, pilot.get("durability_bonus", 0)))
+        pilot["durability_damage"] = min(pilot["durability_bonus"], max(0, pilot.get("durability_damage", 0)))
         pilot["remaining_ms"] = {
             key: max(0, int(player.get(key, 0) - now)) for key in SAVED_TIMER_FIELDS
         }
@@ -11600,7 +11992,7 @@ def build_saved_run(round_num, players, checkpoint, infinite_mode=False, now=Non
         "pilots": pilots,
         "checkpoint": {
             "wave": int(checkpoint["wave"]),
-            "pilots": [dict(migrate_legacy_health_state(dict(pilot)),
+            "pilots": [dict(migrate_saved_defense_state(migrate_legacy_health_state(dict(pilot))),
                              name=clean_player_name(player.get("name", "")))
                        for pilot, player in zip(checkpoint["pilots"], players)],
         },
@@ -11902,7 +12294,7 @@ def load_saved_run(filename=SAVE_FILE):
                 return None
             durability_bonus = pilot.get("durability_bonus", pilot.get("health_bonus", 0))
             if (type(durability_bonus) is not int
-                    or not 0 <= durability_bonus <= MAX_DURABILITY_BONUS
+                    or not 0 <= durability_bonus <= LEGACY_MAX_DURABILITY_BONUS
                     or type(pilot.get("durability_damage", 0)) is not int
                     or not 0 <= pilot.get("durability_damage", 0) <= durability_bonus):
                 return None
@@ -11918,9 +12310,11 @@ def load_saved_run(filename=SAVE_FILE):
             if pilot["eliminated"] != (pilot["lives"] == 0):
                 return None
             if (type(pilot.get("warp_ready", False)) is not bool
+                    or ("warp_charges" in pilot and (type(pilot["warp_charges"]) is not int
+                                                    or not 0 <= pilot["warp_charges"] <= MAX_WARP_CHARGES))
                     or type(pilot.get("pending_missiles", False)) is not bool
                     or type(pilot.get("reflector_charges", 0)) is not int
-                    or not 0 <= pilot.get("reflector_charges", 0) <= 3
+                    or not 0 <= pilot.get("reflector_charges", 0) <= MAX_REFLECTOR_CHARGES
                     or type(pilot.get("supply_kills_left", 0)) is not int
                     or not 0 <= pilot.get("supply_kills_left", 0) <= 8):
                 return None
@@ -11949,19 +12343,23 @@ def load_saved_run(filename=SAVE_FILE):
                     or not 0 <= pilot.get("health_bonus", 0) <= MAX_HEALTH_BONUS):
                 return None
             durability_bonus = pilot.get("durability_bonus", pilot.get("health_bonus", 0))
-            if type(durability_bonus) is not int or not 0 <= durability_bonus <= MAX_DURABILITY_BONUS:
+            if type(durability_bonus) is not int or not 0 <= durability_bonus <= LEGACY_MAX_DURABILITY_BONUS:
                 return None
             if (type(pilot.get("warp_ready", False)) is not bool
+                    or ("warp_charges" in pilot and (type(pilot["warp_charges"]) is not int
+                                                    or not 0 <= pilot["warp_charges"] <= MAX_WARP_CHARGES))
                     or type(pilot.get("pending_missiles", False)) is not bool
                     or type(pilot.get("reflector_charges", 0)) is not int
-                    or not 0 <= pilot.get("reflector_charges", 0) <= 3
+                    or not 0 <= pilot.get("reflector_charges", 0) <= MAX_REFLECTOR_CHARGES
                     or type(pilot.get("supply_kills_left", 0)) is not int
                     or not 0 <= pilot.get("supply_kills_left", 0) <= 8):
                 return None
         for pilot in data["pilots"]:
             migrate_legacy_health_state(pilot)
+            migrate_saved_defense_state(pilot)
         for pilot in cp["pilots"]:
             migrate_legacy_health_state(pilot)
+            migrate_saved_defense_state(pilot)
         return data
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return None
@@ -12045,7 +12443,8 @@ def restore_saved_run(snapshot, player_sprites):
         player["name"] = restored_player_name(pilot, player["number"])
         for field in SAVED_PILOT_FIELDS:
             player[field] = pilot.get(field, SAVED_OPTIONAL_PILOT_DEFAULTS[field]) if field in SAVED_OPTIONAL_PILOT_DEFAULTS else pilot[field]
-        player["durability_bonus"] = pilot.get("durability_bonus", pilot.get("health_bonus", 0))
+        set_warp_charges(player, pilot.get("warp_charges", 1 if pilot.get("warp_ready", False) else 0))
+        player["durability_bonus"] = min(MAX_DURABILITY_BONUS, pilot.get("durability_bonus", pilot.get("health_bonus", 0)))
         player["lives"] = min(BASE_MAX_LIVES, player["lives"])
         for field in SAVED_TIMER_FIELDS:
             remaining = pilot["remaining_ms"].get(field, 0)
@@ -12190,6 +12589,11 @@ def main():
             for key, deadline in player.items():
                 if key.endswith("_until") and deadline:
                     player[key] = deadline + pause_duration
+            # This rolling weapon limit measures combat time. A settings/pause
+            # dialog must not refill it simply because the wall clock advanced.
+            if player.get("homing_laser_hit_times"):
+                player["homing_laser_hit_times"] = [stamp + pause_duration
+                                                    for stamp in player["homing_laser_hit_times"]]
             if player.get("nova_sweep_until", 0):
                 player["nova_sweep_start"] += pause_duration
                 if player.get("nova_target_ids") is not None:
@@ -13102,6 +13506,9 @@ def main():
                         for key, value in player.items():
                             if key.endswith("_until") and value:
                                 player[key] = value + transition_duration
+                        if player.get("homing_laser_hit_times"):
+                            player["homing_laser_hit_times"] = [stamp + transition_duration
+                                                                for stamp in player["homing_laser_hit_times"]]
                     transitioning = False
 
         if arena:
