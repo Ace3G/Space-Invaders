@@ -30,11 +30,281 @@ import sys
 os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
 import pygame 
 
+# The UI lays out in readable design pixels, then rasterizes at the drawable's
+# actual density. Combat never uses this transform. Keeping the conversion at
+# the canvas boundary makes painted rectangles and pointer hit boxes agree.
+_Surface = pygame.Surface
+_NATIVE_TEXT_CACHE = {}
+_NATIVE_TEXT_CACHE_PIXELS = 0
+_NATIVE_TEXT_PIXEL_LIMIT = 4_000_000
+_NATIVE_FONT_CACHE = {}
+
+
+class _TextImage(_Surface):
+    """A logical text bitmap that retains enough information to rasterize anew."""
+    def __init__(self, image, spec):
+        super().__init__(image.get_size(), pygame.SRCALPHA)
+        _Surface.blit(self, image, (0, 0))
+        self.text_spec = spec
+
+
+class ResolutionFont(pygame.font.Font):
+    """Ordinary Font behavior, plus native glyphs when blitted to a UI canvas."""
+    def __init__(self, filename, size):
+        super().__init__(filename, size)
+        self.source_filename = filename
+        self.source_size = size
+
+    def render(self, text, antialias, color, background=None, *args, **kwargs):
+        image = super().render(text, antialias, color, background, *args, **kwargs)
+        spec = (self, str(text), bool(antialias), tuple(pygame.Color(color)),
+                tuple(pygame.Color(background)) if background is not None else None,
+                image.get_size())
+        return _TextImage(image, spec)
+
+
+def resolution_font(name, size, bold=False, italic=False):
+    filename = pygame.font.match_font(name, bold, italic) if name else None
+    font = ResolutionFont(filename, size)
+    font.set_bold(bold)
+    font.set_italic(italic)
+    return font
+
+
+def scale_render_surface(source, size, destination=None):
+    """Retain text provenance through fitting; ordinary image scaling is unchanged."""
+    result = (pygame.transform.smoothscale(source, size) if destination is None
+              else pygame.transform.smoothscale(source, size, destination))
+    spec = getattr(source, "text_spec", None)
+    if spec is not None and destination is None:
+        return _TextImage(result, spec)
+    if isinstance(source, NativeUISurface) and destination is None:
+        return source._inherit_geometry(result, tuple(size))
+    return result
+
+
+def _native_text_image(source, size):
+    global _NATIVE_TEXT_CACHE_PIXELS
+    font, text, antialias, color, background, original_size = source.text_spec
+    styles = (font.get_bold(), font.get_italic(), font.get_underline(),
+              font.get_strikethrough() if hasattr(font, "get_strikethrough") else False)
+    key = (font, text, antialias, color, background, styles, tuple(size), source.get_alpha())
+    image = _NATIVE_TEXT_CACHE.get(key)
+    if image is not None:
+        return image
+    factor = min(size[0] / max(1, original_size[0]),
+                 size[1] / max(1, original_size[1]))
+    point_size = max(1, round(font.source_size * factor))
+    font_key = (font.source_filename, point_size, styles)
+    native_font = _NATIVE_FONT_CACHE.get(font_key)
+    if native_font is None:
+        native_font = pygame.font.Font(font.source_filename, point_size)
+        native_font.set_bold(styles[0])
+        native_font.set_italic(styles[1])
+        native_font.set_underline(styles[2])
+        if hasattr(native_font, "set_strikethrough"):
+            native_font.set_strikethrough(styles[3])
+        if len(_NATIVE_FONT_CACHE) >= 96:
+            _NATIVE_FONT_CACHE.clear()
+        _NATIVE_FONT_CACHE[font_key] = native_font
+    image = native_font.render(text, antialias, color, background)
+    # Font hinting can change a glyph's proportions by a pixel. Preserve the
+    # fitted logical box using only this final small native-size adjustment.
+    if not image.get_width() or not image.get_height():
+        # SDL cannot scale an empty glyph surface (e.g. a blank narrow button).
+        image = pygame.Surface(size, pygame.SRCALPHA)
+    elif image.get_size() != tuple(size):
+        image = pygame.transform.smoothscale(image, size)
+    image.set_alpha(source.get_alpha())
+    pixels = size[0] * size[1]
+    if pixels <= _NATIVE_TEXT_PIXEL_LIMIT:
+        if len(_NATIVE_TEXT_CACHE) >= 512 or _NATIVE_TEXT_CACHE_PIXELS + pixels > _NATIVE_TEXT_PIXEL_LIMIT:
+            _NATIVE_TEXT_CACHE.clear()
+            _NATIVE_TEXT_CACHE_PIXELS = 0
+        _NATIVE_TEXT_CACHE[key] = image
+        _NATIVE_TEXT_CACHE_PIXELS += pixels
+    return image
+
+
+class NativeUISurface(_Surface):
+    """Logical geometry with a real native-resolution RGBA backing buffer.
+
+    Pygame's C routines see the full raster. Python layout helpers see design
+    pixels. render_draw and blit are the only conversion points; UI text is
+    rendered from its font at final size instead of enlarging low-res glyphs.
+    """
+    def __init__(self, size, raster_size, *, opaque=False):
+        super().__init__(raster_size, 0 if opaque else pygame.SRCALPHA, 32)
+        self.logical_size = tuple(size)
+        self.raster_size = tuple(raster_size)
+        self.density = (raster_size[0] / size[0], raster_size[1] / size[1])
+
+    def get_size(self):
+        return self.logical_size
+
+    def get_width(self):
+        return self.logical_size[0]
+
+    def get_height(self):
+        return self.logical_size[1]
+
+    def get_rect(self, **kwargs):
+        rect = pygame.Rect((0, 0), self.logical_size)
+        for key, value in kwargs.items():
+            setattr(rect, key, value)
+        return rect
+
+    def raster_point(self, point):
+        return (round(point[0] * self.density[0]), round(point[1] * self.density[1]))
+
+    def raster_rect(self, rect):
+        rect = pygame.Rect(rect)
+        left, top = self.raster_point(rect.topleft)
+        right, bottom = self.raster_point(rect.bottomright)
+        return pygame.Rect(left, top, right - left, bottom - top)
+
+    def logical_rect(self, rect):
+        return pygame.Rect(round(rect.x / self.density[0]), round(rect.y / self.density[1]),
+                           round(rect.width / self.density[0]), round(rect.height / self.density[1]))
+
+    def get_clip(self):
+        return self.logical_rect(_Surface.get_clip(self))
+
+    def set_clip(self, rect=None):
+        return _Surface.set_clip(self, None if rect is None else self.raster_rect(rect))
+
+    def fill(self, color, rect=None, special_flags=0):
+        result = _Surface.fill(self, color, None if rect is None else self.raster_rect(rect), special_flags)
+        return self.logical_rect(result)
+
+    def blit(self, source, dest, area=None, special_flags=0):
+        point = dest.topleft if isinstance(dest, pygame.Rect) else dest[:2]
+        position = self.raster_point(point)
+        size = source.get_size()
+        if not size[0] or not size[1]:
+            return pygame.Rect(point, (0, 0))
+        target_size = (max(1, round(size[0] * self.density[0])),
+                       max(1, round(size[1] * self.density[1])))
+        if isinstance(source, NativeUISurface):
+            image = source
+            source_area = source.raster_rect(area) if area is not None else None
+            if source.raster_size != target_size:
+                image = pygame.transform.smoothscale(source, target_size)
+                if area is not None:
+                    source_area = pygame.Rect(round(area[0] * self.density[0]),
+                        round(area[1] * self.density[1]), round(area[2] * self.density[0]),
+                        round(area[3] * self.density[1]))
+        else:
+            if getattr(source, "text_spec", None) is not None:
+                image = _native_text_image(source, target_size)
+            elif size != target_size:
+                image = pygame.transform.smoothscale(source, target_size)
+            else:
+                image = source
+            source_area = self.raster_rect(area) if area is not None else None
+        result = _Surface.blit(self, image, position, source_area, special_flags)
+        return self.logical_rect(result)
+
+    def get_at(self, position):
+        if not (0 <= position[0] < self.logical_size[0] and 0 <= position[1] < self.logical_size[1]):
+            raise IndexError("pixel index out of range")
+        return _Surface.get_at(self, (math.floor(position[0] * self.density[0]),
+                                     math.floor(position[1] * self.density[1])))
+
+    def _inherit_geometry(self, result, logical_size=None):
+        logical_size = logical_size or self.logical_size
+        if not isinstance(result, NativeUISurface):
+            # Classic Pygame and CE differ in whether transforms preserve the
+            # Python Surface subtype. Normalize either result at this boundary.
+            wrapped = NativeUISurface(logical_size, _Surface.get_size(result),
+                                      opaque=not bool(result.get_flags() & pygame.SRCALPHA))
+            _Surface.blit(wrapped, result, (0, 0))
+            result = wrapped
+        result.logical_size = logical_size
+        result.raster_size = _Surface.get_size(result)
+        result.density = (result.raster_size[0] / max(1, result.logical_size[0]),
+                          result.raster_size[1] / max(1, result.logical_size[1]))
+        return result
+
+    def copy(self):
+        return self._inherit_geometry(_Surface.copy(self))
+
+    def convert_alpha(self, *args, **kwargs):
+        return self._inherit_geometry(_Surface.convert_alpha(self, *args, **kwargs))
+
+    def convert(self, *args, **kwargs):
+        return self._inherit_geometry(_Surface.convert(self, *args, **kwargs))
+
+    def subsurface(self, rect):
+        rect = pygame.Rect(rect)
+        return self._inherit_geometry(_Surface.subsurface(self, self.raster_rect(rect)), rect.size)
+
+
+def ui_surface_like(size, parent, *, opaque=False):
+    if isinstance(parent, NativeUISurface):
+        raster = (max(1, round(size[0] * parent.density[0])),
+                  max(1, round(size[1] * parent.density[1])))
+        return NativeUISurface(size, raster, opaque=opaque)
+    return pygame.Surface(size, 0 if opaque else pygame.SRCALPHA)
+
+
+class _ResolutionDraw:
+    """Scale UI vector primitives; world/artwork draw calls pass through intact."""
+    @staticmethod
+    def _width(surface, value):
+        return max(1, round(value * min(surface.density))) if value > 0 else value
+
+    def rect(self, surface, color, rect, width=0, **kwargs):
+        if isinstance(surface, NativeUISurface):
+            kwargs = {key: self._width(surface, value) for key, value in kwargs.items()}
+            return pygame.draw.rect(surface, color, surface.raster_rect(rect), self._width(surface, width), **kwargs)
+        return pygame.draw.rect(surface, color, rect, width, **kwargs)
+
+    def circle(self, surface, color, center, radius, width=0, **kwargs):
+        if isinstance(surface, NativeUISurface):
+            return pygame.draw.circle(surface, color, surface.raster_point(center),
+                max(0, round(radius * min(surface.density))), self._width(surface, width), **kwargs)
+        return pygame.draw.circle(surface, color, center, radius, width, **kwargs)
+
+    def line(self, surface, color, start, end, width=1):
+        if isinstance(surface, NativeUISurface):
+            return pygame.draw.line(surface, color, surface.raster_point(start),
+                                    surface.raster_point(end), self._width(surface, width))
+        return pygame.draw.line(surface, color, start, end, width)
+
+    def lines(self, surface, color, closed, points, width=1):
+        if isinstance(surface, NativeUISurface):
+            return pygame.draw.lines(surface, color, closed,
+                [surface.raster_point(point) for point in points], self._width(surface, width))
+        return pygame.draw.lines(surface, color, closed, points, width)
+
+    def polygon(self, surface, color, points, width=0):
+        if isinstance(surface, NativeUISurface):
+            return pygame.draw.polygon(surface, color,
+                [surface.raster_point(point) for point in points], self._width(surface, width))
+        return pygame.draw.polygon(surface, color, points, width)
+
+    def ellipse(self, surface, color, rect, width=0):
+        if isinstance(surface, NativeUISurface):
+            return pygame.draw.ellipse(surface, color, surface.raster_rect(rect), self._width(surface, width))
+        return pygame.draw.ellipse(surface, color, rect, width)
+
+    def arc(self, surface, color, rect, start, stop, width=1):
+        if isinstance(surface, NativeUISurface):
+            return pygame.draw.arc(surface, color, surface.raster_rect(rect), start, stop, self._width(surface, width))
+        return pygame.draw.arc(surface, color, rect, start, stop, width)
+
+
+render_draw = _ResolutionDraw()
+
+
 # Screen Setup Constants
 SCREEN_WIDTH = 1600
 SCREEN_HEIGHT = 900
-WORLD_SIZE = (1600, 900)  # Minimum logical arena; extend one axis to fit the window.
-GAME_BUILD_ID = "2026.11.19-bombs-homing"
+WORLD_SIZE = (1600, 900)  # Legacy simulation/design reference, retained for save compatibility.
+WORLD_VIEW_SIZE = (1920, 1080)  # Roomier combat framing; extend one axis to match the drawable.
+UI_REFERENCE_SIZE = (1600, 900)
+GAME_BUILD_ID = "2026.11.19-resolution"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
@@ -146,6 +416,7 @@ def reset_animation_graphics(players=(), enemies=(), clear_caches=True):
     global _UI_PRESS, _SHIP_ANIMATIONS, _ROTATED_ENEMY_SPRITES, _NOVA_LABEL_SPRITES
     global _HUD_BACKPLATES, _HUD_PANEL_SURFACES, _HUD_PANEL_KEYS, _HUD_FONTS
     global _UI_TEXT_CACHE, _GAMEPLAY_UI_SCALE_TARGET, _GAMEPLAY_UI_REGION_TARGET
+    global _NATIVE_TEXT_CACHE_PIXELS
     for player in players:
         player["animation_tick"] = 0
         player["animation_bank"] = 0.0
@@ -158,6 +429,9 @@ def reset_animation_graphics(players=(), enemies=(), clear_caches=True):
         enemy["animation_hit"] = 0
         enemy["animation_warp"] = 0
     if clear_caches:
+        _NATIVE_TEXT_CACHE.clear()
+        _NATIVE_FONT_CACHE.clear()
+        _NATIVE_TEXT_CACHE_PIXELS = 0
         _SPACE_BACKGROUNDS.clear()
         _GLOW_SPRITES.clear()
         _BUTTON_ANIMATIONS.clear()
@@ -493,9 +767,9 @@ class DisplayManager:
         self._margin_background = None
         if self.display is not None:
             width, height = self.display.get_size()
-            factor = min(width / WORLD_SIZE[0], height / WORLD_SIZE[1])
-            size = (max(WORLD_SIZE[0], round(width / factor)),
-                    max(WORLD_SIZE[1], round(height / factor)))
+            factor = min(width / WORLD_VIEW_SIZE[0], height / WORLD_VIEW_SIZE[1])
+            size = (max(WORLD_VIEW_SIZE[0], round(width / factor)),
+                    max(WORLD_VIEW_SIZE[1], round(height / factor)))
             if self.world_surface.get_size() != size:
                 self.world_surface = pygame.Surface(size).convert()
 
@@ -508,22 +782,27 @@ class DisplayManager:
 
     @property
     def effective_gui_zoom(self):
-        return self.preferences["gui_scale"]
+        # High-density screens enlarge the interface automatically. The stored
+        # slider is a multiplier, so old preferences remain useful on any monitor.
+        width, height = self.display.get_size()
+        automatic = max(1.0, min(width / UI_REFERENCE_SIZE[0], height / UI_REFERENCE_SIZE[1]))
+        return automatic * self.preferences["gui_scale"]
 
     def ui_size(self, arena=False):
         self._sync_display_surface()
         width, height = self.display.get_size()
-        # Auto uses one GUI pixel per display pixel. Manual zoom receives one
-        # antialiased presentation pass, rather than a trip through world pixels.
+        # Design geometry adapts to density; its backing canvas and fonts are
+        # rendered directly at native resolution, including manual GUI zoom.
         factor = min(self.effective_gui_zoom, width / 640, height / 360)
         return (max(640, round(width / factor)), max(360, round(height / factor)))
 
     def activate(self, arena=False):
         global _UI_LAYOUT_SIZE, _UI_POINTER_POS
         size = self.ui_size(arena)
-        if self._ui_key != size:
-            self.ui_surface = pygame.Surface(size, pygame.SRCALPHA).convert_alpha()
-            self._ui_key = size
+        key = (size, self.display.get_size())
+        if self._ui_key != key:
+            self.ui_surface = NativeUISurface(size, self.display.get_size())
+            self._ui_key = key
         _UI_LAYOUT_SIZE = size
         _UI_POINTER_POS = self.map_pointer(pygame.mouse.get_pos(), arena)
         return self.ui_surface
@@ -701,6 +980,14 @@ class DisplayManager:
             source_regions = merge_ui_regions(bounds, surface.get_rect())
             if not source_regions:
                 return
+        if isinstance(surface, NativeUISurface) and surface.raster_size == region.size:
+            if bounds is None:
+                self.display.blit(surface, region)
+            else:
+                for source in source_regions:
+                    raster = surface.raster_rect(source)
+                    self.display.blit(surface, (region.x + raster.x, region.y + raster.y), raster)
+            return
         if surface.get_size() == region.size:
             if bounds is None:
                 self.display.blit(surface, region)
@@ -736,7 +1023,8 @@ class DisplayManager:
         gui_region = self.display.get_rect()
         region = self.viewport if arena else gui_region
         self.display.fill((3, 7, 20))
-        if surface.get_size() == region.size:
+        if ((isinstance(surface, NativeUISurface) and surface.raster_size == region.size)
+                or surface.get_size() == region.size):
             self.display.blit(surface, region)
         else:
             if self._presentation_size != region.size:
@@ -1704,7 +1992,7 @@ def draw_text_entry(screen, rect, text, font, color=UI_TEXT, accent=UI_CYAN, *,
     try:
         if focused and selected_all and value:
             selection = destination.inflate(2, 0).clip(content)
-            pygame.draw.rect(screen, blend_color(UI_BG, accent, .2), selection,
+            render_draw.rect(screen, blend_color(UI_BG, accent, .2), selection,
                              border_radius=min(3, selection.height // 2))
         screen.blit(rendered, destination)
         if focused:
@@ -1713,14 +2001,14 @@ def draw_text_entry(screen, rect, text, font, color=UI_TEXT, accent=UI_CYAN, *,
             caret_top = max(content.top, content.centery - max(2, font.get_height() // 2))
             caret_bottom = min(content.bottom - 1, content.centery + max(2, font.get_height() // 2))
             if not animated or age < 220 or age % 1000 < 600:
-                pygame.draw.line(screen, accent, (caret_x, caret_top),
+                render_draw.line(screen, accent, (caret_x, caret_top),
                                  (caret_x, caret_bottom), 2)
             if animated and edited_at is not None and age < 180:
                 # A small contracting highlight makes accepted key/paste edits
                 # visible without moving the text or allocating a glow canvas.
                 width = max(2, round(14 * (1 - age / 180)))
                 start = max(content.left, caret_x - width)
-                pygame.draw.line(screen, blend_color(accent, UI_TEXT, .45),
+                render_draw.line(screen, blend_color(accent, UI_TEXT, .45),
                                  (start, content.bottom - 1),
                                  (caret_x, content.bottom - 1), 2)
     finally:
@@ -1815,7 +2103,7 @@ class PlayerNameMenu:
                                  selected_all=self.select_all,
                                  edited_at=self.edited_at[index], placeholder=f"Player {index + 1}")
                 if index == self.selected:
-                    pygame.draw.line(screen, color, (field.x, field.bottom), (field.right, field.bottom))
+                    render_draw.line(screen, color, (field.x, field.bottom), (field.right, field.bottom))
             draw_fitted_text(screen, self.status, small_font, UI_MUTED, layout["help"])
             draw_neon_button(screen, layout["cancel"], "CANCEL", small_font, UI_CORAL)
             draw_neon_button(screen, layout["done"], "APPLY NAMES", small_font, UI_MINT)
@@ -2821,7 +3109,7 @@ def draw_soft_glow(screen, center, color, radius=18, strength=35):
         glow = pygame.Surface((radius * 2 + 2, radius * 2 + 2), pygame.SRCALPHA)
         for ring in range(radius, 0, -2):
             alpha = round(strength * (1 - ring / (radius + 1)) ** 1.5)
-            pygame.draw.circle(glow, (*color, alpha), (radius + 1, radius + 1), ring)
+            render_draw.circle(glow, (*color, alpha), (radius + 1, radius + 1), ring)
         if len(_GLOW_SPRITES) > 1024:
             _GLOW_SPRITES.clear()
         _GLOW_SPRITES[key] = glow
@@ -2868,7 +3156,7 @@ def draw_space_background(screen, style="menu", now=None):
         background = pygame.Surface((width, height))
         for y in range(height):
             color = blend_color(top, bottom, y / max(1, height - 1))
-            pygame.draw.line(background, color, (0, y), (width, y))
+            render_draw.line(background, color, (0, y), (width, y))
 
         nebula = pygame.Surface((128, 128), pygame.SRCALPHA)
         for color, center, size in (
@@ -2878,26 +3166,26 @@ def draw_space_background(screen, style="menu", now=None):
             nebula.fill((0, 0, 0, 0))
             for radius in range(63, 0, -1):
                 alpha = round((17 if style == "gameplay" else 28) * (1 - radius / 64) ** 1.5)
-                pygame.draw.circle(nebula, (*color, alpha), (64, 64), radius)
-            mist = pygame.transform.smoothscale(nebula, (size, size))
+                render_draw.circle(nebula, (*color, alpha), (64, 64), radius)
+            mist = scale_render_surface(nebula, (size, size))
             background.blit(mist, (round(center[0] - size / 2), round(center[1] - size / 2)))
 
         if style != "gameplay":
             planet_center = (round(width * 0.88), round(height * 0.23))
             planet_radius = max(40, round(height * 0.13))
-            pygame.draw.circle(background, blend_color(UI_BG, second, 0.07), planet_center, planet_radius)
-            pygame.draw.circle(background, blend_color(UI_BG, first, 0.23), planet_center, planet_radius, 1)
+            render_draw.circle(background, blend_color(UI_BG, second, 0.07), planet_center, planet_radius)
+            render_draw.circle(background, blend_color(UI_BG, first, 0.23), planet_center, planet_radius, 1)
             ring = pygame.Rect(0, 0, planet_radius * 3, planet_radius)
             ring.center = planet_center
-            pygame.draw.ellipse(background, blend_color(UI_BG, second, 0.25), ring, 1)
+            render_draw.ellipse(background, blend_color(UI_BG, second, 0.25), ring, 1)
             horizon = round(height * 0.80)
             grid_color = blend_color(UI_BG, first, 0.07)
             for column in range(-4, 9):
-                pygame.draw.line(background, grid_color, (width // 2, horizon),
+                render_draw.line(background, grid_color, (width // 2, horizon),
                                  (column * width // 4, height), 1)
             for fraction in (0.12, 0.28, 0.50, 0.80):
                 y = round(horizon + (height - horizon) * fraction)
-                pygame.draw.line(background, grid_color, (0, y), (width, y))
+                render_draw.line(background, grid_color, (0, y), (width, y))
 
         stars = space_background_stars(width, height, palette)
         entry = (background, stars)
@@ -2926,9 +3214,9 @@ def draw_space_stars(screen, stars, style, now=None, palette=None):
     for x, y, radius, color, phase in stars:
         brightness = (0.17 if style == "gameplay" else 0.25) + 0.12 * (1 + math.sin(now / 1600 + phase))
         star_color = blend_color(palette["bg"] if palette is not None else UI_BG, color, brightness)
-        pygame.draw.circle(screen, star_color, (x, y), radius)
+        render_draw.circle(screen, star_color, (x, y), radius)
         if radius == 2 and style != "gameplay":
-            pygame.draw.line(screen, star_color, (x - 3, y), (x + 3, y))
+            render_draw.line(screen, star_color, (x - 3, y), (x + 3, y))
 
 
 def draw_neon_panel(screen, rect, accent=UI_CYAN, fill=None, radius=12):
@@ -2938,16 +3226,16 @@ def draw_neon_panel(screen, rect, accent=UI_CYAN, fill=None, radius=12):
     accent = ui_theme_color(accent)
     palette = ui_palette()
     if _POTATO_MODE:
-        pygame.draw.rect(screen, fill or palette["panel"], rect)
-        pygame.draw.rect(screen, accent, rect, 1)
+        render_draw.rect(screen, fill or palette["panel"], rect)
+        render_draw.rect(screen, accent, rect, 1)
         return
-    pygame.draw.rect(screen, blend_color(palette["bg"], accent, 0.07), rect.inflate(6, 6),
+    render_draw.rect(screen, blend_color(palette["bg"], accent, 0.07), rect.inflate(6, 6),
                      border_radius=radius + 3)
-    pygame.draw.rect(screen, fill or palette["panel"], rect, border_radius=radius)
-    pygame.draw.rect(screen, blend_color(palette["bg"], accent, 0.62), rect, 1, border_radius=radius)
+    render_draw.rect(screen, fill or palette["panel"], rect, border_radius=radius)
+    render_draw.rect(screen, blend_color(palette["bg"], accent, 0.62), rect, 1, border_radius=radius)
     inset = min(15, rect.width // 5)
     if rect.width > inset * 2:
-        pygame.draw.line(screen, accent, (rect.x + inset, rect.y),
+        render_draw.line(screen, accent, (rect.x + inset, rect.y),
                          (rect.x + min(rect.width - inset, max(40, rect.width // 3)), rect.y), 2)
 
 
@@ -2984,8 +3272,8 @@ def draw_neon_button(screen, rect, label, font, accent=UI_CYAN, enabled=True, se
         color = accent if enabled else palette["disabled"]
         active = enabled and (hovered or selected or just_clicked)
         fill = blend_color(palette["button"], color, 0.22 if active else 0.07)
-        pygame.draw.rect(screen, fill, rect)
-        pygame.draw.rect(screen, color, rect, 2 if active else 1)
+        render_draw.rect(screen, fill, rect)
+        render_draw.rect(screen, color, rect, 2 if active else 1)
         text = cached_ui_text(font, label, palette["text"] if enabled else palette["muted"],
                               max(1, rect.width - 18), max(1, rect.height - 10))
         screen.blit(text, text.get_rect(center=rect.center))
@@ -3004,9 +3292,9 @@ def draw_neon_button(screen, rect, label, font, accent=UI_CYAN, enabled=True, se
                        strength=round(25 + amount * 35))
     draw_neon_panel(screen, visual_rect, color, fill=fill, radius=min(10, rect.height // 3))
     if amount > 0.1 or pressed:
-        pygame.draw.rect(screen, color, visual_rect, 2, border_radius=min(10, rect.height // 3))
+        render_draw.rect(screen, color, visual_rect, 2, border_radius=min(10, rect.height // 3))
         sweep_width = max(8, round((rect.width - 24) * amount))
-        pygame.draw.line(screen, color, (visual_rect.x + 12, visual_rect.bottom - 5),
+        render_draw.line(screen, color, (visual_rect.x + 12, visual_rect.bottom - 5),
                          (visual_rect.x + 12 + sweep_width, visual_rect.bottom - 5), 2)
     max_width, max_height = max(1, rect.width - 18), max(1, rect.height - 10)
     text = cached_ui_text(font, label, palette["text"] if enabled else palette["muted"],
@@ -3040,8 +3328,8 @@ def draw_ui_feedback(screen):
         ripple = pygame.Surface((96, 96), pygame.SRCALPHA)
         alpha = round(150 * (1 - progress))
         radius = round(6 + progress * 36)
-        pygame.draw.circle(ripple, (*color, alpha), (48, 48), radius, 2)
-        pygame.draw.circle(ripple, (*UI_TEXT, alpha // 2), (48, 48), max(1, radius - 4), 1)
+        render_draw.circle(ripple, (*color, alpha), (48, 48), radius, 2)
+        render_draw.circle(ripple, (*UI_TEXT, alpha // 2), (48, 48), max(1, radius - 4), 1)
         screen.blit(ripple, (position[0] - 48, position[1] - 48))
 
 
@@ -3074,8 +3362,8 @@ def draw_neon_title(screen, text, font, center, accent=UI_CYAN):
     screen.blit(text_surface, rect)
     line_width = min(rect.width // 2, 220)
     line_y = rect.bottom + 8
-    pygame.draw.line(screen, accent, (rect.centerx - line_width, line_y), (rect.centerx - 8, line_y), 2)
-    pygame.draw.line(screen, secondary,
+    render_draw.line(screen, accent, (rect.centerx - line_width, line_y), (rect.centerx - 8, line_y), 2)
+    render_draw.line(screen, secondary,
                      (rect.centerx + 8, line_y), (rect.centerx + line_width, line_y), 2)
 
 
@@ -3399,8 +3687,119 @@ def get_unlocked_boss_attacks(round_num):
 
 # SHIP ART: text matrices define occupied pixels; cached frames reuse that art.
 # Animation state advances in simulation updates, while drawing reads the state.
-def generate_pixel_sprite(art_matrix, color, width, height):
-    """Shade each X in a text silhouette, then scale it with crisp pixel edges."""
+_SHIP_ARTWORK = {}
+_POWERUP_ICON_CACHE = {}
+
+
+def artwork_filter():
+    """Retain the original low-cost sprites when Pixel/Potato is selected."""
+    return "pixel" if effective_world_filter() == "pixel" else "smooth"
+
+
+def rounded_art_contours(art_matrix):
+    """Trace every hull/eye boundary, retaining disconnected antennae and holes.
+
+    The text matrices remain the source of each ship's silhouette. Rounding
+    their corners removes enlarged square steps without replacing the art or
+    changing any collision rectangle. This runs only when building cached art.
+    """
+    occupied = {(x, y) for y, row in enumerate(art_matrix)
+                for x, char in enumerate(row) if char == "X"}
+    edges = {}
+    for x, y in sorted(occupied):
+        for neighbor, start, end in (
+                ((x, y - 1), (x, y), (x + 1, y)),
+                ((x + 1, y), (x + 1, y), (x + 1, y + 1)),
+                ((x, y + 1), (x + 1, y + 1), (x, y + 1)),
+                ((x - 1, y), (x, y + 1), (x, y))):
+            if neighbor not in occupied:
+                edges.setdefault(start, []).append(end)
+    contours = []
+    directions = {(1, 0): 0, (0, 1): 1, (-1, 0): 2, (0, -1): 3}
+    while edges:
+        start = min(edges)
+        current, previous = start, None
+        vertices = []
+        while True:
+            vertices.append(current)
+            candidates = edges[current]
+            if previous is None or len(candidates) == 1:
+                following = candidates[0]
+            else:
+                incoming = directions[(current[0] - previous[0], current[1] - previous[1])]
+                # A right turn keeps diagonally touching components separate.
+                priority = {1: 0, 0: 1, 3: 2, 2: 3}
+                following = min(candidates, key=lambda p: priority[(directions[
+                    (p[0] - current[0], p[1] - current[1])] - incoming) % 4])
+            candidates.remove(following)
+            if not candidates:
+                del edges[current]
+            previous, current = current, following
+            if current == start:
+                break
+        points = []
+        for index, vertex in enumerate(vertices):
+            before, after = vertices[index - 1], vertices[(index + 1) % len(vertices)]
+            incoming = (vertex[0] - before[0], vertex[1] - before[1])
+            outgoing = (after[0] - vertex[0], after[1] - vertex[1])
+            if incoming == outgoing:
+                points.append(vertex)
+                continue
+            radius = 0.28
+            entry = (vertex[0] - incoming[0] * radius, vertex[1] - incoming[1] * radius)
+            exit_point = (vertex[0] + outgoing[0] * radius, vertex[1] + outgoing[1] * radius)
+            for step in range(5):
+                t = step / 4
+                points.append(((1 - t) ** 2 * entry[0] + 2 * (1 - t) * t * vertex[0] + t * t * exit_point[0],
+                               (1 - t) ** 2 * entry[1] + 2 * (1 - t) * t * vertex[1] + t * t * exit_point[1]))
+        area = sum(a[0] * b[1] - b[0] * a[1]
+                   for a, b in zip(vertices, vertices[1:] + vertices[:1]))
+        contours.append((area, points))
+    return sorted(contours, key=lambda contour: -abs(contour[0]))
+
+
+def generate_smooth_ship_sprite(art_matrix, color, width, height):
+    """Cache antialiased contours and continuous hull shading at the drawn size."""
+    key = (tuple(art_matrix), tuple(color[:3]), int(width), int(height))
+    cached = _SHIP_ARTWORK.get(key)
+    if cached is not None:
+        return cached
+    width, height = max(1, int(width)), max(1, int(height))
+    # Four samples per logical pixel are built once, never once per frame.
+    samples = 4
+    mask = pygame.Surface((width * samples, height * samples), pygame.SRCALPHA)
+    rows, cols = len(art_matrix), max(map(len, art_matrix))
+    for area, contour in rounded_art_contours(art_matrix):
+        points = [(round(x * width * samples / cols), round(y * height * samples / rows))
+                  for x, y in contour]
+        render_draw.polygon(mask, (255, 255, 255, 255) if area > 0 else (0, 0, 0, 0), points)
+    hull = pygame.Surface(mask.get_size(), pygame.SRCALPHA)
+    base = tuple(color[:3])
+    for y in range(hull.get_height()):
+        progress = y / max(1, hull.get_height() - 1)
+        shade = (0.27 * (1 - progress / 0.42) if progress < 0.42
+                 else -0.34 * (progress - 0.42) / 0.58)
+        row_color = (tuple(round(channel + (255 - channel) * shade) for channel in base)
+                     if shade >= 0 else tuple(round(channel * (1 + shade)) for channel in base))
+        render_draw.line(hull, (*row_color, 255), (0, y), (hull.get_width() - 1, y))
+    hull.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    result = scale_render_surface(hull, (width, height))
+    if pygame.display.get_surface() is not None:
+        result = result.convert_alpha()
+    if len(_SHIP_ARTWORK) >= 512:
+        _SHIP_ARTWORK.pop(next(iter(_SHIP_ARTWORK)))
+    _SHIP_ARTWORK[key] = result
+    return result
+
+
+def generate_pixel_sprite(art_matrix, color, width, height, quality=None):
+    """Build smooth outlined art or the original exact pixel-art variant."""
+    if (quality or artwork_filter()) == "smooth":
+        return generate_smooth_ship_sprite(art_matrix, color, width, height)
+    key = (tuple(art_matrix), tuple(color[:3]), int(width), int(height), "pixel")
+    cached = _SHIP_ARTWORK.get(key)
+    if cached is not None:
+        return cached
     rows, cols = len(art_matrix), max(len(line) for line in art_matrix)
     surf = pygame.Surface((cols, rows), pygame.SRCALPHA)
     base = tuple(color[:3])
@@ -3424,12 +3823,17 @@ def generate_pixel_sprite(art_matrix, color, width, height):
                     pixel_color = base
                 surf.set_at((c, r), pixel_color)
     scaled = pygame.transform.scale(surf, (int(width), int(height)))
-    return scaled.convert_alpha() if pygame.display.get_surface() is not None else scaled
+    result = scaled.convert_alpha() if pygame.display.get_surface() is not None else scaled
+    if len(_SHIP_ARTWORK) >= 1024:
+        _SHIP_ARTWORK.pop(next(iter(_SHIP_ARTWORK)))
+    _SHIP_ARTWORK[key] = result
+    return result
 
 
 def generate_ship_animation(art_matrix, color, width, height, style="alien"):
-    """Build shared pixel-art frames once; no external image files are needed."""
-    key = (tuple(art_matrix), tuple(color), int(width), int(height), style)
+    """Build shared resolution-aware frames once; no external files are needed."""
+    quality = artwork_filter()
+    key = (tuple(art_matrix), tuple(color), int(width), int(height), style, quality)
     if key in _SHIP_ANIMATIONS:
         return _SHIP_ANIMATIONS[key]
 
@@ -3452,15 +3856,22 @@ def generate_ship_animation(art_matrix, color, width, height, style="alien"):
                     art[row_index][target] = "X"
 
         matrix = ["".join(row) for row in art]
-        pixels = generate_pixel_sprite(matrix, color, cols, rows)
         light = blend_color(color, UI_TEXT, (0.40, 0.70, 0.95, 0.65)[frame_index])
         lights = ((cols // 2, 1), (cols // 2, 2)) if style == "player" else (
             (cols // 2 - 2, rows // 2), (cols // 2 + 2, rows // 2),
         )
-        for x, y in lights:
-            if 0 <= x < cols and 0 <= y < rows and art[y][x] == "X":
-                pixels.set_at((x, y), light)
-        frame = pygame.transform.scale(pixels, (int(width), int(height)))
+        if quality == "pixel":
+            pixels = generate_pixel_sprite(matrix, color, cols, rows)
+            for x, y in lights:
+                if 0 <= x < cols and 0 <= y < rows and art[y][x] == "X":
+                    pixels.set_at((x, y), light)
+            frame = pygame.transform.scale(pixels, (int(width), int(height)))
+        else:
+            frame = generate_smooth_ship_sprite(matrix, color, width, height).copy()
+            for x, y in lights:
+                if 0 <= x < cols and 0 <= y < rows and art[y][x] == "X":
+                    location = (round((x + 0.5) * width / cols), round((y + 0.5) * height / rows))
+                    render_draw.circle(frame, light, location, max(1, round(width / cols * 0.23)))
         hit = frame.copy()
         hit.fill((165, 165, 165, 0), special_flags=pygame.BLEND_RGBA_ADD)
         frames.append(frame)
@@ -3477,6 +3888,14 @@ def attach_ship_animation(ship, art, color, width, height, style="alien"):
         art, color, width, height, style,
     )
     ship["animation_style"] = style
+    # Keep immutable construction data so a live graphics change does not need
+    # to recreate enemies, reset animations, or alter their combat dictionaries.
+    ship["artwork_source"] = (tuple(art), tuple(color), int(width), int(height), style)
+    ship["artwork_filter"] = artwork_filter()
+    ship["artwork_base_id"] = id(ship.get("sprite", ship.get("surface")))
+    # Prewarm the inexpensive static fallback before combat. Entering Potato
+    # mode must not allocate a new sprite for every visible enemy while drawing.
+    generate_pixel_sprite(art, color, width, height, quality="pixel")
     ship.setdefault("animation_tick", 0)
     # Deterministic phases keep the fleet lively without changing gameplay RNG.
     ship.setdefault("animation_phase", int(ship.get("x", 0) * 3 + ship.get("number", 0) * 19) % 120)
@@ -3532,6 +3951,11 @@ def animated_ship_frame(ship, fallback):
     if not graphics_feature_enabled("animations"):
         return fallback
     frames = ship.get("animation_frames")
+    hit_frames = ship.get("animation_hit_frames")
+    source = ship.get("artwork_source")
+    if (source and id(fallback) == ship.get("artwork_base_id")
+            and ship.get("artwork_filter") != artwork_filter()):
+        frames, hit_frames = generate_ship_animation(*source)
     if not frames:
         return fallback
     style = ship.get("animation_style", "alien")
@@ -3539,8 +3963,17 @@ def animated_ship_frame(ship, fallback):
     interval *= animation_slowdown()
     index = ((ship.get("animation_tick", 0) + ship.get("animation_phase", 0)) // interval) % len(frames)
     if ship.get("animation_hit", 0) > 0:
-        return ship["animation_hit_frames"][index]
+        return hit_frames[index]
     return frames[index]
+
+
+def static_ship_frame(ship, fallback):
+    """Honor live Smooth/Pixel selection while reusing immutable cached art."""
+    source = ship.get("artwork_source")
+    if (source and id(fallback) == ship.get("artwork_base_id")
+            and ship.get("artwork_filter") != artwork_filter()):
+        return generate_pixel_sprite(*source[:4])
+    return fallback
 
 
 def draw_animated_player(screen, player, now):
@@ -3549,7 +3982,7 @@ def draw_animated_player(screen, player, now):
             draw_soft_glow(screen, (round(player["x"] + PLAYER_WIDTH / 2),
                                     round(player["y"] + PLAYER_HEIGHT / 2)),
                            player["color"], radius=24, strength=50)
-        screen.blit(player["sprite"], (round(player["x"]), round(player["y"])))
+        screen.blit(static_ship_frame(player, player["sprite"]), (round(player["x"]), round(player["y"])))
         draw_player_nameplate(screen, player)
         return
     frame = animated_ship_frame(player, player["sprite"])
@@ -3567,20 +4000,20 @@ def draw_animated_player(screen, player, now):
     x, y = body.centerx, body.bottom - 2
     engine_color = blend_color(player["color"], UI_CYAN, 0.45) if boosted else player["color"]
     # Outer glow, bright core, and an inner hot jet all stay on the centerline.
-    pygame.draw.polygon(canvas, (*engine_color, 105), (
+    render_draw.polygon(canvas, (*engine_color, 105), (
         (x - 5, y), (x, y + flame_length + 4), (x + 5, y),
     ))
-    pygame.draw.polygon(canvas, engine_color, (
+    render_draw.polygon(canvas, engine_color, (
         (x - 3, y), (x, y + flame_length), (x + 3, y),
     ))
     hot_color = blend_color(engine_color, UI_TEXT, 0.74)
-    pygame.draw.polygon(canvas, hot_color, (
+    render_draw.polygon(canvas, hot_color, (
         (x - 1, y + 1), (x, y + max(3, round(flame_length * 0.62))),
         (x + 1, y + 1),
     ))
     # One moving ember directly beneath the jet adds visible travel animation.
     ember_y = y + 3 + (animation_tick * 2 % max(6, flame_length))
-    pygame.draw.circle(canvas, engine_color, (x, ember_y), 1)
+    render_draw.circle(canvas, engine_color, (x, ember_y), 1)
 
     recoil = round(2 * player.get("animation_fire", 0) / 8)
     canvas.blit(frame, body.move(0, recoil))
@@ -3588,25 +4021,25 @@ def draw_animated_player(screen, player, now):
         flash_size = 2 + player["animation_fire"] // 2
         for offset in player.get("animation_muzzles", (0,)):
             x, y = body.centerx + offset, body.top
-            pygame.draw.polygon(canvas, player["color"], (
+            render_draw.polygon(canvas, player["color"], (
                 (x, y - flash_size * 2), (x + flash_size, y),
                 (x, y + 2), (x - flash_size, y),
             ))
-            pygame.draw.line(canvas, UI_TEXT, (x, y - flash_size), (x, y + 1), 2)
+            render_draw.line(canvas, UI_TEXT, (x, y - flash_size), (x, y + 1), 2)
 
     spawn = player.get("animation_spawn", 0)
     if spawn:
         canvas.set_alpha(255 - spawn * 4)
         scan_y = body.top + round((1 - spawn / 30) * body.height)
-        pygame.draw.line(canvas, UI_TEXT, (body.left - 4, scan_y), (body.right + 4, scan_y), 2)
+        render_draw.line(canvas, UI_TEXT, (body.left - 4, scan_y), (body.right + 4, scan_y), 2)
     if player.get("animation_hit", 0):
-        pygame.draw.circle(canvas, UI_CYAN, body.center, 23 + player["animation_hit"], 2)
+        render_draw.circle(canvas, UI_CYAN, body.center, 23 + player["animation_hit"], 2)
     canvas = pygame.transform.rotate(canvas, round(player.get("animation_bank", 0)))
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
     draw_soft_glow(screen, center, player["color"], radius=24, strength=50)
     screen.blit(canvas, canvas.get_rect(center=center))
     if spawn:
-        pygame.draw.circle(screen, player["color"], center, 18 + spawn, 1)
+        render_draw.circle(screen, player["color"], center, 18 + spawn, 1)
     draw_player_nameplate(screen, player)
 
 
@@ -3653,13 +4086,13 @@ def draw_player_stamina_bar(screen, player, now=None):
     bar = player_stamina_bar_rect(player, screen.get_rect())
     stamina = max(0.0, min(PLAYER_MAX_STAMINA, player.get("stamina", PLAYER_MAX_STAMINA)))
     color = UI_CORAL if player.get("stamina_exhaustion_ticks", 0) > 0 else player["color"]
-    pygame.draw.rect(screen, UI_BG, bar)
+    render_draw.rect(screen, UI_BG, bar)
     inner = bar.inflate(-2, -2)
     fill = inner.copy()
     fill.width = round(inner.width * stamina / PLAYER_MAX_STAMINA)
     if fill.width:
-        pygame.draw.rect(screen, color, fill)
-    pygame.draw.rect(screen, UI_MUTED, bar, 1)
+        render_draw.rect(screen, color, fill)
+    render_draw.rect(screen, UI_MUTED, bar, 1)
 
 
 def draw_animated_enemy(screen, enemy):
@@ -3670,7 +4103,7 @@ def draw_animated_enemy(screen, enemy):
         if not _POTATO_MODE and graphics_feature_enabled("glow"):
             draw_soft_glow(screen, rect.center, enemy["color"],
                            radius=26 if enemy.get("is_boss") else 18, strength=30)
-        screen.blit(enemy["surface"], rect)
+        screen.blit(static_ship_frame(enemy, enemy["surface"]), rect)
         if enemy.get("milestone_kind"):
             draw_milestone_boss_hull(screen, enemy, 0)
         return
@@ -3699,22 +4132,22 @@ def draw_animated_enemy(screen, enemy):
 
     if enemy.get("animation_style") == "fast" and graphics_feature_enabled("trails"):
         length = 4 + (tick // 3) % 5
-        pygame.draw.line(screen, enemy["color"], (rect.centerx, rect.top),
+        render_draw.line(screen, enemy["color"], (rect.centerx, rect.top),
                          (rect.centerx, rect.top - length), 2)
     if enemy.get("animation_fire", 0):
         radius = 2 + enemy["animation_fire"] // 2
         center = (rect.centerx, rect.bottom + 2)
-        pygame.draw.circle(screen, enemy["color"], center, radius + 2, 1)
-        pygame.draw.circle(screen, UI_TEXT, center, max(1, radius // 2))
+        render_draw.circle(screen, enemy["color"], center, radius + 2, 1)
+        render_draw.circle(screen, UI_TEXT, center, max(1, radius // 2))
     if enemy.get("is_boss"):
         draw_boss_charge_accents(screen, enemy, tick)
     support = enemy.get("animation_support", 0)
     if support:
-        pygame.draw.circle(screen, enemy["color"], rect.center, 12 + (24 - support) * 3, 1)
+        render_draw.circle(screen, enemy["color"], rect.center, 12 + (24 - support) * 3, 1)
     warp = enemy.get("animation_warp", 0)
     if warp:
         for center in (rect.center, enemy.get("animation_warp_origin", rect.center)):
-            pygame.draw.circle(screen, UI_CYAN, center, 6 + (16 - warp) * 2, 2)
+            render_draw.circle(screen, UI_CYAN, center, 6 + (16 - warp) * 2, 2)
     if enemy.get("milestone_kind"):
         draw_milestone_boss_hull(screen, enemy, tick)
 
@@ -3737,11 +4170,11 @@ def draw_boss_charge_accents(screen, enemy, tick):
     # Two six-cell rails make a pending volley conspicuous, close to its hull.
     for side in (-1, 1):
         rail_x = rect.centerx + side * max(12, rect.width // 3)
-        pygame.draw.line(screen, blend_color(color, UI_BG, .4),
+        render_draw.line(screen, blend_color(color, UI_BG, .4),
                          (rail_x, rect.top + 4), (rail_x, rect.bottom - 4), 2)
         for index in range(lit):
             y = rect.bottom - 6 - round(index * max(1, rect.height - 12) / 6)
-            pygame.draw.line(screen, bright, (rail_x - 4, y), (rail_x + 4, y), 2)
+            render_draw.line(screen, bright, (rail_x - 4, y), (rail_x + 4, y), 2)
         if charge > 0:
             # Small fixed-size glows use only three shared strength variants.
             draw_soft_glow(screen, (rail_x, rect.bottom), color, radius=12,
@@ -3750,10 +4183,10 @@ def draw_boss_charge_accents(screen, enemy, tick):
         if fire:
             reach = 4 + min(8, fire)
             muzzle = (rail_x, rect.bottom + 2)
-            pygame.draw.polygon(screen, color, ((muzzle[0] - 4, muzzle[1]),
+            render_draw.polygon(screen, color, ((muzzle[0] - 4, muzzle[1]),
                                 (muzzle[0], muzzle[1] + reach),
                                 (muzzle[0] + 4, muzzle[1])))
-            pygame.draw.line(screen, UI_TEXT, muzzle,
+            render_draw.line(screen, UI_TEXT, muzzle,
                              (muzzle[0], muzzle[1] + reach - 2), 2)
 
 
@@ -3763,9 +4196,9 @@ def draw_milestone_boss_hull(screen, enemy, tick):
     x, y = rect.center
     if _POTATO_MODE:
         core = max(4, rect.height // 10)
-        pygame.draw.circle(screen, enemy["color"], (x, y), core, 2)
+        render_draw.circle(screen, enemy["color"], (x, y), core, 2)
         if enemy.get("stagger_remaining", 0) > 0:
-            pygame.draw.circle(screen, UI_MINT, (x, y), core + 9, 2)
+            render_draw.circle(screen, UI_MINT, (x, y), core + 9, 2)
         return
     animated = graphics_feature_enabled("animations")
     tick = tick if animated else 0
@@ -3782,33 +4215,33 @@ def draw_milestone_boss_hull(screen, enemy, tick):
             for level in (-1, 1):
                 anchor = (x + side * (rect.width // 2 - 6), y + level * rect.height // 4)
                 end = (anchor[0] + side * 9, anchor[1] + level * 5)
-                pygame.draw.line(screen, color, anchor, end, 3)
-                pygame.draw.circle(screen, light, end, 3)
-                pygame.draw.line(screen, light, (anchor[0] - side * 8, anchor[1]),
+                render_draw.line(screen, color, anchor, end, 3)
+                render_draw.circle(screen, light, end, 3)
+                render_draw.line(screen, light, (anchor[0] - side * 8, anchor[1]),
                                  (anchor[0] - side * 2, anchor[1]), 2)
         for side in (-1, 1):
             armor = pygame.Rect(x + side * (rect.width // 3) - 8, y - rect.height // 4,
                                 16, rect.height // 2)
-            pygame.draw.rect(screen, blend_color(color, UI_BG, .4), armor)
-            pygame.draw.rect(screen, light, armor, 2)
+            render_draw.rect(screen, blend_color(color, UI_BG, .4), armor)
+            render_draw.rect(screen, light, armor, 2)
         aperture = pygame.Rect(x - core, y - core, core * 2, core * 2)
-        pygame.draw.rect(screen, UI_BG, aperture.inflate(5, 5), border_radius=3)
-        pygame.draw.rect(screen, light, aperture, 2, border_radius=2)
-        pygame.draw.line(screen, light, (x - core + 3, y), (x + core - 3, y), 2)
+        render_draw.rect(screen, UI_BG, aperture.inflate(5, 5), border_radius=3)
+        render_draw.rect(screen, light, aperture, 2, border_radius=2)
+        render_draw.line(screen, light, (x - core + 3, y), (x + core - 3, y), 2)
     elif kind == "helix":
         # Two opposed, counter-rotating strands give this organic hull its name.
         ellipse = rect.inflate(16, 8)
-        pygame.draw.ellipse(screen, blend_color(color, UI_BG, .35), ellipse, 1)
+        render_draw.ellipse(screen, blend_color(color, UI_BG, .35), ellipse, 1)
         for index in range(4):
             angle = tick / 38 * (1 if index % 2 == 0 else -1) + index * math.pi / 2
             node = (round(x + math.cos(angle) * ellipse.width / 2),
                     round(y + math.sin(angle) * ellipse.height / 2))
-            pygame.draw.circle(screen, light if index % 2 else color, node, 3)
+            render_draw.circle(screen, light if index % 2 else color, node, 3)
             inner = (round(x + math.cos(angle) * ellipse.width * .35),
                      round(y + math.sin(angle) * ellipse.height * .35))
-            pygame.draw.line(screen, color, inner, node, 2)
-        pygame.draw.circle(screen, UI_BG, (x, y), core + 3)
-        pygame.draw.circle(screen, light, (x, y), core, 2)
+            render_draw.line(screen, color, inner, node, 2)
+        render_draw.circle(screen, UI_BG, (x, y), core + 3)
+        render_draw.circle(screen, light, (x, y), core, 2)
     elif kind == "tempest":
         # Angular turbine fins and short charged traces stay close to the hull.
         for side in (-1, 1):
@@ -3816,15 +4249,15 @@ def draw_milestone_boss_hull(screen, enemy, tick):
                       (x + side * (rect.width // 2 + 8), y),
                       (x + side * (rect.width // 2 - 4), y + 5),
                       (x + side * (rect.width // 2 + 3), y + rect.height // 4)]
-            pygame.draw.lines(screen, light, False, points, 2)
-            pygame.draw.lines(screen, color, False,
+            render_draw.lines(screen, light, False, points, 2)
+            render_draw.lines(screen, color, False,
                               [(x + side * rect.width // 5, rect.top + 5),
                                (x + side * rect.width // 3, rect.top - 6),
                                (x + side * (rect.width // 2 + 8), rect.top + 4)], 2)
         diamond = ((x, y - core - 3), (x + core, y),
                    (x, y + core + 3), (x - core, y))
-        pygame.draw.polygon(screen, UI_BG, diamond)
-        pygame.draw.polygon(screen, light, diamond, 2)
+        render_draw.polygon(screen, UI_BG, diamond)
+        render_draw.polygon(screen, light, diamond, 2)
     elif kind == "eclipse":
         # A broken orbital crown surrounds a dark, pulsating central eclipse.
         crown = pygame.Rect(0, 0, rect.width - 12, rect.height + 22)
@@ -3832,27 +4265,27 @@ def draw_milestone_boss_hull(screen, enemy, tick):
         angle = tick / 90
         for index in range(3):
             start = angle + index * math.tau / 3
-            pygame.draw.arc(screen, light, crown, start, start + 1.5, 2)
+            render_draw.arc(screen, light, crown, start, start + 1.5, 2)
             node = (round(x + math.cos(start) * crown.width / 2),
                     round(y - math.sin(start) * crown.height / 2))
-            pygame.draw.circle(screen, color, node, 3)
+            render_draw.circle(screen, color, node, 3)
             outer = (round(x + math.cos(start) * (crown.width / 2 + 9)),
                      round(y - math.sin(start) * (crown.height / 2 + 9)))
-            pygame.draw.line(screen, light, node, outer, 3)
-        pygame.draw.circle(screen, UI_BG, (x, y), core + 5)
-        pygame.draw.circle(screen, light, (x, y), core + 5, 2)
-        pygame.draw.circle(screen, color, (x, y), core + 9, 1)
+            render_draw.line(screen, light, node, outer, 3)
+        render_draw.circle(screen, UI_BG, (x, y), core + 5)
+        render_draw.circle(screen, light, (x, y), core + 5, 2)
+        render_draw.circle(screen, color, (x, y), core + 9, 1)
     # A bright core and three discrete phase marks read consistently across hulls.
     core_color = UI_MINT if enemy.get("stagger_remaining", 0) > 0 else light
-    pygame.draw.circle(screen, core_color, (x, y), max(2, core // 3))
+    render_draw.circle(screen, core_color, (x, y), max(2, core // 3))
     for index in range(3):
         marker = pygame.Rect(x - 12 + index * 9, rect.top + 2, 6, 3)
-        pygame.draw.rect(screen, phase_color if index < phase else blend_color(color, UI_BG, .65), marker)
+        render_draw.rect(screen, phase_color if index < phase else blend_color(color, UI_BG, .65), marker)
     if animated and not low_effects_mode():
         charge = milestone_stagger_ratio(enemy)
         if charge:
             aperture = pygame.Rect(x - core - 4, y - core - 4, (core + 4) * 2, (core + 4) * 2)
-            pygame.draw.arc(screen, UI_MINT, aperture, -math.pi / 2,
+            render_draw.arc(screen, UI_MINT, aperture, -math.pi / 2,
                             -math.pi / 2 + max(.02, charge * math.tau), 2)
     if enemy.get("stagger_remaining", 0) > 0:
         # Broken-core sparks remain confined to the ship, with no danger ring.
@@ -3862,7 +4295,7 @@ def draw_milestone_boss_hull(screen, enemy, tick):
             start = (round(x + math.cos(angle) * (core + 6)),
                      round(y + math.sin(angle) * (core + 6)))
             end = (round(x + math.cos(angle) * reach), round(y + math.sin(angle) * reach))
-            pygame.draw.line(screen, UI_MINT, start, end, 2)
+            render_draw.line(screen, UI_MINT, start, end, 2)
 
 
 def enemy_animation_style(enemy_type):
@@ -3968,8 +4401,8 @@ def draw_bunkers(screen, bunkers, players):
     for block in bunkers:
         color = colors[bunker_group_for_block(block)]
         shade = 0.25 if (block.x // BLOCK_SIZE + block.y // BLOCK_SIZE) % 2 else 0.08
-        pygame.draw.rect(screen, blend_color(color, UI_BG, shade), block, border_radius=1)
-        pygame.draw.line(screen, blend_color(color, UI_TEXT, 0.4), block.topleft, block.topright)
+        render_draw.rect(screen, blend_color(color, UI_BG, shade), block, border_radius=1)
+        render_draw.line(screen, blend_color(color, UI_TEXT, 0.4), block.topleft, block.topright)
 
 
 def create_bunkers():
@@ -4141,24 +4574,24 @@ def update_and_draw_particles(screen, particles, advance=True):
             continue
         if p.get("kind") == "lightning_arc":
             if level != "full":
-                pygame.draw.line(screen, p["color"], p["points"][0], p["points"][-1], 1)
+                render_draw.line(screen, p["color"], p["points"][0], p["points"][-1], 1)
             else:
-                pygame.draw.lines(screen, p["color"], False, p["points"], 4)
-                pygame.draw.lines(screen, UI_TEXT, False, p["points"], 1)
+                render_draw.lines(screen, p["color"], False, p["points"], 4)
+                render_draw.lines(screen, UI_TEXT, False, p["points"], 1)
         elif p.get("kind") == "momentum":
             alpha = p["lifetime"] / p["max_lifetime"]
             x, y = int(p["x"]), int(p["y"])
-            pygame.draw.line(screen, p["color"],
+            render_draw.line(screen, p["color"],
                              (x - round(p["dx"] * 0.7), y - round(p["dy"] * 0.7)),
                              (x, y), max(1, round(3 * alpha)))
-            pygame.draw.circle(screen, UI_TEXT, (x, y), max(1, round(2 * alpha)))
+            render_draw.circle(screen, UI_TEXT, (x, y), max(1, round(2 * alpha)))
         elif p.get("kind") in ("powerup_pickup", "shatter"):
             draw_powerup_collection_particle(screen, p)
         elif p.get("kind") == "nova_pulse":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             radius = max(1, round(p["radius"] * min(1, progress * 1.6)))
             if level == "off":
-                pygame.draw.circle(screen, p["color"], (round(p["x"]), round(p["y"])), radius, 2)
+                render_draw.circle(screen, p["color"], (round(p["x"]), round(p["y"])), radius, 2)
             else:
                 size = int(p["radius"] * 2 + 8)
                 position = (round(p["x"]), round(p["y"]))
@@ -4176,15 +4609,15 @@ def update_and_draw_particles(screen, particles, advance=True):
                 pulse = pygame.Surface(bounds.size, pygame.SRCALPHA)
                 center = (position[0] - bounds.x, position[1] - bounds.y)
                 alpha = round(190 * (1 - progress))
-                pygame.draw.circle(pulse, (*p["color"], alpha), center, radius, 3)
-                pygame.draw.circle(pulse, (*UI_TEXT, alpha // 2), center, max(1, radius - 9), 1)
+                render_draw.circle(pulse, (*p["color"], alpha), center, radius, 3)
+                render_draw.circle(pulse, (*UI_TEXT, alpha // 2), center, max(1, radius - 9), 1)
                 screen.blit(pulse, bounds.topleft)
         elif p.get("kind") == "bomb_blast":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             radius = max(1, round(p["radius"] * progress))
             position = (round(p["x"]), round(p["y"]))
             if level == "reduced":
-                pygame.draw.circle(screen, p["color"], position, radius, 2)
+                render_draw.circle(screen, p["color"], position, radius, 2)
                 continue
             bounds = pygame.Rect(position[0] - radius - 3, position[1] - radius - 3,
                                  radius * 2 + 7, radius * 2 + 7).clip(screen.get_clip())
@@ -4193,14 +4626,14 @@ def update_and_draw_particles(screen, particles, advance=True):
             pulse = pygame.Surface(bounds.size, pygame.SRCALPHA)
             center = (position[0] - bounds.x, position[1] - bounds.y)
             alpha = round(190 * (1 - progress))
-            pygame.draw.circle(pulse, (*p["color"], alpha), center, radius, 4)
-            pygame.draw.circle(pulse, (*UI_GOLD, alpha // 2), center,
+            render_draw.circle(pulse, (*p["color"], alpha), center, radius, 4)
+            render_draw.circle(pulse, (*UI_GOLD, alpha // 2), center,
                                max(1, radius - 7), 2)
             screen.blit(pulse, bounds.topleft)
         elif p.get("kind") == "ring":
             progress = 1 - p["lifetime"] / p["max_lifetime"]
             ring_radius = int(p["radius"] + progress * 28)
-            pygame.draw.circle(
+            render_draw.circle(
                 screen,
                 p["color"],
                 (int(p["x"]), int(p["y"])),
@@ -4210,7 +4643,7 @@ def update_and_draw_particles(screen, particles, advance=True):
         else:
             current_radius = int(p["radius"] * (p["lifetime"] / p["max_lifetime"]))
             if current_radius > 0:
-                pygame.draw.circle(screen, p["color"], (int(p["x"]), int(p["y"])), current_radius)
+                render_draw.circle(screen, p["color"], (int(p["x"]), int(p["y"])), current_radius)
     if advance:
         particles[:] = [p for p in particles if p["lifetime"] > 0]
 
@@ -5893,8 +6326,8 @@ def draw_energy_flow(screen, rect, color, time_ms, *, horizontal=False, reverse=
                           (x + breadth // 2, y + band_length + bend),
                           (x, y + band_length))
                 edge_points = points[:3]
-            pygame.draw.polygon(screen, fill, points)
-            pygame.draw.lines(screen, edge, False, edge_points, 1 if warning else 2)
+            render_draw.polygon(screen, fill, points)
+            render_draw.lines(screen, edge, False, edge_points, 1 if warning else 2)
     finally:
         screen.set_clip(old_clip)
 
@@ -5905,14 +6338,14 @@ def draw_milestone_safe_corridor(screen, gap, *, warning=False):
     if warning:
         fill = ((*UI_MINT, 15) if screen.get_flags() & pygame.SRCALPHA
                 else blend_color(UI_BG, UI_MINT, .055))
-        pygame.draw.rect(screen, fill, gap)
-    pygame.draw.rect(screen, UI_MINT, gap, 2)
+        render_draw.rect(screen, fill, gap)
+    render_draw.rect(screen, UI_MINT, gap, 2)
     label = cached_ui_text(hud_font(18), "SAFE", UI_MINT,
                            max_width=max(16, min(100, gap.width - 8)), max_height=16)
     vertical = gap.height >= SCREEN_HEIGHT - GAMEPLAY_TOP
     center = (gap.centerx, min(screen.get_height() - 60, gap.bottom - 26)) if vertical else gap.center
     label_rect = label.get_rect(center=center)
-    pygame.draw.rect(screen, UI_BG, label_rect.inflate(8, 4), border_radius=3)
+    render_draw.rect(screen, UI_BG, label_rect.inflate(8, 4), border_radius=3)
     screen.blit(label, label_rect)
 
 
@@ -5925,14 +6358,14 @@ def draw_direction_chevrons(screen, rect, dx, dy, color, spacing=120):
         sign = 1 if dy > 0 else -1
         y = rect.centery
         for x in range(rect.left + min(24, rect.width // 2), rect.right, spacing):
-            pygame.draw.lines(screen, color, False,
+            render_draw.lines(screen, color, False,
                               [(x - 5, y - sign * 3), (x, y + sign * 3),
                                (x + 5, y - sign * 3)], 2)
     else:
         sign = 1 if dx > 0 else -1
         x = rect.centerx
         for y in range(rect.top + min(24, rect.height // 2), rect.bottom, spacing):
-            pygame.draw.lines(screen, color, False,
+            render_draw.lines(screen, color, False,
                               [(x - sign * 3, y - 5), (x + sign * 3, y),
                                (x - sign * 3, y + 5)], 2)
 
@@ -5954,7 +6387,7 @@ def draw_milestone_wall_warning(screen, warning, color, bright, elapsed):
             path = pygame.Rect(0, rect.y, SCREEN_WIDTH, rect.height)
         else:
             path = pygame.Rect(rect.x, GAMEPLAY_TOP, rect.width, SCREEN_HEIGHT - GAMEPLAY_TOP)
-        pygame.draw.rect(screen, color, path, 1)
+        render_draw.rect(screen, color, path, 1)
         if animated:
             offset = (elapsed * 2) % 90
             if abs(dx) > abs(dy):
@@ -5981,13 +6414,13 @@ def draw_milestone_wall_warning(screen, warning, color, bright, elapsed):
         else:
             edges = ((gap.topleft, gap.bottomleft), (gap.topright, gap.bottomright))
         for start, end in edges:
-            pygame.draw.line(screen, gap_color, start, end, 2)
+            render_draw.line(screen, gap_color, start, end, 2)
         if len(gaps) > 1:
             label = cached_ui_text(hud_font(18), f"GAP {index + 1}", gap_color,
                                    max_width=max(24, min(120, gap.width - 8)), max_height=16)
             label_rect = label.get_rect(center=(gap.centerx,
                 min(SCREEN_HEIGHT - 24, max(130, gap.top + 24) + index * 36)))
-            pygame.draw.rect(screen, UI_BG, label_rect.inflate(10, 6), border_radius=3)
+            render_draw.rect(screen, UI_BG, label_rect.inflate(10, 6), border_radius=3)
             screen.blit(label, label_rect)
 
 
@@ -6001,22 +6434,22 @@ def draw_milestone_attack_warning(screen, enemy, show_label=True):
     elapsed = warning["warning_frames"] - warning["remaining_frames"]
     bright = blend_color(color, UI_TEXT, .3 + .2 * math.sin(elapsed * .2)) if animated else color
     for rect in warning["beams"]:
-        pygame.draw.rect(screen, color, rect, 2)
-        pygame.draw.line(screen, bright, rect.midtop, rect.midbottom, 1)
+        render_draw.rect(screen, color, rect, 2)
+        render_draw.line(screen, bright, rect.midtop, rect.midbottom, 1)
         draw_energy_flow(screen, rect, color, elapsed * (1000 / 60),
                          horizontal=rect.width > rect.height and not warning.get("exclusion_zone"),
                          warning=True)
     draw_milestone_wall_warning(screen, warning, color, bright, elapsed)
     for x, y in warning.get("target_marks", ()):
         center = (round(x), round(y))
-        pygame.draw.circle(screen, color, center, 22, 2)
-        pygame.draw.line(screen, bright, (center[0] - 29, center[1]), (center[0] + 29, center[1]), 1)
-        pygame.draw.line(screen, bright, (center[0], center[1] - 29), (center[0], center[1] + 29), 1)
+        render_draw.circle(screen, color, center, 22, 2)
+        render_draw.line(screen, bright, (center[0] - 29, center[1]), (center[0] + 29, center[1]), 1)
+        render_draw.line(screen, bright, (center[0], center[1] - 29), (center[0], center[1] + 29), 1)
     for x, y, dx, dy, size, _ in warning["shots"]:
         speed = max(.01, math.hypot(dx, dy))
         end = (round(x + dx / speed * 90), round(y + dy / speed * 90))
-        pygame.draw.circle(screen, color, (round(x), round(y)), max(4, size // 2), 1)
-        pygame.draw.line(screen, bright, (round(x), round(y)), end, 1)
+        render_draw.circle(screen, color, (round(x), round(y)), max(4, size // 2), 1)
+        render_draw.line(screen, bright, (round(x), round(y)), end, 1)
     if show_label:
         draw_milestone_warning_caption(screen, enemy, bright)
 
@@ -6035,7 +6468,7 @@ def draw_milestone_warning_caption(screen, enemy, color=None):
                            max_height=max(6, round(13 * scale)))
     rect = label.get_rect(midtop=(enemy["rect"].centerx,
                                   enemy["rect"].bottom + max(4, round(10 * scale))))
-    pygame.draw.rect(screen, UI_BG, rect.inflate(6, 4))
+    render_draw.rect(screen, UI_BG, rect.inflate(6, 4))
     screen.blit(label, rect)
 
 
@@ -8378,7 +8811,7 @@ def draw_pause_overlay(screen, font, save_error=None):
     panel.center = (SCREEN_WIDTH // 2, max(panel.height // 2 + 12, SCREEN_HEIGHT // 2 - 32))
     draw_neon_panel(screen, panel, UI_VIOLET)
     draw_neon_title(screen, "PAUSED (ESC)", font, (panel.centerx, panel.y + 46), UI_CYAN)
-    note_font = pygame.font.SysFont(None, 24)
+    note_font = resolution_font(None, 24)
     draw_fitted_text(screen, "Autosave failed. Progress may not be saved." if save_error
                      else "Auto-saved at wave start. CONTINUE restarts the wave.",
                      note_font, UI_CORAL if save_error else UI_MUTED,
@@ -8394,7 +8827,7 @@ def draw_fitted_text(screen, text, font, color, rect, align="center"):
     factor = min(1.0, rect.width / max(1, rendered.get_width()),
                  rect.height / max(1, rendered.get_height()))
     if factor < 1:
-        rendered = pygame.transform.smoothscale(rendered,
+        rendered = scale_render_surface(rendered,
             (max(1, round(rendered.get_width() * factor)),
              max(1, round(rendered.get_height() * factor))))
     destination = rendered.get_rect(center=rect.center)
@@ -8408,24 +8841,45 @@ def compact_menu_layout():
     return SCREEN_WIDTH < 1100 or SCREEN_HEIGHT < 720
 
 
+def start_screen_frame():
+    """Keep the menu together on wide or tall displays instead of stretching it.
+
+    These are interface coordinates, independent of combat arena dimensions.
+    The display adapter supplies automatic monitor density before this layout.
+    """
+    margin = max(24, round(min(SCREEN_WIDTH, 1600) * .045))
+    width = min(1440, SCREEN_WIDTH - 2 * margin)
+    height = min(760, SCREEN_HEIGHT - 80)
+    return pygame.Rect((SCREEN_WIDTH - width) // 2,
+                       (SCREEN_HEIGHT - height) // 2, width, height)
+
+
 def compact_start_layout():
     margin = 20 if SCREEN_WIDTH >= 700 else 14
     low = SCREEN_HEIGHT < 500
-    top = 70 if low else 156
-    launch = pygame.Rect(margin, top, SCREEN_WIDTH - margin * 2, 104 if low else 142)
+    width = min(900, SCREEN_WIDTH - margin * 2)
+    left = (SCREEN_WIDTH - width) // 2
+    group_height = min(540, SCREEN_HEIGHT - 28)
+    group_top = (SCREEN_HEIGHT - group_height) // 2
+    title = pygame.Rect(left, 12 if low else group_top, width, 30 if low else 54)
+    objective = pygame.Rect(left, 45 if low else group_top + 62, width, 24 if low else 44)
+    top = 78 if low else group_top + 122
+    launch = pygame.Rect(left, top, width, 104 if low else 142)
     choices = []
     gap = 10
-    width = (launch.width - 32 - gap) // 2
+    choice_width = (launch.width - 32 - gap) // 2
     height = 28 if low else 34
     for index in range(4):
-        choices.append(pygame.Rect(launch.x + 16 + index % 2 * (width + gap),
-            launch.y + (26 if low else 44) + index // 2 * (height + 9), width, height))
-    controls = pygame.Rect(margin, launch.bottom + 12, launch.width,
-                           min(150, SCREEN_HEIGHT - launch.bottom - 80))
+        choices.append(pygame.Rect(launch.x + 16 + index % 2 * (choice_width + gap),
+            launch.y + (26 if low else 44) + index // 2 * (height + 9), choice_width, height))
+    controls = pygame.Rect(left, launch.bottom + 12, launch.width,
+                           SCREEN_HEIGHT - 260 if low else group_height - 328)
     actions_width = (launch.width - 20) // 3
-    actions = [pygame.Rect(margin + i * (actions_width + 10), SCREEN_HEIGHT - 50,
+    actions_y = SCREEN_HEIGHT - 54 if low else controls.bottom + 14
+    actions = [pygame.Rect(left + i * (actions_width + 10), actions_y,
                            actions_width, 34) for i in range(3)]
-    return {"controls": controls, "launch": launch, "choices": choices,
+    return {"title": title, "objective": objective,
+            "controls": controls, "launch": launch, "choices": choices,
             "continue": actions[0], "start": actions[1], "journal": actions[2]}
 
 
@@ -8434,13 +8888,14 @@ def start_screen_panels():
     if compact_menu_layout():
         layout = compact_start_layout()
         return layout["controls"], layout["launch"]
-    margin = max(36, int(SCREEN_WIDTH * 0.045))
+    frame = start_screen_frame()
     gap = 24
-    panel_y = int(SCREEN_HEIGHT * 0.365)
-    panel_height = min(430, SCREEN_HEIGHT - panel_y - 82)
-    left_width = int((SCREEN_WIDTH - margin * 2 - gap) * 0.59)
-    controls = pygame.Rect(margin, panel_y, left_width, panel_height)
-    launch = pygame.Rect(controls.right + gap, panel_y, SCREEN_WIDTH - margin - controls.right - gap, panel_height)
+    panel_y = frame.y + 216
+    panel_height = min(430, frame.height - 258)
+    left_width = round((frame.width - gap) * .58)
+    controls = pygame.Rect(frame.x, panel_y, left_width, panel_height)
+    launch = pygame.Rect(controls.right + gap, panel_y,
+                         frame.right - controls.right - gap, panel_height)
     return controls, launch
 
 
@@ -8456,13 +8911,10 @@ def menu_control_layout():
     else:
         choice_width = (launch.width - 64) // 2
         choices = [pygame.Rect(launch.x + 24 + index % 2 * (choice_width + 16),
-                   launch.y + 70 + index // 2 * 56, choice_width, 44) for index in range(4)]
-        start = pygame.Rect(0, 0, launch.width - 48, 52)
-        start.center = (launch.centerx, launch.bottom - 109)
-        saves = pygame.Rect(0, 0, launch.width - 48, 45)
-        saves.center = (launch.centerx, launch.bottom - 173)
-        journal = pygame.Rect(0, 0, launch.width - 48, 44)
-        journal.center = (launch.centerx, launch.bottom - 45)
+                   launch.y + 60 + index // 2 * 54, choice_width, 42) for index in range(4)]
+        start = pygame.Rect(launch.x + 24, launch.bottom - 122, launch.width - 48, 48)
+        saves = pygame.Rect(launch.x + 24, launch.bottom - 176, launch.width - 48, 40)
+        journal = pygame.Rect(launch.x + 24, launch.bottom - 60, launch.width - 48, 40)
     nav_height = 34 if SCREEN_HEIGHT < 500 else 42
     nav_width = min(150, (SCREEN_WIDTH - 64) // 3)
     journal_back = pygame.Rect(0, 0, nav_width, nav_height)
@@ -8594,10 +9046,10 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
                     (SCREEN_WIDTH // 2, round(SCREEN_HEIGHT * 0.10)), UI_CYAN)
     subtitle = font.render(f"{SAVE_SLOT_COUNT} slots. Each run autosaves to its own file.", True, UI_TEXT)
     screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_WIDTH // 2, round(SCREEN_HEIGHT * 0.18))))
-    detail_font = pygame.font.SysFont(None, 23 if SCREEN_WIDTH >= 1400 else 21)
-    date_font = pygame.font.SysFont(None, 21 if SCREEN_WIDTH >= 1400 else 19)
-    player_count_font = pygame.font.SysFont(None, 28 if SCREEN_WIDTH >= 1400 else 26)
-    action_font = pygame.font.SysFont(None, 22)
+    detail_font = resolution_font(None, 23 if SCREEN_WIDTH >= 1400 else 21)
+    date_font = resolution_font(None, 21 if SCREEN_WIDTH >= 1400 else 19)
+    player_count_font = resolution_font(None, 28 if SCREEN_WIDTH >= 1400 else 26)
+    action_font = resolution_font(None, 22)
     for card in layout["cards"]:
         slot, panel = card["slot"], card["panel"]
         snapshot = saved_slots[slot - 1] if slot <= len(saved_slots) else None
@@ -8624,7 +9076,7 @@ def draw_save_browser(screen, saved_slots, title_font, button_font, font,
             for index, (text, color) in enumerate(lines):
                 surface = detail_font.render(text, True, color)
                 if surface.get_width() > panel.width - 36:
-                    surface = pygame.transform.smoothscale(surface,
+                    surface = scale_render_surface(surface,
                         (panel.width - 36, surface.get_height()))
                 screen.blit(surface, surface.get_rect(midtop=(panel.centerx, panel.top + 133 + index * 25)))
             try:
@@ -8914,10 +9366,10 @@ def draw_save_action_dialog(screen, action, layout, button_font, font):
         draw_fitted_text(screen, "Ctrl+A selects; Ctrl+V pastes. Enter confirms; Esc cancels.",
                          font, UI_MUTED, pygame.Rect(dialog.x + 20, dialog.y + 150, dialog.width - 40, 26))
     if action.get("error"):
-        error_font = pygame.font.SysFont(None, 21)
+        error_font = resolution_font(None, 21)
         error = error_font.render(action["error"], True, UI_CORAL)
         if error.get_width() > dialog.width - 40:
-            error = pygame.transform.smoothscale(error, (dialog.width - 40, error.get_height()))
+            error = scale_render_surface(error, (dialog.width - 40, error.get_height()))
         screen.blit(error, error.get_rect(center=(dialog.centerx, dialog.bottom - 98)))
     label = ("SAVE NAME" if kind == "rename" else "DELETE SAVE" if kind == "delete"
              else "CONFIRM REPLACE" if stage == "overwrite" else kind.upper())
@@ -8957,10 +9409,11 @@ def draw_start_screen(
         draw_compact_start_screen(screen, title_font, button_font, player_choice_font,
                                   player_count, save_error, saved_slots)
         return
-    cx = SCREEN_WIDTH // 2
-    draw_neon_title(screen, "SPACE INVADERS", title_font, (cx, int(SCREEN_HEIGHT * 0.13)), UI_CYAN)
+    frame = start_screen_frame()
+    cx = frame.centerx
+    draw_neon_title(screen, "SPACE INVADERS", title_font, (cx, frame.y + 42), UI_CYAN)
     controls_panel, launch_panel = start_screen_panels()
-    objective_panel = pygame.Rect(controls_panel.x, int(SCREEN_HEIGHT * 0.22), SCREEN_WIDTH - controls_panel.x * 2, 80)
+    objective_panel = pygame.Rect(frame.x, frame.y + 114, frame.width, 76)
     draw_neon_panel(screen, objective_panel, UI_VIOLET)
     draw_menu_objective(screen, objective_panel.inflate(-32, -12),
                          34 if SCREEN_WIDTH < 1600 else 38)
@@ -8972,20 +9425,24 @@ def draw_start_screen(
     launch_heading = player_choice_font.render("ASSEMBLE YOUR SQUAD", True, UI_PINK)
     screen.blit(launch_heading, launch_heading.get_rect(center=(launch_panel.centerx, launch_panel.y + 31)))
     control_labels = tuple(player_control_labels(index) for index in range(4))
-    control_font = pygame.font.SysFont(None, 21 if SCREEN_WIDTH < 1400 else 23)
+    control_font = resolution_font(None, 21 if SCREEN_WIDTH < 1400 else 23)
     row_height = min(76, (controls_panel.height - 82) // 4)
     for index, (movement, firing) in enumerate(control_labels):
         row_y = controls_panel.y + 61 + index * row_height
         color = PLAYER_COLORS[index]
         active = index < player_count
-        pygame.draw.rect(screen, color if active else (50, 59, 83), (controls_panel.x + 20, row_y, 4, row_height - 12), border_radius=2)
+        render_draw.rect(screen, color if active else (50, 59, 83), (controls_panel.x + 20, row_y, 4, row_height - 12), border_radius=2)
         draw_fitted_text(screen, player_display_name(index + 1), player_choice_font,
                          color if active else UI_MUTED,
                          pygame.Rect(controls_panel.x + 36, row_y, 122, 24), "left")
         draw_fitted_text(screen, f"MOVE   {movement}", control_font, UI_TEXT if active else UI_MUTED,
                          pygame.Rect(controls_panel.x + 170, row_y, controls_panel.width - 190, 24), "left")
-        draw_fitted_text(screen, f"FIRE     {firing}", control_font, color if active else UI_MUTED,
-                         pygame.Rect(controls_panel.x + 170, row_y + 24, controls_panel.width - 190, 24), "left")
+        fire_label, _, sprint_label = firing.partition("  /  HOLD ")
+        draw_fitted_text(screen, f"FIRE     {fire_label}", control_font, color if active else UI_MUTED,
+                         pygame.Rect(controls_panel.x + 170, row_y + 22, controls_panel.width - 190, 22), "left")
+        draw_fitted_text(screen, f"SPRINT   HOLD {sprint_label.removesuffix(' SPRINT')}",
+                         control_font, UI_TEXT if active else UI_MUTED,
+                         pygame.Rect(controls_panel.x + 170, row_y + 44, controls_panel.width - 190, 22), "left")
     for index, choice_rect in enumerate(choice_button_rects, start=1):
         label = "1 PLAYER" if index == 1 else f"{index} PLAYERS"
         draw_neon_button(screen, choice_rect, label, player_choice_font, PLAYER_COLORS[index - 1], selected=player_count == index)
@@ -8998,21 +9455,22 @@ def draw_start_screen(
     draw_neon_button(screen, journal_button_rect, "JOURNAL", player_choice_font, UI_VIOLET)
     footer_label = ("AUTOSAVE: CONTINUE RESTARTS AT WAVE START  |  ENEMY JOURNAL"
                     if saved_run else "ENEMY INTEL + EVERY POWERUP IN THE JOURNAL")
-    footer = player_choice_font.render(save_error or footer_label, True,
-                                      UI_CORAL if save_error else UI_MUTED)
-    screen.blit(footer, footer.get_rect(center=(cx, SCREEN_HEIGHT - 38)))
+    draw_fitted_text(screen, save_error or footer_label, player_choice_font,
+                     UI_CORAL if save_error else UI_MUTED,
+                     pygame.Rect(frame.x, controls_panel.bottom + 20, frame.width, 26))
 
 
 def draw_compact_start_screen(screen, title_font, button_font, font, player_count,
                               save_error=None, saved_slots=None):
     low = SCREEN_HEIGHT < 500
-    title_right = player_names_button_rect(menu_control_layout()["display_button_rect"]).left - 12
-    draw_fitted_text(screen, "SPACE INVADERS", title_font, UI_CYAN,
-                     pygame.Rect(20, 12 if low else 28, max(100, title_right - 20), 32 if low else 60))
-    draw_menu_objective(screen, pygame.Rect(14 if low else 20, 45 if low else 96,
-                         SCREEN_WIDTH - (28 if low else 40), 24 if low else 44),
-                         20 if low else 24)
     layout = compact_start_layout()
+    title_right = player_names_button_rect(menu_control_layout()["display_button_rect"]).left - 12
+    title = layout["title"].copy()
+    if title.top < 48:
+        title.width = max(100, min(title.width, title_right - title.x))
+    draw_fitted_text(screen, "SPACE INVADERS", title_font, UI_CYAN,
+                     title)
+    draw_menu_objective(screen, layout["objective"], 20 if low else 24)
     draw_neon_panel(screen, layout["launch"], UI_PINK)
     draw_fitted_text(screen, "ASSEMBLE YOUR SQUAD", font, UI_PINK,
                      pygame.Rect(layout["launch"].x + 12, layout["launch"].y + 4,
@@ -9023,12 +9481,19 @@ def draw_compact_start_screen(screen, title_font, button_font, font, player_coun
     controls = layout["controls"]
     draw_neon_panel(screen, controls, UI_CYAN)
     row_height = max(15, (controls.height - 30) // 4)
-    small_font = pygame.font.SysFont(None, 19 if low else 22)
-    draw_fitted_text(screen, "FLIGHT CONTROLS — MOVE / FIRE", small_font, UI_CYAN,
+    small_font = resolution_font(None, 19 if low else 22)
+    draw_fitted_text(screen, "FLIGHT CONTROLS — MOVE / FIRE TOGGLE / SPRINT", small_font, UI_CYAN,
                      pygame.Rect(controls.x + 12, controls.y + 4, controls.width - 24, 21))
-    controls_text = tuple(f"{player_display_name(index + 1)}  {move}  /  {fire}"
-                          for index in range(4)
-                          for move, fire in (player_control_labels(index),))
+    # Primary keys keep the compact help readable; all aliases remain visible
+    # in Display & Keyboard, without changing any actual control bindings.
+    controls_text = []
+    for index, (left, right, up, down, fire) in enumerate(PLAYER_CONTROLS):
+        move = ("ARROWS" if (left, right, up, down) ==
+                (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN)
+                else "/".join(hud_control_key_label(key) for key in (up, left, down, right)))
+        controls_text.append(f"{player_display_name(index + 1)}  {move}  /  "
+                             f"{hud_control_key_label(fire[0])}  /  "
+                             f"{hud_control_key_label(sprint_keys()[index])}")
     for index, text in enumerate(controls_text):
         draw_fitted_text(screen, text, small_font,
                          PLAYER_COLORS[index] if index < player_count else UI_MUTED,
@@ -9040,7 +9505,8 @@ def draw_compact_start_screen(screen, title_font, button_font, font, player_coun
     draw_neon_button(screen, layout["journal"], "JOURNAL", font, UI_VIOLET)
     if save_error:
         draw_fitted_text(screen, save_error, small_font, UI_CORAL,
-                         pygame.Rect(16, SCREEN_HEIGHT - 72, SCREEN_WIDTH - 32, 18))
+                         pygame.Rect(layout["launch"].x, layout["start"].bottom + 2,
+                                     layout["launch"].width, 18))
 
 
 @ui_layout
@@ -9149,7 +9615,7 @@ def draw_enemy_journal(
             sample = generate_pixel_sprite(STANDARD_ART_V1, UI_VIOLET, 48, 36)
             sample_rect = sample.get_rect(center=(card.x + 51, card.centery - 4))
             screen.blit(sample, sample_rect)
-            pygame.draw.rect(screen, color, sample_rect.inflate(12, 12), 2)
+            render_draw.rect(screen, color, sample_rect.inflate(12, 12), 2)
             name_surface = entry_font.render(name, True, color)
             screen.blit(name_surface, (card.x + 102, card.y + 20))
             draw_journal_description(
@@ -9181,8 +9647,8 @@ def draw_enemy_journal(
                 color = POWERUP_COLORS[name]
                 draw_neon_panel(screen, card, color, fill=(10, 16, 38), radius=10)
                 icon_center = (card.x + 27, card.y + 20)
-                pygame.draw.circle(screen, color, icon_center, 15)
-                pygame.draw.circle(screen, (10, 16, 38), icon_center, 12)
+                render_draw.circle(screen, color, icon_center, 15)
+                render_draw.circle(screen, (10, 16, 38), icon_center, 12)
                 draw_powerup_icon(screen, name, icon_center)
                 label_color = UI_CYAN if color == BLUE else color
                 name_surface = entry_font.render(POWERUP_LABELS[name], True, label_color)
@@ -9210,7 +9676,7 @@ def draw_enemy_journal(
                 if enemy_type == "boss":
                     colors = tuple(dict.fromkeys(color for color, _ in BOSS_ATTACKS.values()))
                     for color_index, color in enumerate(colors):
-                        pygame.draw.circle(
+                        render_draw.circle(
                             screen, color,
                             (card.right - 12 - (len(colors) - color_index - 1) * 11, card.y + 19),
                             3,
@@ -9269,7 +9735,7 @@ def draw_responsive_journal(screen, page, title_font, button_font, entry_font,
         elif mutation:
             sprite = generate_pixel_sprite(STANDARD_ART_V1, UI_VIOLET, 28, 22)
             screen.blit(sprite, (card.x + 10, card.y + 9))
-            pygame.draw.rect(screen, accent, (card.x + 7, card.y + 6, 34, 28), 1)
+            render_draw.rect(screen, accent, (card.x + 7, card.y + 6, 34, 28), 1)
         else:
             frames = journal_sprites[name][0]
             sprite = frames[(pygame.time.get_ticks() // 150) % len(frames)]
@@ -9625,18 +10091,18 @@ def check_player_ram_collisions(enemies, particles, enemy_bullets, powerups, pla
 def draw_spawn_shield(screen, x, y, spark_color, now):
     center = (int(x + PLAYER_WIDTH / 2), int(y + PLAYER_HEIGHT / 2))
     if not graphics_feature_enabled("animations"):
-        pygame.draw.circle(screen, CYAN, center, 26, 1)
+        render_draw.circle(screen, CYAN, center, 26, 1)
         return
     phase = now / 250
     radius = 24 + int((math.sin(phase) + 1) * 2)
-    pygame.draw.circle(screen, CYAN, center, radius, 2)
-    pygame.draw.circle(screen, LIGHT_BLUE, center, radius - 5, 1)
+    render_draw.circle(screen, CYAN, center, radius, 2)
+    render_draw.circle(screen, LIGHT_BLUE, center, radius - 5, 1)
 
     for index in range(3):
         angle = phase + index * (2 * math.pi / 3)
         spark_x = center[0] + round(math.cos(angle) * radius)
         spark_y = center[1] + round(math.sin(angle) * radius)
-        pygame.draw.circle(screen, spark_color, (spark_x, spark_y), 3)
+        render_draw.circle(screen, spark_color, (spark_x, spark_y), 3)
 
 
 def draw_respawn_charge(screen, x, y, spark_color, now, respawn_until):
@@ -9646,16 +10112,16 @@ def draw_respawn_charge(screen, x, y, spark_color, now, respawn_until):
     ring_color = blend_color(spark_color, UI_CYAN, 0.45)
     if not graphics_feature_enabled("animations"):
         # A fixed charge marker still identifies the safe return location.
-        pygame.draw.circle(screen, ring_color, center, 25, 1)
+        render_draw.circle(screen, ring_color, center, 25, 1)
         bounds = pygame.Rect(center[0] - 29, center[1] - 29, 58, 58)
         if progress > 0:
-            pygame.draw.arc(screen, spark_color, bounds, -math.pi / 2,
+            render_draw.arc(screen, spark_color, bounds, -math.pi / 2,
                             -math.pi / 2 + math.tau * progress, 2)
-        pygame.draw.line(screen, spark_color, (center[0] - 7, center[1]),
+        render_draw.line(screen, spark_color, (center[0] - 7, center[1]),
                          (center[0] + 7, center[1]), 2)
-        pygame.draw.line(screen, spark_color, (center[0], center[1] - 7),
+        render_draw.line(screen, spark_color, (center[0], center[1] - 7),
                          (center[0], center[1] + 7), 2)
-        pygame.draw.circle(screen, UI_TEXT, center, 3)
+        render_draw.circle(screen, UI_TEXT, center, 3)
         return
     if progress < 0.75:
         radius = 10 + round(40 * progress / 0.75)
@@ -9671,138 +10137,188 @@ def draw_respawn_charge(screen, x, y, spark_color, now, respawn_until):
         bounds = pygame.Rect(center[0] - ring_radius, center[1] - ring_radius,
                              ring_radius * 2, ring_radius * 2)
         start = phase + index * math.tau / 3
-        pygame.draw.arc(screen, ring_color, bounds, start, start + math.pi * 1.35, thickness)
+        render_draw.arc(screen, ring_color, bounds, start, start + math.pi * 1.35, thickness)
         spark_radius = max(2, round(ring_radius * (1 - 0.68 * implode)))
         spark = (round(center[0] + math.cos(start) * spark_radius),
                  round(center[1] + math.sin(start) * spark_radius))
-        pygame.draw.circle(screen, spark_color, spark, 2 if _POTATO_MODE else 3)
+        render_draw.circle(screen, spark_color, spark, 2 if _POTATO_MODE else 3)
 
     core_radius = round(2 + 5 * implode)
-    pygame.draw.circle(screen, UI_TEXT, center, core_radius)
-    pygame.draw.circle(screen, ring_color, center, core_radius + 4, thickness)
+    render_draw.circle(screen, UI_TEXT, center, core_radius)
+    render_draw.circle(screen, ring_color, center, core_radius + 4, thickness)
+
+
+class _ScaledArtworkDraw:
+    """Rasterize small vector icons above logical resolution once per kind."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def point(self, position):
+        return tuple(round(value * self.scale) for value in position)
+
+    def rectangle(self, rect):
+        return tuple(round(value * self.scale) for value in rect)
+
+    def circle(self, surface, color, center, radius, width=0):
+        return render_draw.circle(surface, color, self.point(center), round(radius * self.scale), round(width * self.scale))
+
+    def line(self, surface, color, start, end, width=1):
+        return render_draw.line(surface, color, self.point(start), self.point(end), round(width * self.scale))
+
+    def lines(self, surface, color, closed, points, width=1):
+        return render_draw.lines(surface, color, closed, [self.point(point) for point in points], round(width * self.scale))
+
+    def polygon(self, surface, color, points, width=0):
+        return render_draw.polygon(surface, color, [self.point(point) for point in points], round(width * self.scale))
+
+    def rect(self, surface, color, rect, width=0):
+        return render_draw.rect(surface, color, self.rectangle(rect), round(width * self.scale))
+
+    def ellipse(self, surface, color, rect, width=0):
+        return render_draw.ellipse(surface, color, self.rectangle(rect), round(width * self.scale))
+
+    def arc(self, surface, color, rect, start, stop, width=1):
+        return render_draw.arc(surface, color, self.rectangle(rect), start, stop, round(width * self.scale))
 
 
 def draw_powerup_icon(screen, powerup_type, center):
+    """Use cached antialiased glyphs in Smooth mode, direct shapes in Potato."""
+    if artwork_filter() == "pixel" or not graphics_feature_enabled("animations"):
+        _draw_powerup_icon_primitives(screen, powerup_type, center)
+        return
+    icon = _POWERUP_ICON_CACHE.get(powerup_type)
+    if icon is None:
+        samples = 4
+        canvas = pygame.Surface((32 * samples, 32 * samples), pygame.SRCALPHA)
+        _draw_powerup_icon_primitives(canvas, powerup_type, (16, 16), samples)
+        icon = scale_render_surface(canvas, (32, 32))
+        _POWERUP_ICON_CACHE[powerup_type] = icon
+    screen.blit(icon, (round(center[0]) - 16, round(center[1]) - 16))
+
+
+def _draw_powerup_icon_primitives(screen, powerup_type, center, samples=1):
+    draw = render_draw if samples == 1 else _ScaledArtworkDraw(samples)
     x, y = center
     if powerup_type == "revive":
-        pygame.draw.circle(screen, WHITE, (x, y - 4), 5)
-        pygame.draw.circle(screen, WHITE, (x, y + 4), 5)
-        pygame.draw.line(screen, WHITE, (x - 9, y), (x + 9, y), 2)
-        pygame.draw.line(screen, WHITE, (x, y - 9), (x, y + 9), 2)
+        draw.circle(screen, WHITE, (x, y - 4), 5)
+        draw.circle(screen, WHITE, (x, y + 4), 5)
+        draw.line(screen, WHITE, (x - 9, y), (x + 9, y), 2)
+        draw.line(screen, WHITE, (x, y - 9), (x, y + 9), 2)
     elif powerup_type == "life":
-        pygame.draw.circle(screen, WHITE, (x - 4, y - 3), 5)
-        pygame.draw.circle(screen, WHITE, (x + 4, y - 3), 5)
-        pygame.draw.polygon(screen, WHITE, [
+        draw.circle(screen, WHITE, (x - 4, y - 3), 5)
+        draw.circle(screen, WHITE, (x + 4, y - 3), 5)
+        draw.polygon(screen, WHITE, [
             (x - 9, y - 1), (x, y + 9), (x + 9, y - 1),
             (x + 7, y - 6), (x + 3, y - 7), (x, y - 3),
             (x - 3, y - 7), (x - 7, y - 6),
         ])
     elif powerup_type == "shield":
-        pygame.draw.polygon(screen, WHITE, [
+        draw.polygon(screen, WHITE, [
             (x, y - 9), (x + 8, y - 5), (x + 7, y + 2),
             (x, y + 9), (x - 7, y + 2), (x - 8, y - 5),
         ])
     elif powerup_type == "rapid_fire":
         for offset in (-6, 0, 6):
-            pygame.draw.line(screen, WHITE, (x - 8, y + offset), (x + 2, y + offset), 2)
-            pygame.draw.polygon(screen, WHITE, [
+            draw.line(screen, WHITE, (x - 8, y + offset), (x + 2, y + offset), 2)
+            draw.polygon(screen, WHITE, [
                 (x + 1, y + offset - 3),
                 (x + 8, y + offset),
                 (x + 1, y + offset + 3),
             ])
     elif powerup_type == "triple_shot":
         for offset in (-9, 0, 9):
-            pygame.draw.line(screen, WHITE, (x + offset, y + 7), (x + offset, y - 2), 2)
-            pygame.draw.polygon(screen, WHITE, [
+            draw.line(screen, WHITE, (x + offset, y + 7), (x + offset, y - 2), 2)
+            draw.polygon(screen, WHITE, [
                 (x + offset - 3, y + 1), (x + offset, y - 8), (x + offset + 3, y + 1),
             ])
-        pygame.draw.circle(screen, WHITE, (x, y - 11), 3, 1)
+        draw.circle(screen, WHITE, (x, y - 11), 3, 1)
     elif powerup_type == "laser":
-        pygame.draw.rect(screen, WHITE, (x - 2, y - 9, 4, 18))
-        pygame.draw.line(screen, WHITE, (x - 7, y - 1), (x + 7, y - 1), 2)
+        draw.rect(screen, WHITE, (x - 2, y - 9, 4, 18))
+        draw.line(screen, WHITE, (x - 7, y - 1), (x + 7, y - 1), 2)
     elif powerup_type == "magnet":
-        pygame.draw.lines(screen, WHITE, False, [
+        draw.lines(screen, WHITE, False, [
             (x - 7, y - 7), (x - 7, y + 2), (x - 4, y + 7),
             (x + 4, y + 7), (x + 7, y + 2), (x + 7, y - 7),
         ], 3)
-        pygame.draw.line(screen, YELLOW, (x - 9, y - 8), (x - 5, y - 8), 3)
-        pygame.draw.line(screen, CYAN, (x + 5, y - 8), (x + 9, y - 8), 3)
+        draw.line(screen, YELLOW, (x - 9, y - 8), (x - 5, y - 8), 3)
+        draw.line(screen, CYAN, (x + 5, y - 8), (x + 9, y - 8), 3)
     elif powerup_type == "bomb":
-        pygame.draw.circle(screen, WHITE, (x - 1, y + 2), 6)
-        pygame.draw.line(screen, WHITE, (x + 3, y - 3), (x + 7, y - 8), 2)
-        pygame.draw.circle(screen, YELLOW, (x + 8, y - 9), 2)
+        draw.circle(screen, WHITE, (x - 1, y + 2), 6)
+        draw.line(screen, WHITE, (x + 3, y - 3), (x + 7, y - 8), 2)
+        draw.circle(screen, YELLOW, (x + 8, y - 9), 2)
     elif powerup_type == "bullet_time":
-        pygame.draw.polygon(screen, WHITE, [
+        draw.polygon(screen, WHITE, [
             (x - 7, y - 9), (x + 7, y - 9), (x + 6, y - 5),
             (x + 2, y - 1), (x + 6, y + 5), (x + 7, y + 9),
             (x - 7, y + 9), (x - 6, y + 5), (x - 2, y - 1), (x - 6, y - 5),
         ])
     elif powerup_type == "speed":
-        pygame.draw.polygon(screen, WHITE, [
+        draw.polygon(screen, WHITE, [
             (x + 2, y - 10), (x - 6, y + 1), (x - 1, y + 1),
             (x - 3, y + 10), (x + 7, y - 3), (x + 2, y - 3),
         ])
     elif powerup_type == "piercing":
-        pygame.draw.line(screen, WHITE, (x - 8, y), (x + 8, y), 3)
-        pygame.draw.line(screen, WHITE, (x + 2, y - 5), (x + 8, y), 3)
-        pygame.draw.line(screen, WHITE, (x + 2, y + 5), (x + 8, y), 3)
+        draw.line(screen, WHITE, (x - 8, y), (x + 8, y), 3)
+        draw.line(screen, WHITE, (x + 2, y - 5), (x + 8, y), 3)
+        draw.line(screen, WHITE, (x + 2, y + 5), (x + 8, y), 3)
     elif powerup_type == "damage_up":
-        pygame.draw.line(screen, WHITE, (x - 6, y), (x + 6, y), 3)
-        pygame.draw.line(screen, WHITE, (x, y - 6), (x, y + 6), 3)
-        pygame.draw.polygon(screen, WHITE, [(x, y - 11), (x - 3, y - 7), (x + 3, y - 7)])
+        draw.line(screen, WHITE, (x - 6, y), (x + 6, y), 3)
+        draw.line(screen, WHITE, (x, y - 6), (x, y + 6), 3)
+        draw.polygon(screen, WHITE, [(x, y - 11), (x - 3, y - 7), (x + 3, y - 7)])
     elif powerup_type == "health_up":
-        pygame.draw.polygon(screen, WHITE, [(x - 9, y - 9), (x + 9, y - 9),
+        draw.polygon(screen, WHITE, [(x - 9, y - 9), (x + 9, y - 9),
                                            (x + 8, y + 3), (x, y + 12), (x - 8, y + 3)], 2)
-        pygame.draw.lines(screen, WHITE, False,
+        draw.lines(screen, WHITE, False,
                           [(x - 5, y), (x - 1, y + 4), (x + 6, y - 4)], 2)
     elif powerup_type == "lightning":
-        pygame.draw.lines(screen, WHITE, False, [
+        draw.lines(screen, WHITE, False, [
             (x + 2, y - 11), (x - 6, y), (x, y),
             (x - 3, y + 11), (x + 8, y - 3), (x + 2, y - 3),
         ], 3)
     elif powerup_type == "homing":
-        pygame.draw.circle(screen, WHITE, (x, y), 7, 2)
-        pygame.draw.circle(screen, WHITE, (x, y), 2)
-        pygame.draw.line(screen, WHITE, (x + 4, y - 4), (x + 9, y - 9), 2)
+        draw.circle(screen, WHITE, (x, y), 7, 2)
+        draw.circle(screen, WHITE, (x, y), 2)
+        draw.line(screen, WHITE, (x + 4, y - 4), (x + 9, y - 9), 2)
     elif powerup_type == "cryo":
         for angle in (0, math.pi / 3, 2 * math.pi / 3):
             dx, dy = round(math.cos(angle) * 10), round(math.sin(angle) * 10)
-            pygame.draw.line(screen, WHITE, (x - dx, y - dy), (x + dx, y + dy), 2)
-        pygame.draw.circle(screen, WHITE, (x, y), 3, 1)
+            draw.line(screen, WHITE, (x - dx, y - dy), (x + dx, y + dy), 2)
+        draw.circle(screen, WHITE, (x, y), 3, 1)
     elif powerup_type == "orbit_drones":
-        pygame.draw.ellipse(screen, WHITE, (x - 10, y - 6, 20, 12), 1)
-        pygame.draw.circle(screen, WHITE, (x - 8, y - 4), 3)
-        pygame.draw.circle(screen, WHITE, (x + 8, y + 4), 3)
-        pygame.draw.circle(screen, WHITE, (x, y), 3)
+        draw.ellipse(screen, WHITE, (x - 10, y - 6, 20, 12), 1)
+        draw.circle(screen, WHITE, (x - 8, y - 4), 3)
+        draw.circle(screen, WHITE, (x + 8, y + 4), 3)
+        draw.circle(screen, WHITE, (x, y), 3)
     elif powerup_type == "supply_beacon":
-        pygame.draw.rect(screen, WHITE, (x - 8, y - 7, 16, 14), 2)
-        pygame.draw.line(screen, WHITE, (x - 4, y), (x + 4, y), 2)
-        pygame.draw.line(screen, WHITE, (x, y - 4), (x, y + 4), 2)
+        draw.rect(screen, WHITE, (x - 8, y - 7, 16, 14), 2)
+        draw.line(screen, WHITE, (x - 4, y), (x + 4, y), 2)
+        draw.line(screen, WHITE, (x, y - 4), (x, y + 4), 2)
     elif powerup_type == "gravity_well":
-        pygame.draw.circle(screen, WHITE, (x, y), 9, 1)
-        pygame.draw.circle(screen, WHITE, (x, y), 5, 2)
-        pygame.draw.circle(screen, WHITE, (x, y), 1)
+        draw.circle(screen, WHITE, (x, y), 9, 1)
+        draw.circle(screen, WHITE, (x, y), 5, 2)
+        draw.circle(screen, WHITE, (x, y), 1)
     elif powerup_type == "emergency_warp":
-        pygame.draw.ellipse(screen, WHITE, (x - 7, y - 10, 14, 20), 2)
-        pygame.draw.lines(screen, WHITE, False, [(x - 3, y), (x + 7, y),
+        draw.ellipse(screen, WHITE, (x - 7, y - 10, 14, 20), 2)
+        draw.lines(screen, WHITE, False, [(x - 3, y), (x + 7, y),
                                                (x + 3, y - 4), (x + 7, y), (x + 3, y + 4)], 2)
     elif powerup_type == "nova_pulse":
         for index in range(8):
             angle = index * math.pi / 4
-            pygame.draw.line(screen, WHITE, (x + round(math.cos(angle) * 4), y + round(math.sin(angle) * 4)),
+            draw.line(screen, WHITE, (x + round(math.cos(angle) * 4), y + round(math.sin(angle) * 4)),
                              (x + round(math.cos(angle) * 11), y + round(math.sin(angle) * 11)), 2)
-        pygame.draw.circle(screen, WHITE, (x, y), 3)
+        draw.circle(screen, WHITE, (x, y), 3)
     elif powerup_type == "missile_swarm":
         for dx, dy in ((-7, 3), (0, -2), (7, 3)):
-            pygame.draw.polygon(screen, WHITE, [(x + dx, y + dy - 8),
+            draw.polygon(screen, WHITE, [(x + dx, y + dy - 8),
                 (x + dx - 3, y + dy + 4), (x + dx + 3, y + dy + 4)])
     elif powerup_type == "reflector":
-        pygame.draw.arc(screen, WHITE, (x - 10, y - 10, 20, 20), -1.25, 1.25, 3)
-        pygame.draw.lines(screen, WHITE, False, [(x - 8, y - 5), (x + 3, y), (x - 8, y + 5)], 2)
+        draw.arc(screen, WHITE, (x - 10, y - 10, 20, 20), -1.25, 1.25, 3)
+        draw.lines(screen, WHITE, False, [(x - 8, y - 5), (x + 3, y), (x - 8, y + 5)], 2)
     elif powerup_type == "chain_reaction":
-        pygame.draw.lines(screen, WHITE, False, [(x - 8, y + 5), (x, y - 5), (x + 8, y + 5)], 2)
+        draw.lines(screen, WHITE, False, [(x - 8, y + 5), (x, y - 5), (x + 8, y + 5)], 2)
         for point in ((x - 8, y + 5), (x, y - 5), (x + 8, y + 5)):
-            pygame.draw.circle(screen, WHITE, point, 3)
+            draw.circle(screen, WHITE, point, 3)
     elif powerup_type == "score_boost":
         points = []
         for index in range(10):
@@ -9810,7 +10326,7 @@ def draw_powerup_icon(screen, powerup_type, center):
             radius = 9 if index % 2 == 0 else 4
             points.append((x + round(math.cos(angle) * radius),
                            y + round(math.sin(angle) * radius)))
-        pygame.draw.polygon(screen, WHITE, points)
+        draw.polygon(screen, WHITE, points)
 
 
 POWERUP_VISUAL_PROFILES = {
@@ -9858,72 +10374,72 @@ def draw_powerup_aura(surface, center, color, motif, count, phase, radius=24):
         points = [point(phase + math.tau * index / vertices,
                         radius * (0.76 if alternating and index % 2 else 1))
                   for index in range(vertices)]
-        pygame.draw.polygon(surface, color, points, 1)
+        render_draw.polygon(surface, color, points, 1)
     elif motif in ("dash", "comet", "lances", "rockets"):
         for index in range(count):
             angle = phase + math.tau * index / count
             end = point(angle, radius)
             start = point(angle - (0.32 if motif in ("dash", "comet") else 0), radius - 7)
-            pygame.draw.line(surface, color, start, end, 2 if motif == "dash" else 1)
+            render_draw.line(surface, color, start, end, 2 if motif == "dash" else 1)
             if motif in ("rockets", "lances"):
-                pygame.draw.lines(surface, color, False,
+                render_draw.lines(surface, color, False,
                                   [point(angle - 0.11, radius - 4), end,
                                    point(angle + 0.11, radius - 4)], 1)
     elif motif == "health_cross":
         for index in range(count):
             x, y = point(phase + math.tau * index / count, radius - 2)
-            pygame.draw.line(surface, color, (x - 3, y), (x + 3, y), 1)
-            pygame.draw.line(surface, color, (x, y - 3), (x, y + 3), 1)
+            render_draw.line(surface, color, (x - 3, y), (x + 3, y), 1)
+            render_draw.line(surface, color, (x, y - 3), (x, y + 3), 1)
     elif motif == "frost":
         for index in range(count):
             angle = phase + math.tau * index / count
-            pygame.draw.line(surface, color, point(angle, radius - 8), point(angle, radius), 1)
+            render_draw.line(surface, color, point(angle, radius - 8), point(angle, radius), 1)
             elbow = point(angle, radius - 4)
             for side in (-1, 1):
-                pygame.draw.line(surface, color, elbow,
+                render_draw.line(surface, color, elbow,
                                  point(angle + side * 0.15, radius - 7), 1)
     elif motif == "zigzag":
         for index in range(count):
             angle = phase + math.tau * index / count
-            pygame.draw.lines(surface, color, False,
+            render_draw.lines(surface, color, False,
                               [point(angle - 0.16, radius - 6), point(angle, radius),
                                point(angle + 0.08, radius - 5), point(angle + 0.20, radius)], 1)
     elif motif == "spiral":
         for arm in range(count):
             points = [point(phase + arm * math.tau / count + step * 0.16,
                             radius - 8 + step * 0.8) for step in range(11)]
-            pygame.draw.lines(surface, color, False, points, 1)
+            render_draw.lines(surface, color, False, points, 1)
     elif motif in ("burst", "spark"):
         for index in range(count):
             angle = phase + math.tau * index / count
             length = 5 + (index % 3 if motif == "spark" else 2)
-            pygame.draw.line(surface, color, point(angle, radius - length), point(angle, radius), 1)
+            render_draw.line(surface, color, point(angle, radius - length), point(angle, radius), 1)
             if motif == "spark":
-                pygame.draw.circle(surface, color, point(angle + 0.12, radius + 2), 1)
+                render_draw.circle(surface, color, point(angle + 0.12, radius + 2), 1)
     elif motif == "scan":
         offset = math.sin(phase) * (radius - 4)
         for side in (-1, 1):
             y = round(cy + side * offset)
             half_width = round(math.sqrt(max(0, radius * radius - offset * offset)))
-            pygame.draw.line(surface, color, (cx - half_width, y), (cx + half_width, y), 1)
+            render_draw.line(surface, color, (cx - half_width, y), (cx + half_width, y), 1)
     elif motif in ("portal", "reflect", "signal"):
         for index in range(count):
             angle = phase + math.tau * index / count
             ring = pygame.Rect(cx - radius, cy - radius, radius * 2, radius * 2)
             sweep = 0.95 if motif == "reflect" else 1.55 if motif == "portal" else 0.65
-            pygame.draw.arc(surface, color, ring, angle, angle + sweep, 2 if motif == "portal" else 1)
+            render_draw.arc(surface, color, ring, angle, angle + sweep, 2 if motif == "portal" else 1)
             if motif == "signal":
                 inner = ring.inflate(-8, -8)
-                pygame.draw.arc(surface, color, inner, angle, angle + sweep, 1)
+                render_draw.arc(surface, color, inner, angle, angle + sweep, 1)
     elif motif == "clock":
         for index in range(count):
             angle = math.tau * index / count
-            pygame.draw.line(surface, color, point(angle, radius - 3), point(angle, radius), 1)
-        pygame.draw.line(surface, color, point(phase, radius - 7), point(phase, radius - 1), 2)
+            render_draw.line(surface, color, point(angle, radius - 3), point(angle, radius), 1)
+        render_draw.line(surface, color, point(phase, radius - 7), point(phase, radius - 1), 2)
     elif motif == "reticle":
         for index in range(count):
             angle = phase * 0.2 + math.tau * index / count
-            pygame.draw.lines(surface, color, False,
+            render_draw.lines(surface, color, False,
                               [point(angle - 0.15, radius - 4), point(angle - 0.15, radius),
                                point(angle + 0.15, radius)], 1)
     else:
@@ -9932,11 +10448,11 @@ def draw_powerup_aura(surface, center, color, motif, count, phase, radius=24):
             angle = phase + math.tau * index / count
             position = point(angle, radius - (2 if motif == "petal" else 0))
             satellite_radius = 4 if motif in ("petal", "links") else 3
-            pygame.draw.circle(surface, color, position, satellite_radius, 1)
+            render_draw.circle(surface, color, position, satellite_radius, 1)
             if motif == "satellite":
-                pygame.draw.line(surface, color, point(angle - 0.30, radius), position, 1)
+                render_draw.line(surface, color, point(angle - 0.30, radius), position, 1)
             elif motif == "orbit":
-                pygame.draw.arc(surface, color,
+                render_draw.arc(surface, color,
                                 (cx - radius, cy - radius, radius * 2, radius * 2),
                                 angle - 0.65, angle, 1)
 
@@ -9950,8 +10466,8 @@ def draw_world_powerup(screen, powerup, now):
         # canvas, pulsing aura, trigonometry or halo reaches this path.
         center = powerup["rect"].center
         bounds = pygame.Rect(center[0] - 14, center[1] - 14, 28, 28)
-        pygame.draw.rect(screen, UI_BG, bounds)
-        pygame.draw.rect(screen, color, bounds, 1)
+        render_draw.rect(screen, UI_BG, bounds)
+        render_draw.rect(screen, color, bounds, 1)
         draw_powerup_icon(screen, key, center)
         return
     motif, count, speed = POWERUP_VISUAL_PROFILES.get(key, ("hex", 6, 1.0))
@@ -9962,9 +10478,9 @@ def draw_world_powerup(screen, powerup, now):
     center = (36, 36)
     pulse = 0.5 + 0.5 * math.sin(now / 240 + visual_phase)
     if graphics_feature_enabled("glow"):
-        pygame.draw.circle(surface, (*color, round(10 + pulse * 9)), center, 26)
-    pygame.draw.circle(surface, (*UI_BG, 172), center, 14)
-    pygame.draw.circle(surface, (*color, 190), center, 14, 1)
+        render_draw.circle(surface, (*color, round(10 + pulse * 9)), center, 26)
+    render_draw.circle(surface, (*UI_BG, 172), center, 14)
+    render_draw.circle(surface, (*color, 190), center, 14, 1)
     draw_powerup_aura(surface, center, (*color, 150), motif, count, phase,
                       radius=round(23 + pulse * 2))
     draw_powerup_icon(surface, key, center)
@@ -10016,8 +10532,8 @@ def draw_powerup_collection_particle(screen, particle):
             theta = angle + index * math.pi / 2
             points.append((round(9 + math.cos(theta) * radius * fraction),
                            round(9 + math.sin(theta) * radius * fraction)))
-        pygame.draw.polygon(surface, (*color, round(185 * fraction)), points, 1)
-        pygame.draw.line(surface, (*UI_TEXT, round(120 * fraction)), points[0], points[2], 1)
+        render_draw.polygon(surface, (*color, round(185 * fraction)), points, 1)
+        render_draw.line(surface, (*UI_TEXT, round(120 * fraction)), points[0], points[2], 1)
         screen.blit(surface, (round(particle["x"]) - 9, round(particle["y"]) - 9))
     elif particle.get("role") == "ring":
         surface = pygame.Surface((80, 80), pygame.SRCALPHA)
@@ -10031,8 +10547,8 @@ def draw_powerup_collection_particle(screen, particle):
         angle = particle.get("angle", 0)
         end = (round(7 + math.cos(angle) * 4 * fraction),
                round(7 + math.sin(angle) * 4 * fraction))
-        pygame.draw.line(surface, (*color, round(175 * fraction)), (7, 7), end, 1)
-        pygame.draw.circle(surface, (*UI_TEXT, round(135 * fraction)), end, 1)
+        render_draw.line(surface, (*color, round(175 * fraction)), (7, 7), end, 1)
+        render_draw.circle(surface, (*UI_TEXT, round(135 * fraction)), end, 1)
         screen.blit(surface, (round(particle["x"]) - 7, round(particle["y"]) - 7))
 
 
@@ -10048,7 +10564,7 @@ _GAMEPLAY_UI_REGION_TARGET = None
 
 def hud_font(size):
     if size not in _HUD_FONTS:
-        _HUD_FONTS[size] = pygame.font.SysFont(None, size)
+        _HUD_FONTS[size] = resolution_font(None, size)
     return _HUD_FONTS[size]
 
 
@@ -10075,7 +10591,7 @@ def cached_ui_text(font, text, color, max_width=None, max_height=None):
                  max_width / max(1, surface.get_width()) if max_width is not None else 1.0,
                  max_height / max(1, surface.get_height()) if max_height is not None else 1.0)
     if factor < 1:
-        surface = pygame.transform.smoothscale(surface, (
+        surface = scale_render_surface(surface, (
             max(1, round(surface.get_width() * factor)),
             max(1, round(surface.get_height() * factor))))
     if key is not None:
@@ -10094,19 +10610,19 @@ def draw_gameplay_hud_panel(screen, rect, color, radius=6):
     if _POTATO_MODE and alpha == 255:
         # Auto retains Potato's opaque small docks; selected opacity still
         # applies when the user opts into translucent plates in this mode.
-        pygame.draw.rect(screen, background, rect)
-        pygame.draw.rect(screen, color, rect, 1)
+        render_draw.rect(screen, background, rect)
+        render_draw.rect(screen, color, rect, 1)
         return
-    key = (rect.size, tuple(color), radius, background, alpha, _POTATO_MODE)
+    key = (rect.size, getattr(screen, "density", (1, 1)), tuple(color), radius, background, alpha, _POTATO_MODE)
     overlay = _HUD_BACKPLATES.get(key)
     if overlay is None:
         if len(_HUD_BACKPLATES) >= 64:
             _HUD_BACKPLATES.clear()
-        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        overlay = ui_surface_like(rect.size, screen)
         corner_radius = 0 if _POTATO_MODE else radius
         border_alpha = 255 if _POTATO_MODE else max(82, alpha)
-        pygame.draw.rect(overlay, (*background, alpha), overlay.get_rect(), border_radius=corner_radius)
-        pygame.draw.rect(overlay, (*color, border_alpha), overlay.get_rect(), 1, border_radius=corner_radius)
+        render_draw.rect(overlay, (*background, alpha), overlay.get_rect(), border_radius=corner_radius)
+        render_draw.rect(overlay, (*color, border_alpha), overlay.get_rect(), 1, border_radius=corner_radius)
         _HUD_BACKPLATES[key] = overlay
     screen.blit(overlay, rect.topleft)
 
@@ -10270,16 +10786,16 @@ def draw_boss_laser_warning(screen, bullet, now):
         progress = 1 - min(1.0, remaining / bullet.get("warning_frames", BOSS_LASER_WARNING_FRAMES))
         pulse = ((math.sin(now / 70) + 1) / 2
                  if graphics_feature_enabled("laser_motion") else 0)
-        pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"],
+        render_draw.rect(screen, blend_color(UI_BG, bullet["color"],
                                             .13 + .16 * progress + .07 * pulse), rect)
-    pygame.draw.rect(screen, UI_GOLD, rect, 2)
+    render_draw.rect(screen, UI_GOLD, rect, 2)
     for y in range(rect.top + 8, rect.bottom, 36):
-        pygame.draw.line(screen, bullet["color"], (rect.centerx, y),
+        render_draw.line(screen, bullet["color"], (rect.centerx, y),
                          (rect.centerx, min(y + 18, rect.bottom)), 2)
         # Outward chevrons reinforce where to move, even without reading text.
         for side in (-1, 1):
             edge_x = rect.centerx + side * (rect.width // 2 + 9)
-            pygame.draw.lines(screen, UI_GOLD, False,
+            render_draw.lines(screen, UI_GOLD, False,
                               [(edge_x - side * 5, y - 4), (edge_x, y),
                                (edge_x - side * 5, y + 4)], 2)
     draw_energy_flow(screen, rect, bullet["color"], now, warning=True)
@@ -10287,7 +10803,7 @@ def draw_boss_laser_warning(screen, bullet, now):
     label = cached_ui_text(hud_font(24), warning_text, UI_GOLD)
     label_rect = label.get_rect(midtop=(rect.centerx, rect.top + 18))
     label_rect.x = max(4, min(SCREEN_WIDTH - label_rect.width - 4, label_rect.x))
-    pygame.draw.rect(screen, UI_BG, label_rect.inflate(12, 8), border_radius=4)
+    render_draw.rect(screen, UI_BG, label_rect.inflate(12, 8), border_radius=4)
     screen.blit(label, label_rect)
 
 
@@ -10381,7 +10897,7 @@ def draw_powerup_hud(screen, player, now, font):
     metrics = powerup_hud_metrics(player["number"], len(entries), bool(notice))
     panel = metrics["panel"]
     alpha = gameplay_hud_opacity()
-    key = (player["number"], panel.size, _POTATO_MODE, graphics_option("ui_theme"),
+    key = (player["number"], panel.size, getattr(screen, "density", (1, 1)), _POTATO_MODE, graphics_option("ui_theme"),
            graphics_option("hud_opacity"), graphics_feature_enabled("text_outline"))
     opaque = _POTATO_MODE and alpha == 255
     overlay = _HUD_PANEL_SURFACES.get(key)
@@ -10389,7 +10905,7 @@ def draw_powerup_hud(screen, player, now, font):
         if len(_HUD_PANEL_SURFACES) >= 16:
             _HUD_PANEL_SURFACES.clear()
             _HUD_PANEL_KEYS.clear()
-        overlay = pygame.Surface(panel.size, 0 if opaque else pygame.SRCALPHA)
+        overlay = ui_surface_like(panel.size, screen, opaque=opaque)
         _HUD_PANEL_SURFACES[key] = overlay
     shown, page, page_count = powerup_hud_page(player, now, metrics)
     font = hud_font(18 if metrics["compact"] else 20)
@@ -10407,8 +10923,8 @@ def draw_powerup_hud(screen, player, now, font):
     else:
         radius = 0 if _POTATO_MODE else 6
         border_alpha = 255 if _POTATO_MODE else max(82, alpha)
-        pygame.draw.rect(overlay, (*ui_palette()["bg"], alpha), overlay.get_rect(), border_radius=radius)
-        pygame.draw.rect(overlay, (*player["color"], border_alpha), overlay.get_rect(), 1, border_radius=radius)
+        render_draw.rect(overlay, (*ui_palette()["bg"], alpha), overlay.get_rect(), border_radius=radius)
+        render_draw.rect(overlay, (*player["color"], border_alpha), overlay.get_rect(), 1, border_radius=radius)
     title = notice or f"{player_display_name(player)} POWERUPS ({len(entries)})"
     if page_count > 1:
         title += f"  {page + 1}/{page_count}"
@@ -10443,9 +10959,9 @@ def draw_nova_countdown(screen, player, now):
         for ring_index in range(3):
             phase = (progress * 2.5 + ring_index / 3) % 1
             radius = max(20, round(40 + (NOVA_MAX_RADIUS - 40) * phase))
-            pygame.draw.circle(screen, (*accent[:3], 255), screen_center, radius, 1)
+            render_draw.circle(screen, (*accent[:3], 255), screen_center, radius, 1)
             if ring_index == 0 and radius > 120:
-                pygame.draw.circle(screen, (*accent, 255), screen_center, radius, 1)
+                render_draw.circle(screen, (*accent, 255), screen_center, radius, 1)
     label_key = (seconds, tuple(accent))
     labels = _NOVA_LABEL_SPRITES.get(label_key)
     if labels is None:
@@ -10470,17 +10986,17 @@ def draw_support_powerups(screen, player, now):
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
     if not graphics_feature_enabled("animations") or graphics_particle_level() == "off":
         if player.get("gravity_until", 0) > now:
-            pygame.draw.circle(screen, POWERUP_COLORS["gravity_well"], center,
+            render_draw.circle(screen, POWERUP_COLORS["gravity_well"], center,
                                GRAVITY_FIELD_RADIUS, 1)
         if player.get("bullet_time_until", 0) > now:
-            pygame.draw.circle(screen, POWERUP_COLORS["bullet_time"], center,
+            render_draw.circle(screen, POWERUP_COLORS["bullet_time"], center,
                                BULLET_TIME_RADIUS, 1)
         # Drones are combat objects, so retain their actual orbit positions.
         if player.get("orbit_until", 0) > now:
             for position in orbit_drone_positions(player, now):
                 drone = pygame.Rect(0, 0, 9, 7)
                 drone.center = position
-                pygame.draw.rect(screen, POWERUP_COLORS["orbit_drones"], drone)
+                render_draw.rect(screen, POWERUP_COLORS["orbit_drones"], drone)
         return
     radius = max(64,
                  GRAVITY_FIELD_RADIUS + 4 if player.get("gravity_until", 0) > now else 0,
@@ -10498,100 +11014,100 @@ def draw_support_powerups(screen, player, now):
     if player.get("gravity_until", 0) > now:
         field_radius = GRAVITY_FIELD_RADIUS
         if graphics_feature_enabled("glow"):
-            pygame.draw.circle(effects, color("gravity_well", 7), (cx, cy), field_radius)
+            render_draw.circle(effects, color("gravity_well", 7), (cx, cy), field_radius)
         ring = pygame.Rect(cx - field_radius, cy - field_radius, field_radius * 2, field_radius * 2)
         for index in range(4):
             start = now / 700 + index * math.pi / 2
-            pygame.draw.arc(effects, color("gravity_well", 115), ring, start, start + 0.62, 1)
-            pygame.draw.circle(effects, color("gravity_well", 155), point(-start, field_radius - 7), 2)
+            render_draw.arc(effects, color("gravity_well", 115), ring, start, start + 0.62, 1)
+            render_draw.circle(effects, color("gravity_well", 155), point(-start, field_radius - 7), 2)
     if player.get("bullet_time_until", 0) > now:
         field_radius = BULLET_TIME_RADIUS
         if graphics_feature_enabled("glow"):
-            pygame.draw.circle(effects, color("bullet_time", 6), (cx, cy), field_radius)
-        pygame.draw.circle(effects, color("bullet_time", 100), (cx, cy), field_radius, 1)
+            render_draw.circle(effects, color("bullet_time", 6), (cx, cy), field_radius)
+        render_draw.circle(effects, color("bullet_time", 100), (cx, cy), field_radius, 1)
         for index in range(12):
             angle = index * math.tau / 12 - now / 2600
-            pygame.draw.line(effects, color("bullet_time", 145),
+            render_draw.line(effects, color("bullet_time", 145),
                              point(angle, field_radius - 5), point(angle, field_radius), 1)
         hand_angle = -math.pi / 2 + now / 1400
-        pygame.draw.line(effects, color("bullet_time", 75), (cx, cy), point(hand_angle, 20), 1)
+        render_draw.line(effects, color("bullet_time", 75), (cx, cy), point(hand_angle, 20), 1)
     if player.get("cryo_until", 0) > now:
         frost_stacks = shatter_stacks(player, now)
         # Tiny snow flecks identify Frostbite even before its first kill.
         for index in range(6):
             angle = -phase + index * math.tau / 6
             x, y = point(angle, 31)
-            pygame.draw.line(effects, color("cryo", 100), (x - 2, y), (x + 2, y), 1)
-            pygame.draw.line(effects, color("cryo", 100), (x, y - 2), (x, y + 2), 1)
+            render_draw.line(effects, color("cryo", 100), (x - 2, y), (x + 2, y), 1)
+            render_draw.line(effects, color("cryo", 100), (x, y - 2), (x, y + 2), 1)
         # Each earned Shatter stack adds a separate orbiting ice crystal.
         for index in range(frost_stacks):
             angle = phase * 0.65 + index * math.tau / max(1, frost_stacks)
             x, y = point(angle, 43)
-            pygame.draw.polygon(effects, color("cryo", 180),
+            render_draw.polygon(effects, color("cryo", 180),
                                 ((x, y - 5), (x + 3, y), (x, y + 5), (x - 3, y)), 1)
-            pygame.draw.line(effects, (*UI_TEXT, 150), (x, y - 2), (x, y + 2), 1)
+            render_draw.line(effects, (*UI_TEXT, 150), (x, y - 2), (x, y + 2), 1)
         if player.get("shatter_flash_until", 0) > now:
             flash_radius = 23 + round((player["shatter_flash_until"] - now) / 40)
-            pygame.draw.circle(effects, color("cryo", 100), (cx, cy), flash_radius, 1)
+            render_draw.circle(effects, color("cryo", 100), (cx, cy), flash_radius, 1)
     if player.get("rapid_fire_until", 0) > now:
         travel = (now // 35) % 15
         for side in (-1, 1):
             for step in range(3):
                 y = cy - 5 - (travel + step * 5) % 18
-                pygame.draw.line(effects, color("rapid_fire", 160 - step * 25),
+                render_draw.line(effects, color("rapid_fire", 160 - step * 25),
                                  (cx + side * 19, y), (cx + side * 19, y - 3), 1)
     if player.get("speed_boost_until", 0) > now:
         for side in (-1, 1):
-            pygame.draw.lines(effects, color("speed", 120), False,
+            render_draw.lines(effects, color("speed", 120), False,
                               ((cx + side * 16, cy + 5),
                                (cx + side * 21, cy + 20),
                                (cx + side * 18, cy + 30)), 1)
     if player.get("triple_shot_until", 0) > now:
         for offset in (-12, 0, 12):
-            pygame.draw.line(effects, color("triple_shot", 120),
+            render_draw.line(effects, color("triple_shot", 120),
                              (cx + offset, cy - 18), (cx + offset, cy - 24), 1)
     if player.get("laser_until", 0) > now:
         for offset in (-4, 4):
-            pygame.draw.line(effects, color("laser", 145),
+            render_draw.line(effects, color("laser", 145),
                              (cx + offset, cy - 11), (cx + offset, cy - 26), 1)
     if player.get("magnet_until", 0) > now:
         ring = pygame.Rect(cx - 34, cy - 26, 68, 52)
         for offset in (0, math.pi):
-            pygame.draw.arc(effects, color("magnet", 100), ring,
+            render_draw.arc(effects, color("magnet", 100), ring,
                             phase + offset, phase + offset + 0.65, 1)
     if player.get("bomb_until", 0) > now:
         for side in (-1, 1):
-            pygame.draw.circle(effects, color("bomb", 140), (cx + side * 23, cy + 8), 4, 1)
-            pygame.draw.line(effects, color("bomb", 140),
+            render_draw.circle(effects, color("bomb", 140), (cx + side * 23, cy + 8), 4, 1)
+            render_draw.line(effects, color("bomb", 140),
                              (cx + side * 23, cy + 3), (cx + side * 25, cy), 1)
     if player.get("piercing_until", 0) > now:
-        pygame.draw.lines(effects, color("piercing", 165), False,
+        render_draw.lines(effects, color("piercing", 165), False,
                           ((cx - 4, cy - 24), (cx, cy - 31), (cx + 4, cy - 24)), 1)
     if player.get("homing_until", 0) > now:
         target = (cx, cy - 34)
-        pygame.draw.circle(effects, color("homing", 125), target, 5, 1)
-        pygame.draw.line(effects, color("homing", 125), (cx - 8, cy - 34), (cx - 4, cy - 34), 1)
-        pygame.draw.line(effects, color("homing", 125), (cx + 4, cy - 34), (cx + 8, cy - 34), 1)
+        render_draw.circle(effects, color("homing", 125), target, 5, 1)
+        render_draw.line(effects, color("homing", 125), (cx - 8, cy - 34), (cx - 4, cy - 34), 1)
+        render_draw.line(effects, color("homing", 125), (cx + 4, cy - 34), (cx + 8, cy - 34), 1)
     if player.get("lightning_until", 0) > now:
         flicker = round(math.sin(now / 90) * 2)
         for side in (-1, 1):
-            pygame.draw.lines(effects, color("lightning", 145), False,
+            render_draw.lines(effects, color("lightning", 145), False,
                               ((cx + side * 14, cy - 8), (cx + side * (22 + flicker), cy - 4),
                                (cx + side * 18, cy + 2), (cx + side * 25, cy + 8)), 1)
     if player.get("score_boost_until", 0) > now:
         for offset in (0, math.pi):
             x, y = point(phase * 0.7 + offset, 39)
-            pygame.draw.polygon(effects, color("score_boost", 145),
+            render_draw.polygon(effects, color("score_boost", 145),
                                 ((x, y - 3), (x + 3, y), (x, y + 3), (x - 3, y)), 1)
     if player.get("chain_reaction_until", 0) > now:
         points = [(cx - 18, cy + 25), (cx, cy + 32), (cx + 18, cy + 25)]
-        pygame.draw.lines(effects, color("chain_reaction", 110), False, points, 1)
+        render_draw.lines(effects, color("chain_reaction", 110), False, points, 1)
         for position in points:
-            pygame.draw.circle(effects, color("chain_reaction", 145), position, 2, 1)
+            render_draw.circle(effects, color("chain_reaction", 145), position, 2, 1)
     if warp_charge_count(player):
-        pygame.draw.arc(effects, color("emergency_warp", 110),
+        render_draw.arc(effects, color("emergency_warp", 110),
                         pygame.Rect(cx - 23, cy - 31, 46, 62), 0.1, 1.2, 1)
-        pygame.draw.arc(effects, color("emergency_warp", 110),
+        render_draw.arc(effects, color("emergency_warp", 110),
                         pygame.Rect(cx - 23, cy - 31, 46, 62), math.pi + 0.1, math.pi + 1.2, 1)
     # The HUD gives the exact stack; keep decorative satellite work bounded.
     # Cosmetic markers stay bounded even with nine blocks; the HUD shows the
@@ -10599,41 +11115,41 @@ def draw_support_powerups(screen, player, now):
     for index in range(min(3, player.get("reflector_charges", 0))):
         angle = -math.pi / 2 + (index - 1) * 0.55
         x, y = point(angle, 26)
-        pygame.draw.polygon(effects, color("reflector", 155),
+        render_draw.polygon(effects, color("reflector", 155),
                             ((x, y - 4), (x + 3, y), (x, y + 4), (x - 3, y)), 1)
     if player.get("supply_kills_left", 0):
         for index in range(3):
-            pygame.draw.line(effects, color("supply_beacon", 125 - index * 20),
+            render_draw.line(effects, color("supply_beacon", 125 - index * 20),
                              (cx - 5 + index * 5, cy + 21), (cx - 5 + index * 5, cy + 25), 1)
     if player.get("pending_missiles", False):
         for side in (-1, 1):
-            pygame.draw.lines(effects, color("missile_swarm", 145), False,
+            render_draw.lines(effects, color("missile_swarm", 145), False,
                               ((cx + side * 27, cy + 15), (cx + side * 27, cy + 7),
                                (cx + side * 24, cy + 11)), 1)
     for index in range(min(MAX_DAMAGE_BONUS, player.get("damage_bonus", 0))):
-        pygame.draw.circle(effects, color("damage_up", 160), (cx - 5 + index * 5, cy + 6), 1)
+        render_draw.circle(effects, color("damage_up", 160), (cx - 5 + index * 5, cy + 6), 1)
     stacks = momentum_stacks(player, now)
     if stacks and graphics_feature_enabled("trails"):
         momentum_color = blend_color(UI_CYAN, UI_VIOLET, min(1, stacks / BULLET_TIME_MAX_STACKS))
         for segment in range(min(5, 1 + stacks // 4)):
             travel = ((now // 48 + segment * 11) % 24)
-            pygame.draw.circle(effects, (*momentum_color, 150),
+            render_draw.circle(effects, (*momentum_color, 150),
                                (cx, cy + PLAYER_HEIGHT // 2 + 10 + travel),
                                max(1, 3 - segment // 2), 1)
         if player.get("momentum_flash_until", 0) > now:
             flash_radius = 20 + round((player["momentum_flash_until"] - now) / 45)
-            pygame.draw.circle(effects, (*UI_CYAN, 100), (cx, cy), flash_radius, 1)
+            render_draw.circle(effects, (*UI_CYAN, 100), (cx, cy), flash_radius, 1)
     screen.blit(effects, (center[0] - cx, center[1] - cy))
     if player.get("orbit_until", 0) > now:
         drone_color = POWERUP_COLORS.get("orbit_drones", UI_CYAN)
         for position in orbit_drone_positions(player, now):
-            pygame.draw.line(screen, blend_color(drone_color, UI_BG, 0.65), center, position, 1)
+            render_draw.line(screen, blend_color(drone_color, UI_BG, 0.65), center, position, 1)
             draw_soft_glow(screen, position, drone_color, radius=12, strength=35)
             drone = pygame.Rect(0, 0, 11, 9)
             drone.center = position
-            pygame.draw.rect(screen, UI_BG, drone.inflate(4, 4), border_radius=3)
-            pygame.draw.rect(screen, drone_color, drone, 2, border_radius=2)
-            pygame.draw.circle(screen, UI_TEXT, position, 2)
+            render_draw.rect(screen, UI_BG, drone.inflate(4, 4), border_radius=3)
+            render_draw.rect(screen, drone_color, drone, 2, border_radius=2)
+            render_draw.circle(screen, UI_TEXT, position, 2)
 
 
 def draw_aimed_projectile_trail(screen, bullet):
@@ -10652,8 +11168,8 @@ def draw_aimed_projectile_trail(screen, bullet):
     length = 12 + min(10, bullet["rect"].width / 2)
     tail = (round(center[0] - dx / speed * length),
             round(center[1] - dy / speed * length))
-    pygame.draw.line(screen, blend_color(bullet["color"], UI_BG, 0.55), tail, center, 2)
-    pygame.draw.line(screen, bullet["color"],
+    render_draw.line(screen, blend_color(bullet["color"], UI_BG, 0.55), tail, center, 2)
+    render_draw.line(screen, bullet["color"],
                      (round((tail[0] + center[0]) / 2), round((tail[1] + center[1]) / 2)),
                      center, 1)
 
@@ -10668,7 +11184,7 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
         heading = math.atan2(velocity_y, velocity_x)
     if not graphics_feature_enabled("animations"):
         if bullet.get("type") == "bomb" and not hostile:
-            pygame.draw.ellipse(screen, color, rect)
+            render_draw.ellipse(screen, color, rect)
         else:
             # A direction triangle fits the existing collision footprint and
             # needs neither a temporary alpha sprite nor a rotated surface.
@@ -10680,7 +11196,7 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
                        round(cy - uy * reach + ux * reach * .65)),
                       (round(cx - ux * reach + uy * reach * .65),
                        round(cy - uy * reach - ux * reach * .65)))
-            pygame.draw.polygon(screen, color, points)
+            render_draw.polygon(screen, color, points)
         return rect
     if hostile:
         # Enemy seekers retain their existing square collision footprint.
@@ -10692,22 +11208,22 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
     sprite = pygame.Surface((width, height), pygame.SRCALPHA)
     if bullet.get("type") == "bomb" and not hostile:
         draw_soft_glow(screen, rect.center, color, radius=17, strength=65)
-        pygame.draw.ellipse(sprite, color, sprite.get_rect())
+        render_draw.ellipse(sprite, color, sprite.get_rect())
         if width > 6 and height > 6:
-            pygame.draw.ellipse(sprite, UI_GOLD, sprite.get_rect().inflate(-6, -6), 2)
-        pygame.draw.line(sprite, UI_TEXT, (width // 2, 0), (width // 2, max(2, height // 3)), 2)
+            render_draw.ellipse(sprite, UI_GOLD, sprite.get_rect().inflate(-6, -6), 2)
+        render_draw.line(sprite, UI_TEXT, (width // 2, 0), (width // 2, max(2, height // 3)), 2)
     else:
         nose = (width // 2, 0)
-        pygame.draw.polygon(sprite, color, (
+        render_draw.polygon(sprite, color, (
             nose, (width - 1, max(1, height // 3)),
             (max(0, width - 2), height - 1), (width // 2, max(1, height - 3)),
             (min(width - 1, 1), height - 1), (0, max(1, height // 3)),
         ))
         core_color = blend_color(color, UI_TEXT, 0.65) if hostile else UI_TEXT
-        pygame.draw.line(sprite, core_color, (width // 2, max(1, height // 4)),
+        render_draw.line(sprite, core_color, (width // 2, max(1, height // 4)),
                          (width // 2, max(1, height - 3)), 2 if width >= 6 else 1)
         if bullet.get("type") == "missile":
-            pygame.draw.line(sprite, UI_GOLD, (width // 2, height - 3),
+            render_draw.line(sprite, UI_GOLD, (width // 2, height - 3),
                              (width // 2, height - 1), 2)
     rotated = pygame.transform.rotate(sprite, -math.degrees(heading) - 90)
     draw_rect = rotated.get_rect(center=rect.center)
@@ -10752,7 +11268,7 @@ def draw_gameplay_ui_underlay(screen, players, font, now, round_num, save_error=
                               meter_y, tick_width, 3)
             reached = index <= ((round_num - 1) % WAVES_PER_SECTOR)
             meter_color = UI_CORAL if round_num % WAVES_PER_SECTOR == 0 else UI_MINT
-            pygame.draw.rect(screen, meter_color if reached else (42, 62, 94), dot, border_radius=2)
+            render_draw.rect(screen, meter_color if reached else (42, 62, 94), dot, border_radius=2)
         draw_scoreboard(screen, players, font, now)
         if save_error:
             cell = pygame.Rect(12, meter_y + 10, SCREEN_WIDTH - 24, 18)
@@ -10850,11 +11366,11 @@ def draw_boss_status(screen, enemy):
                    cells["health_label"], align="right", themed=False)
     health = cells["health"]
     ratio = max(0, min(1, enemy["hp"] / max(1, enemy["max_hp"])))
-    pygame.draw.rect(screen, (51, 23, 49), health)
+    render_draw.rect(screen, (51, 23, 49), health)
     if ratio:
-        pygame.draw.rect(screen, blend_color(UI_CORAL, UI_MINT, ratio),
+        render_draw.rect(screen, blend_color(UI_CORAL, UI_MINT, ratio),
                          (health.x, health.y, max(1, round(health.width * ratio)), health.height))
-    pygame.draw.rect(screen, UI_TEXT, health, 1)
+    render_draw.rect(screen, UI_TEXT, health, 1)
     if "core" not in cells:
         return
     draw_hud_label(screen, hud_font(max(8, round(13 * scale))), "CORE", UI_MINT,
@@ -10864,11 +11380,11 @@ def draw_boss_status(screen, enemy):
                        cells["status"], align="center", themed=False)
         return
     core = cells["core"]
-    pygame.draw.rect(screen, (39, 47, 63), core)
+    render_draw.rect(screen, (39, 47, 63), core)
     width = round(core.width * milestone_stagger_ratio(enemy))
     if width:
-        pygame.draw.rect(screen, UI_MINT, (core.x, core.y, width, core.height))
-    pygame.draw.rect(screen, UI_TEXT, core, 1)
+        render_draw.rect(screen, UI_MINT, (core.x, core.y, width, core.height))
+    render_draw.rect(screen, UI_TEXT, core, 1)
 
 
 def composite_gameplay_ui(screen, ui_surface, bounds=None):
@@ -10878,7 +11394,8 @@ def composite_gameplay_ui(screen, ui_surface, bounds=None):
         bounds = pygame.Rect(bounds).clip(ui_surface.get_rect())
         if not bounds.width or not bounds.height:
             return
-        if screen.get_size() == ui_surface.get_size():
+        if (screen.get_size() == ui_surface.get_size()
+                and not isinstance(ui_surface, NativeUISurface)):
             screen.blit(ui_surface, bounds.topleft, bounds)
             return
         factor_x = screen.get_width() / ui_surface.get_width()
@@ -10889,17 +11406,18 @@ def composite_gameplay_ui(screen, ui_surface, bounds=None):
         if (_GAMEPLAY_UI_REGION_TARGET is None
                 or _GAMEPLAY_UI_REGION_TARGET.get_size() != target_rect.size):
             _GAMEPLAY_UI_REGION_TARGET = pygame.Surface(target_rect.size, pygame.SRCALPHA)
-        pygame.transform.smoothscale(ui_surface.subsurface(bounds), target_rect.size,
+        scale_render_surface(ui_surface.subsurface(bounds), target_rect.size,
                                      _GAMEPLAY_UI_REGION_TARGET)
         screen.blit(_GAMEPLAY_UI_REGION_TARGET, target_rect.topleft)
         return
-    if screen.get_size() == ui_surface.get_size():
+    if (screen.get_size() == ui_surface.get_size()
+            and not isinstance(ui_surface, NativeUISurface)):
         screen.blit(ui_surface, (0, 0))
         return
     if (_GAMEPLAY_UI_SCALE_TARGET is None
             or _GAMEPLAY_UI_SCALE_TARGET.get_size() != screen.get_size()):
         _GAMEPLAY_UI_SCALE_TARGET = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-    pygame.transform.smoothscale(ui_surface, screen.get_size(), _GAMEPLAY_UI_SCALE_TARGET)
+    scale_render_surface(ui_surface, screen.get_size(), _GAMEPLAY_UI_SCALE_TARGET)
     screen.blit(_GAMEPLAY_UI_SCALE_TARGET, (0, 0))
 
 
@@ -10916,10 +11434,10 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
         draw_aimed_projectile_trail(screen, bullet)
         if bullet.get("milestone_wall"):
             rect = bullet["rect"]
-            pygame.draw.rect(screen, bullet["color"], rect, border_radius=3)
-            pygame.draw.line(screen, UI_TEXT, (rect.left, rect.centery),
+            render_draw.rect(screen, bullet["color"], rect, border_radius=3)
+            render_draw.line(screen, UI_TEXT, (rect.left, rect.centery),
                              (rect.right - 1, rect.centery), 2)
-            pygame.draw.line(screen, blend_color(bullet["color"], UI_BG, .5),
+            render_draw.line(screen, blend_color(bullet["color"], UI_BG, .5),
                              rect.bottomleft, (rect.right - 1, rect.bottom - 1), 2)
             draw_direction_chevrons(screen, rect, bullet.get("dx", 0),
                                     bullet.get("dy", 0), UI_TEXT)
@@ -10935,31 +11453,31 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
                 # native status text beneath the transparent threat layer.
                 fill = ((*bullet["color"], 58) if screen.get_flags() & pygame.SRCALPHA
                         else blend_color(UI_BG, bullet["color"], .18))
-                pygame.draw.rect(screen, fill, rect)
-                pygame.draw.rect(screen, bullet["color"], rect, 2)
+                render_draw.rect(screen, fill, rect)
+                render_draw.rect(screen, bullet["color"], rect, 2)
             elif low_effects_mode() or not graphics_feature_enabled("glow"):
-                pygame.draw.rect(screen, bullet["color"], rect)
+                render_draw.rect(screen, bullet["color"], rect)
             elif bullet.get("boss_laser"):
                 remaining = max(0, bullet.get("remaining_frames", 0))
                 fade = min(1.0, remaining / 24.0)
                 pulse = ((math.sin(now / 55.0) + 1.0) / 2.0
                          if graphics_feature_enabled("laser_motion") else 0)
-                pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"],
+                render_draw.rect(screen, blend_color(UI_BG, bullet["color"],
                                                     (.42 + .08 * pulse) * fade), rect)
                 core_width = max(6, round(rect.width * (0.18 + 0.025 * pulse)))
                 core_rect = pygame.Rect(rect.centerx - core_width // 2, rect.top,
                                         core_width, rect.height)
-                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.42),
+                render_draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.42),
                                  core_rect, border_radius=max(3, core_width // 2))
-                pygame.draw.line(screen, UI_TEXT,
+                render_draw.line(screen, UI_TEXT,
                                  (rect.centerx, rect.top + 4),
                                  (rect.centerx, rect.bottom - 4),
                                  max(1, core_width // 4))
-                pygame.draw.rect(screen, bullet["color"], rect, 2, border_radius=8)
+                render_draw.rect(screen, bullet["color"], rect, 2, border_radius=8)
             else:
-                pygame.draw.rect(screen, blend_color(UI_BG, bullet["color"], .4), rect)
-                pygame.draw.rect(screen, bullet["color"], rect, 2)
-                pygame.draw.line(screen, blend_color(bullet["color"], UI_TEXT, .5),
+                render_draw.rect(screen, blend_color(UI_BG, bullet["color"], .4), rect)
+                render_draw.rect(screen, bullet["color"], rect, 2)
+                render_draw.line(screen, blend_color(bullet["color"], UI_TEXT, .5),
                                  rect.midtop, rect.midbottom, max(2, min(6, rect.width // 6)))
             draw_energy_flow(screen, rect, bullet["color"], now,
                              horizontal=rect.width > rect.height and not bullet.get("exclusion_zone"))
@@ -10976,9 +11494,9 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
             pulse = ((1 + math.sin(elapsed * .24)) / 2
                      if graphics_feature_enabled("animations") else 0)
             color = blend_color(bullet["color"], UI_TEXT, .18 + .25 * pulse)
-            pygame.draw.circle(screen, bullet["color"], center, radius)
-            pygame.draw.circle(screen, color, center, radius + 3 + round(2 * pulse), 2)
-            pygame.draw.circle(screen, UI_TEXT, center, max(2, radius // 3))
+            render_draw.circle(screen, bullet["color"], center, radius)
+            render_draw.circle(screen, color, center, radius + 3 + round(2 * pulse), 2)
+            render_draw.circle(screen, UI_TEXT, center, max(2, radius // 3))
             spokes = (HEAVY_ORB_CLUSTER_SPOKES if bullet.get("boss_cluster")
                       else HEAVY_ORB_BURST_COUNT)
             lit = max(1, math.ceil(spokes * remaining / total))
@@ -10988,23 +11506,23 @@ def draw_hostile_projectiles(screen, enemy_bullets, now, enemies=(), native_boss
                          round(center[1] + math.sin(angle) * (radius + 6)))
                 end = (round(center[0] + math.cos(angle) * (radius + 10)),
                        round(center[1] + math.sin(angle) * (radius + 10)))
-                pygame.draw.line(screen, color, start, end, 2)
+                render_draw.line(screen, color, start, end, 2)
             if bullet.get("boss_cluster"):
                 # Two orbit rails mark the boss's extra pulse. The echo keeps
                 # one rail and a shrinking ring, never a hidden damage radius.
                 rails = 1 if bullet.get("boss_bomb_echo") else 2
                 for index in range(rails):
-                    pygame.draw.circle(screen, bullet["color"], center,
+                    render_draw.circle(screen, bullet["color"], center,
                                        radius + 13 + index * 4, 1)
                 charge_radius = radius + 4 + round(8 * remaining / total)
-                pygame.draw.circle(screen, UI_TEXT, center, charge_radius, 1)
+                render_draw.circle(screen, UI_TEXT, center, charge_radius, 1)
         elif bullet.get("homing"):
             draw_homing_projectile(screen, bullet, bullet["color"], hostile=True)
         else:
-            pygame.draw.rect(screen, bullet["color"], bullet["rect"],
+            render_draw.rect(screen, bullet["color"], bullet["rect"],
                              border_radius=0 if _POTATO_MODE else 3)
             if not _POTATO_MODE and bullet["rect"].width >= 5 and bullet["rect"].height >= 5:
-                pygame.draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.65),
+                render_draw.rect(screen, blend_color(bullet["color"], UI_TEXT, 0.65),
                                  bullet["rect"].inflate(-3, -3), border_radius=2)
 
 
@@ -11034,12 +11552,12 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
                 continue
         draw_animated_enemy(screen, enemy)
         if enemy_cryo_multiplier(enemy, now) < 1:
-            pygame.draw.rect(screen, POWERUP_COLORS["cryo"], enemy["rect"].inflate(5, 5), 1)
+            render_draw.rect(screen, POWERUP_COLORS["cryo"], enemy["rect"].inflate(5, 5), 1)
         mutation_color = MUTATION_COLORS.get(enemy.get("mutation"))
         if mutation_color:
-            pygame.draw.rect(screen, mutation_color, enemy["rect"].inflate(6, 6), 2)
+            render_draw.rect(screen, mutation_color, enemy["rect"].inflate(6, 6), 2)
         if enemy.get("shield_charges", 0) > 0:
-            pygame.draw.rect(
+            render_draw.rect(
                 screen,
                 enemy.get("shield_color", LIGHT_BLUE),
                 enemy["rect"].inflate(8, 8),
@@ -11057,29 +11575,29 @@ def draw_gameplay(screen, enemies, enemy_bullets, player_bullets, bunkers, parti
         if isinstance(bullet, dict) and bullet.get("type") == "laser":
             points = player_laser_points(bullet)
             if len(points) >= 2:
-                pygame.draw.lines(screen, shot_color, False, points, bullet["rect"].width)
+                render_draw.lines(screen, shot_color, False, points, bullet["rect"].width)
                 if not _POTATO_MODE:
-                    pygame.draw.lines(screen, UI_TEXT, False, points, 2)
+                    render_draw.lines(screen, UI_TEXT, False, points, 2)
             continue
         if _POTATO_MODE:
             if isinstance(bullet, dict) and bullet.get("homing"):
                 draw_homing_projectile(screen, bullet, shot_color)
             else:
-                pygame.draw.rect(screen, shot_color, rect)
+                render_draw.rect(screen, shot_color, rect)
             continue
         if isinstance(bullet, dict):
             if bullet.get("homing"):
                 draw_homing_projectile(screen, bullet, shot_color)
             elif bullet.get("type") == "bomb":
                 draw_soft_glow(screen, rect.center, shot_color, radius=17, strength=65)
-                pygame.draw.ellipse(screen, shot_color, rect)
-                pygame.draw.ellipse(screen, UI_GOLD, rect.inflate(-6, -6), 2)
+                render_draw.ellipse(screen, shot_color, rect)
+                render_draw.ellipse(screen, UI_GOLD, rect.inflate(-6, -6), 2)
             else:
-                pygame.draw.rect(screen, shot_color, rect, border_radius=2)
-                pygame.draw.line(screen, UI_TEXT, (rect.centerx, rect.top + 2),
+                render_draw.rect(screen, shot_color, rect, border_radius=2)
+                render_draw.line(screen, UI_TEXT, (rect.centerx, rect.top + 2),
                                  (rect.centerx, rect.bottom - 2), 2)
         else:
-            pygame.draw.rect(screen, shot_color, rect, border_radius=2)
+            render_draw.rect(screen, shot_color, rect, border_radius=2)
 
     for powerup in powerups:
         draw_world_powerup(screen, powerup, now)
@@ -11131,7 +11649,7 @@ def draw_round_transition(screen, round_num, round_font, transition_timer):
     fade_surf.blit(text_surf, text_surf.get_rect(center=panel.center))
     for offset in (-1, 1):
         marker_x = panel.centerx + offset * (text_surf.get_width() // 2 + 24)
-        pygame.draw.polygon(fade_surf, UI_GOLD if round_num % 5 == 0 else UI_VIOLET,
+        render_draw.polygon(fade_surf, UI_GOLD if round_num % 5 == 0 else UI_VIOLET,
                             ((marker_x, panel.centery - 9), (marker_x + offset * 9, panel.centery), (marker_x, panel.centery + 9)))
     fade_surf.set_alpha(alpha)
 
@@ -11142,7 +11660,7 @@ def draw_round_transition(screen, round_num, round_font, transition_timer):
                else f"SECTOR {sector_for_round(round_num):02d}  |  ENEMY HP TIER {enemy_health_tier(round_num)}")
     if profile is not None:
         caption = f"WAVE {round_num}  |  {profile['subtitle']}"
-    caption_font = pygame.font.SysFont(None, 27)
+    caption_font = resolution_font(None, 27)
     caption_surface = caption_font.render(caption, True, UI_GOLD)
     caption_surface.set_alpha(alpha)
     screen.blit(caption_surface, caption_surface.get_rect(center=(SCREEN_WIDTH // 2, text_rect.bottom + 20)))
@@ -11447,14 +11965,14 @@ def draw_invasion_stars(screen):
         star_size = 2 if star_index % 7 == 0 else 1
         tint = star_colors[star_index % len(star_colors)]
         color = tuple(int(channel * brightness) for channel in tint)
-        pygame.draw.rect(
+        render_draw.rect(
             screen,
             color,
             (star_x, star_y, star_size, star_size),
         )
         if star_index % 23 == 0:
-            pygame.draw.line(screen, color, (star_x - 3, star_y), (star_x + 3, star_y))
-            pygame.draw.line(screen, color, (star_x, star_y - 3), (star_x, star_y + 3))
+            render_draw.line(screen, color, (star_x - 3, star_y), (star_x + 3, star_y))
+            render_draw.line(screen, color, (star_x, star_y - 3), (star_x, star_y + 3))
 
 
 def draw_invasion_earth(screen, center, radius, damaged=False):
@@ -11462,9 +11980,9 @@ def draw_invasion_earth(screen, center, radius, damaged=False):
     ocean_color = (16, 29, 65) if damaged else (12, 60, 121)
     land_color = (62, 75, 91) if damaged else (57, 180, 158)
     atmosphere = UI_CORAL if damaged else UI_CYAN
-    pygame.draw.circle(screen, (24, 18, 48) if damaged else (10, 30, 58), center, radius + 19)
-    pygame.draw.circle(screen, (51, 30, 65) if damaged else (18, 62, 94), center, radius + 11)
-    pygame.draw.circle(screen, ocean_color, center, radius)
+    render_draw.circle(screen, (24, 18, 48) if damaged else (10, 30, 58), center, radius + 19)
+    render_draw.circle(screen, (51, 30, 65) if damaged else (18, 62, 94), center, radius + 11)
+    render_draw.circle(screen, ocean_color, center, radius)
 
     continents = (
         ((-0.78, -0.22), (-0.55, -0.52), (-0.28, -0.40), (-0.20, -0.18), (-0.42, -0.02), (-0.33, 0.22), (-0.58, 0.16)),
@@ -11477,19 +11995,19 @@ def draw_invasion_earth(screen, center, radius, damaged=False):
             (int(center_x + offset_x * radius), int(center_y + offset_y * radius))
             for offset_x, offset_y in continent
         ]
-        pygame.draw.polygon(screen, land_color, points)
+        render_draw.polygon(screen, land_color, points)
 
     for band in (-0.46, 0.0, 0.46):
         latitude = pygame.Rect(center_x - radius, int(center_y + band * radius - radius * 0.13), radius * 2, int(radius * 0.26))
-        pygame.draw.ellipse(screen, (35, 64, 90) if damaged else (21, 92, 134), latitude, 1)
-    pygame.draw.circle(screen, atmosphere, center, radius, 3)
-    pygame.draw.arc(screen, UI_GOLD if damaged else (149, 252, 255), (center_x - radius - 5, center_y - radius - 5, 2 * radius + 10, 2 * radius + 10), 0.38, 2.68, 3)
+        render_draw.ellipse(screen, (35, 64, 90) if damaged else (21, 92, 134), latitude, 1)
+    render_draw.circle(screen, atmosphere, center, radius, 3)
+    render_draw.arc(screen, UI_GOLD if damaged else (149, 252, 255), (center_x - radius - 5, center_y - radius - 5, 2 * radius + 10, 2 * radius + 10), 0.38, 2.68, 3)
 
     if damaged:
         for crack_index in range(5):
             crack_x = center_x - radius // 2 + crack_index * radius // 4
             crack_y = center_y - radius // 3 + crack_index * 9
-            pygame.draw.line(
+            render_draw.line(
                 screen,
                 UI_CORAL,
                 (crack_x, crack_y),
@@ -11500,8 +12018,8 @@ def draw_invasion_earth(screen, center, radius, damaged=False):
             light_x = center_x - radius + (light_index * 47) % (radius * 2)
             light_y = center_y - radius // 5 + (light_index * 29) % max(1, radius // 2)
             if math.hypot(light_x - center_x, light_y - center_y) < radius - 8:
-                pygame.draw.circle(screen, UI_GOLD, (light_x, light_y), 3)
-                pygame.draw.circle(screen, UI_CORAL, (light_x, light_y), 7, 1)
+                render_draw.circle(screen, UI_GOLD, (light_x, light_y), 3)
+                render_draw.circle(screen, UI_CORAL, (light_x, light_y), 7, 1)
 
 
 def draw_invasion_ship(screen, center_x, center_y, size, color):
@@ -11514,15 +12032,15 @@ def draw_invasion_ship(screen, center_x, center_y, size, color):
         (center_x - size // 2, center_y + size // 3),
     ]
     glow_points = [(center_x + int((x - center_x) * 1.17), center_y + int((y - center_y) * 1.17)) for x, y in ship_points]
-    pygame.draw.polygon(screen, tuple(int(channel * 0.22) for channel in color), glow_points)
-    pygame.draw.polygon(screen, tuple(int(channel * 0.46) for channel in color), ship_points)
-    pygame.draw.polygon(screen, color, ship_points, 2)
-    pygame.draw.rect(
+    render_draw.polygon(screen, tuple(int(channel * 0.22) for channel in color), glow_points)
+    render_draw.polygon(screen, tuple(int(channel * 0.46) for channel in color), ship_points)
+    render_draw.polygon(screen, color, ship_points, 2)
+    render_draw.rect(
         screen,
         UI_TEXT,
         (center_x - size // 4, center_y - size // 3, size // 2, max(3, size // 5)),
     )
-    pygame.draw.line(
+    render_draw.line(
         screen,
         UI_GOLD,
         (center_x - size // 2, center_y + size // 3),
@@ -11530,7 +12048,7 @@ def draw_invasion_ship(screen, center_x, center_y, size, color):
         3,
     )
     for engine_offset in (-size // 2, size // 2):
-        pygame.draw.circle(screen, UI_CYAN, (center_x + engine_offset, center_y + size // 3), max(2, size // 8))
+        render_draw.circle(screen, UI_CYAN, (center_x + engine_offset, center_y + size // 3), max(2, size // 8))
 
 
 @ui_scene
@@ -11551,15 +12069,15 @@ def draw_alien_invasion_cutscene(screen, elapsed_ms, title_font, button_font):
         impact_y = earth_center[1] - earth_radius + int(earth_radius * 0.35)
         if elapsed_ms > 950:
             beam_color = fleet_colors[ship_index]
-            pygame.draw.line(screen, tuple(int(channel * 0.36) for channel in beam_color), (ship_x, ship_y + ship_size // 3), (ship_x, impact_y), 11)
-            pygame.draw.line(screen, beam_color, (ship_x, ship_y + ship_size // 3), (ship_x, impact_y), 5)
-            pygame.draw.line(screen, UI_TEXT, (ship_x, ship_y + ship_size // 3), (ship_x, impact_y), 1)
+            render_draw.line(screen, tuple(int(channel * 0.36) for channel in beam_color), (ship_x, ship_y + ship_size // 3), (ship_x, impact_y), 11)
+            render_draw.line(screen, beam_color, (ship_x, ship_y + ship_size // 3), (ship_x, impact_y), 5)
+            render_draw.line(screen, UI_TEXT, (ship_x, ship_y + ship_size // 3), (ship_x, impact_y), 1)
             impact_radius = 5 + int((elapsed_ms // 90 + ship_index * 3) % 9)
-            pygame.draw.circle(screen, UI_GOLD, (ship_x, impact_y), impact_radius, 2)
+            render_draw.circle(screen, UI_GOLD, (ship_x, impact_y), impact_radius, 2)
         draw_invasion_ship(screen, ship_x, ship_y, ship_size, fleet_colors[ship_index])
 
-    pygame.draw.rect(screen, BLACK, (0, 0, SCREEN_WIDTH, 18))
-    pygame.draw.rect(screen, BLACK, (0, SCREEN_HEIGHT - 18, SCREEN_WIDTH, 18))
+    render_draw.rect(screen, BLACK, (0, 0, SCREEN_WIDTH, 18))
+    render_draw.rect(screen, BLACK, (0, SCREEN_HEIGHT - 18, SCREEN_WIDTH, 18))
     draw_neon_title(screen, "ALIEN FLEET INBOUND", title_font, (SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.075)), UI_PINK)
     caption = "EARTH'S DEFENSES ARE FAILING" if progress > 0.42 else "PLANETARY SHIELDS BREACHED"
     caption_surface = button_font.render(caption, True, UI_CORAL if progress > 0.42 else UI_GOLD)
@@ -11609,7 +12127,7 @@ def draw_compact_end_screen(screen, title_font, button_font, font, players,
             rank = index
             previous = player["score"]
         rankings[player["number"]] = rank
-    small_font = pygame.font.SysFont(None, 18 if low else 22)
+    small_font = resolution_font(None, 18 if low else 22)
     for player, card in zip(players, end_screen_card_layout(len(players), completion)):
         draw_neon_panel(screen, card, player["color"], radius=8)
         lines = [f"{player_display_name(player)}  ·  RANK #{rankings[player['number']]}",
@@ -11683,7 +12201,7 @@ def draw_death_screen(screen, death_title_font, button_font, player_choice_font,
     for player_index, player in enumerate(players):
         card = pygame.Rect(card_start_x + player_index * (card_width + card_gap), card_y, card_width, card_height)
         draw_neon_panel(screen, card, player["color"])
-        pygame.draw.rect(screen, player["color"], (card.x + 12, card.y + 34, 36, 3), border_radius=1)
+        render_draw.rect(screen, player["color"], (card.x + 12, card.y + 34, 36, 3), border_radius=1)
         draw_fitted_text(screen, player_display_name(player), player_choice_font, player["color"],
                          pygame.Rect(card.x + 12, card.y + 10, card.width - 110, 26), "left")
         rank_text = player_choice_font.render(f"RANK #{player_ranks[player['number']]}", True, UI_GOLD)
@@ -11704,7 +12222,7 @@ def draw_death_screen(screen, death_title_font, button_font, player_choice_font,
     if save_error:
         status = player_choice_font.render(save_error, True, UI_CORAL)
         if status.get_width() > SCREEN_WIDTH - 40:
-            status = pygame.transform.smoothscale(status, (SCREEN_WIDTH - 40, status.get_height()))
+            status = scale_render_surface(status, (SCREEN_WIDTH - 40, status.get_height()))
         screen.blit(status, status.get_rect(center=(SCREEN_WIDTH // 2, int(SCREEN_HEIGHT * 0.77))))
     draw_neon_button(screen, play_again_rect, "NEW RUN", button_font, UI_CYAN)
 
@@ -11727,7 +12245,7 @@ def draw_victory_cutscene(screen, elapsed_ms, title_font, button_font, players):
         )
         ship_y = int(SCREEN_HEIGHT * 0.59 + math.sin(elapsed_ms / 520 + index * 2) * 9)
         draw_invasion_ship(screen, ship_x, ship_y, 24, player["color"])
-        pygame.draw.line(
+        render_draw.line(
             screen,
             player["color"],
             (ship_x, ship_y + 16),
@@ -11808,7 +12326,7 @@ def draw_completion_screen(screen, title_font, button_font, player_choice_font, 
             card_height,
         )
         draw_neon_panel(screen, card, player["color"])
-        pygame.draw.rect(screen, player["color"], (card.x + 12, card.y + 37, 50, 3), border_radius=1)
+        render_draw.rect(screen, player["color"], (card.x + 12, card.y + 37, 50, 3), border_radius=1)
 
         draw_fitted_text(screen, f"{player_display_name(player)}  RANK #{player_ranks[player['number']]}",
                          player_choice_font, player["color"],
@@ -12502,15 +13020,15 @@ def main():
     screen = display_manager.world_surface
     pygame.display.set_caption(f"Space Invaders — {GAME_BUILD_ID}")
 
-    title_font = pygame.font.SysFont(None, 84)
-    death_title_font = pygame.font.SysFont(None, 100)
-    button_font = pygame.font.SysFont(None, 36)
-    player_choice_font = pygame.font.SysFont(None, 24)
-    journal_font = pygame.font.SysFont(None, 20)
-    round_font = pygame.font.SysFont(None, 72)
-    lives_font = pygame.font.SysFont(None, 36)
+    title_font = resolution_font(None, 84)
+    death_title_font = resolution_font(None, 100)
+    button_font = resolution_font(None, 36)
+    player_choice_font = resolution_font(None, 24)
+    journal_font = resolution_font(None, 20)
+    round_font = resolution_font(None, 72)
+    lives_font = resolution_font(None, 36)
     native_ui_underlay = None
-    native_threats = pygame.Surface(screen.get_size(), pygame.SRCALPHA).convert_alpha()
+    native_threats = NativeUISurface(screen.get_size(), display_manager.display.get_size())
 
     player_sprites = [
         generate_pixel_sprite(PLAYER_ART, color, PLAYER_WIDTH, PLAYER_HEIGHT)
@@ -12624,8 +13142,9 @@ def main():
                                enemy_bullets, player_bullets, bunkers, particles, powerups,
                                now=(paused_at if paused and paused_at is not None else
                                     transition_started_at if transitioning else pygame.time.get_ticks()))
-        if native_threats.get_size() != world_size:
-            native_threats = pygame.Surface(world_size, pygame.SRCALPHA).convert_alpha()
+        if (native_threats.get_size() != world_size
+                or native_threats.raster_size != display_manager.display.get_size()):
+            native_threats = NativeUISurface(world_size, display_manager.display.get_size())
         layout = menu_control_layout()
         spawn_controls = dict(layout)
         spawn_controls["display_button_rect"] = gameplay_display_button_rect(layout["pause_button_rect"])
@@ -13464,8 +13983,9 @@ def main():
                         simulation_accumulator -= simulation_step_ms
 
             if (native_ui_underlay is None
-                    or native_ui_underlay.get_size() != ui_surface.get_size()):
-                native_ui_underlay = pygame.Surface(ui_surface.get_size(), pygame.SRCALPHA)
+                    or native_ui_underlay.get_size() != ui_surface.get_size()
+                    or native_ui_underlay.raster_size != ui_surface.raster_size):
+                native_ui_underlay = ui_surface_like(ui_surface.get_size(), ui_surface)
             draw_gameplay(
                 screen,
                 enemies,
