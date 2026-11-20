@@ -197,6 +197,10 @@ class NativeUISurface(_Surface):
         else:
             if getattr(source, "text_spec", None) is not None:
                 image = _native_text_image(source, target_size)
+            elif getattr(source, "artwork_spec", None) is not None:
+                image = native_artwork_image(source, target_size)
+                if image is None:
+                    image = pygame.transform.smoothscale(source, target_size) if size != target_size else source
             elif size != target_size:
                 image = pygame.transform.smoothscale(source, target_size)
             else:
@@ -246,6 +250,31 @@ def ui_surface_like(size, parent, *, opaque=False):
                   max(1, round(size[1] * parent.density[1])))
         return NativeUISurface(size, raster, opaque=opaque)
     return pygame.Surface(size, 0 if opaque else pygame.SRCALPHA)
+
+
+def rotate_render_surface(source, angle, parent=None):
+    """Rotate final-resolution pixels while retaining logical placement geometry."""
+    native = isinstance(source, NativeUISurface)
+    if not native and not isinstance(parent, NativeUISurface):
+        return pygame.transform.rotate(source, angle)
+    density = source.density if native else parent.density
+    if native:
+        pixels = source
+    else:
+        target = (max(1, round(source.get_width() * density[0])),
+                  max(1, round(source.get_height() * density[1])))
+        pixels = (native_artwork_image(source, target)
+                  if getattr(source, "artwork_spec", None) is not None else None)
+        if pixels is None:
+            pixels = pygame.transform.smoothscale(source, target)
+    # Bilinear rotation keeps diagonal ship banking smooth at native density.
+    pixels = pygame.transform.rotozoom(pixels, angle, 1.0) if angle else pixels
+    physical = _Surface.get_size(pixels)
+    logical = (max(1, round(physical[0] / density[0])),
+               max(1, round(physical[1] / density[1])))
+    canvas = NativeUISurface(logical, physical)
+    _Surface.blit(canvas, pixels, (0, 0))
+    return canvas
 
 
 class _ResolutionDraw:
@@ -304,8 +333,10 @@ SCREEN_HEIGHT = 900
 WORLD_SIZE = (1600, 900)  # Legacy simulation/design reference, retained for save compatibility.
 WORLD_VIEW_SIZE = (1920, 1080)  # Roomier combat framing; extend one axis to match the drawable.
 UI_REFERENCE_SIZE = (1600, 900)
-GAME_BUILD_ID = "2026.11.19-resolution"
+GAME_BUILD_ID = "2026.11.19-settings-rendering"
 GUI_SCALE_STEPS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5)
+AUDIO_VOLUME_KEYS = ("master_volume", "music_volume", "sfx_volume", "ui_volume")
+AUDIO_DEFAULTS = {**{key: 100 for key in AUDIO_VOLUME_KEYS}, "audio_muted": False}
 FPS_STEPS = (30, 60, 120, 240)
 FPS_MODES = ("auto", 30, 60, 120, 240, "infinite")
 GRAPHICS_DEFAULTS = {
@@ -589,15 +620,26 @@ def display_preferences_path():
 
 def _validated_display_preferences(data):
     """Validate fields separately so one obsolete choice cannot erase good ones."""
-    preferences = {"gui_scale": 1.0, "fullscreen": False,
+    preferences = {"gui_scale": 1.0, "gui_scale_mode": "auto", "fullscreen": False,
                    "window_size": [1280, 720], "potato_mode": False,
-                   "fps_mode": "auto", **GRAPHICS_DEFAULTS}
+                   "fps_mode": "auto", **GRAPHICS_DEFAULTS, **AUDIO_DEFAULTS}
     if not isinstance(data, dict):
         return preferences
     scale = data.get("gui_scale")
     if type(scale) in (int, float) and scale in GUI_SCALE_STEPS:
         preferences["gui_scale"] = float(scale)
-    for key in ("fullscreen", "potato_mode"):
+    mode = data.get("gui_scale_mode")
+    if mode in ("auto", "manual"):
+        preferences["gui_scale_mode"] = mode
+    elif "gui_scale_mode" not in data and preferences["gui_scale"] != 1.0:
+        # Earlier builds stored only a multiplier. Preserve an intentional
+        # non-default zoom as Manual without inventing an Auto/Manual history.
+        preferences["gui_scale_mode"] = "manual"
+    for key in AUDIO_VOLUME_KEYS:
+        value = data.get(key)
+        if type(value) is int and 0 <= value <= 100:
+            preferences[key] = value
+    for key in ("fullscreen", "potato_mode", "audio_muted"):
         if type(data.get(key)) is bool:
             preferences[key] = data[key]
     size = data.get("window_size")
@@ -668,6 +710,7 @@ class DisplayManager:
         self.preferences = _validated_display_preferences(
             load_display_preferences(self.settings_file) if preferences is None else preferences)
         self._sync_graphics_preferences()
+        self._sync_audio_preferences()
         self.display = None
         self.world_surface = pygame.Surface(WORLD_SIZE)
         self.ui_surface = None
@@ -705,6 +748,30 @@ class DisplayManager:
         if changed:
             reset_animation_graphics(clear_caches=True)
 
+    def _sync_audio_preferences(self):
+        audio = globals().get("AUDIO_MANAGER")
+        if audio is not None and hasattr(audio, "apply_preferences"):
+            audio.apply_preferences(self.preferences)
+
+    def adjust_audio_volume(self, key, direction):
+        if key not in AUDIO_VOLUME_KEYS:
+            raise ValueError("Unknown audio volume: " + str(key))
+        if not direction:
+            return False
+        value = max(0, min(100, self.preferences[key] + (10 if direction > 0 else -10)))
+        if value == self.preferences[key]:
+            return False
+        self.preferences[key] = value
+        self._sync_audio_preferences()
+        self._save()
+        return True
+
+    def toggle_audio_mute(self):
+        self.preferences["audio_muted"] = not self.preferences["audio_muted"]
+        self._sync_audio_preferences()
+        self._save()
+        return self.preferences["audio_muted"]
+
     def _graphics_preferences_changed(self):
         self._sync_graphics_preferences()
         self._invalidate()
@@ -740,7 +807,6 @@ class DisplayManager:
         flags = pygame.FULLSCREEN if self.preferences["fullscreen"] else pygame.RESIZABLE
         size = (0, 0) if self.preferences["fullscreen"] else tuple(self.preferences["window_size"])
         self.display = pygame.display.set_mode(size, flags)
-        self.world_surface = self.world_surface.convert()
         self._display_size = self.display.get_size()
         self.mode_epoch += 1
         self._invalidate()
@@ -770,8 +836,16 @@ class DisplayManager:
             factor = min(width / WORLD_VIEW_SIZE[0], height / WORLD_VIEW_SIZE[1])
             size = (max(WORLD_VIEW_SIZE[0], round(width / factor)),
                     max(WORLD_VIEW_SIZE[1], round(height / factor)))
-            if self.world_surface.get_size() != size:
-                self.world_surface = pygame.Surface(size).convert()
+            native = effective_world_filter() == "smooth"
+            current_native = isinstance(self.world_surface, NativeUISurface)
+            raster = self.display.get_size()
+            if (self.world_surface.get_size() != size or native != current_native
+                    or (native and self.world_surface.raster_size != raster)):
+                # Simulation coordinates remain fixed. Smooth mode paints its
+                # world at the drawable's actual density instead of enlarging a
+                # finished low-resolution scene; Pixel/Potato retain cheap art.
+                self.world_surface = (NativeUISurface(size, raster, opaque=True) if native
+                                      else pygame.Surface(size).convert())
 
     @property
     def viewport(self):
@@ -786,7 +860,9 @@ class DisplayManager:
         # slider is a multiplier, so old preferences remain useful on any monitor.
         width, height = self.display.get_size()
         automatic = max(1.0, min(width / UI_REFERENCE_SIZE[0], height / UI_REFERENCE_SIZE[1]))
-        return automatic * self.preferences["gui_scale"]
+        multiplier = (self.preferences["gui_scale"]
+                      if self.preferences["gui_scale_mode"] == "manual" else 1.0)
+        return automatic * multiplier
 
     def ui_size(self, arena=False):
         self._sync_display_surface()
@@ -862,6 +938,8 @@ class DisplayManager:
         self._save()
 
     def adjust_gui_scale(self, direction):
+        if self.preferences["gui_scale_mode"] == "auto":
+            return False
         index = min(range(len(GUI_SCALE_STEPS)),
                     key=lambda i: abs(GUI_SCALE_STEPS[i] - self.preferences["gui_scale"]))
         new_scale = GUI_SCALE_STEPS[max(0, min(len(GUI_SCALE_STEPS) - 1, index + direction))]
@@ -872,8 +950,20 @@ class DisplayManager:
         self._save()
         return True
 
+    def toggle_gui_scale_mode(self):
+        # Manual starts at the current automatic density, so changing mode
+        # alone does not jump the interface or move its click targets.
+        automatic = self.preferences["gui_scale_mode"] == "auto"
+        self.preferences["gui_scale_mode"] = "manual" if automatic else "auto"
+        if automatic:
+            self.preferences["gui_scale"] = 1.0
+        self._invalidate()
+        self._save()
+        return self.preferences["gui_scale_mode"]
+
     def reset_gui_scale(self):
         self.preferences["gui_scale"] = 1.0
+        self.preferences["gui_scale_mode"] = "auto"
         self._invalidate()
         self._save()
 
@@ -1358,14 +1448,17 @@ def gameplay_status_bounds(size, players, enemies=(), world_size=None):
     return regions[0].unionall(regions[1:]) if regions else pygame.Rect(0, 0, 0, 0)
 
 
-SETTINGS_PAGES = ("display", "graphics", "interface")
+SETTINGS_PAGES = ("display", "graphics", "interface", "audio")
 SETTINGS_ROWS = {
     "graphics": (("preset", "Graphics preset"), ("particles", "Decorative particles"),
                  ("animations", "Ship animation"), ("laser_motion", "Laser motion"), ("glow", "Glow"),
                  ("background", "Background"), ("trails", "Projectile trails"),
-                 ("auto_effects", "Auto reduce effects"), ("world_filter", "World scaling")),
+                 ("auto_effects", "Auto reduce effects"), ("world_filter", "Artwork quality")),
     "interface": (("ui_theme", "Color theme"), ("hud_opacity", "HUD background"),
                   ("text_outline", "Text outlines"), ("ship_names", "Names above ships")),
+    "audio": (("master_volume", "Master volume"), ("music_volume", "Music volume"),
+              ("sfx_volume", "Game effects"), ("ui_volume", "Menu sounds"),
+              ("audio_muted", "Sound")),
 }
 POTATO_LOCKED_SETTINGS = {"particles", "animations", "glow", "background", "trails", "world_filter"}
 
@@ -1377,7 +1470,7 @@ def display_settings_layout(page="display"):
     panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
     compact = panel.height < 430
     margin, gap = 14, 6
-    tab_width = (panel.width - margin * 2 - gap * 2) // 3
+    tab_width = (panel.width - margin * 2 - gap * (len(SETTINGS_PAGES) - 1)) // len(SETTINGS_PAGES)
     tabs = {key: pygame.Rect(panel.x + margin + index * (tab_width + gap),
                             panel.y + 42, tab_width, 25 if compact else 32)
             for index, key in enumerate(SETTINGS_PAGES)}
@@ -1406,23 +1499,38 @@ def display_settings_layout(page="display"):
                                     scale_row.y, scale_width, scale_row.height)
     controls.update(mode=row(1), potato=row(2), fps=row(3))
     setting_rows = {key: row(index) for index, (key, _) in enumerate(SETTINGS_ROWS.get(page, ()))}
+    audio_controls = {}
+    for key in AUDIO_VOLUME_KEYS:
+        if key not in setting_rows:
+            continue
+        rect = setting_rows[key]
+        side = min(58, (rect.width - 8) // 3)
+        audio_controls[key] = {
+            "minus": pygame.Rect(rect.x, rect.y, side, rect.height),
+            "value": pygame.Rect(rect.x + side + 4, rect.y, rect.width - 2 * side - 8, rect.height),
+            "plus": pygame.Rect(rect.right - side, rect.y, side, rect.height)}
     return {"panel": panel, "tabs": tabs, "page": page, "rows": setting_rows,
+            "audio_controls": audio_controls,
             "close": close, "keyboard": keyboard, "note": note,
             "label_width": label_width, "top": top, "row_height": row_height,
             "row_gap": row_gap, **controls}
 
 
 def graphics_setting_label(manager, key):
+    if key in AUDIO_VOLUME_KEYS:
+        return f"{manager.preferences[key]}%"
+    if key == "audio_muted":
+        return "Muted" if manager.preferences[key] else "On"
     if key == "preset":
         return manager.graphics_preset_name().replace("_", " ").title()
     value = manager.preferences[key]
     if manager.preferences.get("potato_mode", False) and key in POTATO_LOCKED_SETTINGS:
-        return "Pixel (Potato)" if key == "world_filter" else "Off (Potato)"
+        return "Pixel art (Potato)" if key == "world_filter" else "Off (Potato)"
     if type(value) is bool:
         return "On" if value else "Off"
     labels = {"neon": "Neon", "ice": "Ice", "amber": "Amber", "rose": "Rose", "mono": "Mono",
               "light": "Light / 10%", "medium": "Medium / 35%", "solid": "Solid",
-              "smooth": "Smooth", "pixel": "Pixel", "off": "Off", "on": "On",
+              "smooth": "Smooth / sharp", "pixel": "Pixel art / fast", "off": "Off", "on": "On",
               "auto": "Auto", "stars": "Stars", "full": "Full", "reduced": "Reduced"}
     return labels.get(value, str(value).title())
 
@@ -1435,20 +1543,25 @@ def draw_display_settings(screen, manager, font, small_font, page="display"):
     layout = display_settings_layout(page)
     panel = layout["panel"]
     draw_neon_panel(screen, panel, UI_CYAN)
-    draw_fitted_text(screen, "DISPLAY & KEYBOARD", font, ui_theme_color(UI_CYAN),
+    draw_fitted_text(screen, "GAME SETTINGS", font, ui_theme_color(UI_CYAN),
                      pygame.Rect(panel.x + 12, panel.y + 8, panel.width - 24, 27))
     for key, rect in layout["tabs"].items():
         draw_neon_button(screen, rect, key.upper(), small_font, UI_CYAN,
                          selected=layout["page"] == key)
     if layout["page"] == "display":
-        for index, label in enumerate((f"GUI size / {round(manager.preferences['gui_scale'] * 100)}%",
-                                       "Window mode", "Potato override", "Frame limit")):
+        automatic = manager.preferences["gui_scale_mode"] == "auto"
+        size_label = ("GUI size / Auto" if automatic else
+                      f"GUI size / {round(manager.preferences['gui_scale'] * 100)}%")
+        for index, label in enumerate((size_label, "Window mode", "Potato override", "Frame limit")):
             draw_fitted_text(screen, label, small_font, ui_theme_color(UI_TEXT),
                              pygame.Rect(panel.x + 14, layout["top"] + index *
                                          (layout["row_height"] + layout["row_gap"]),
                                          layout["label_width"] - 10, layout["row_height"]), "left")
-        for key, text in (("smaller", "−"), ("auto", "AUTO"), ("larger", "+")):
-            draw_neon_button(screen, layout[key], text, small_font, UI_GOLD)
+        mode_text = "AUTO" if automatic else "MANUAL"
+        for key, text in (("smaller", "−"), ("auto", mode_text), ("larger", "+")):
+            enabled = (key == "auto" or (not automatic and
+                       manager.preferences["gui_scale"] != GUI_SCALE_STEPS[0 if key == "smaller" else -1]))
+            draw_neon_button(screen, layout[key], text, small_font, UI_GOLD, enabled=enabled)
         mode = "Fullscreen" if manager.preferences["fullscreen"] else "Windowed"
         draw_neon_button(screen, layout["mode"], mode, small_font, UI_VIOLET)
         draw_neon_button(screen, layout["potato"], "On" if manager.preferences["potato_mode"] else "Off",
@@ -1456,7 +1569,25 @@ def draw_display_settings(screen, manager, font, small_font, page="display"):
         fps = manager.preferences["fps_mode"]
         text = manager.auto_fps_label() if fps == "auto" else "Infinite" if fps == "infinite" else f"{fps} FPS"
         draw_neon_button(screen, layout["fps"], text, small_font, UI_GOLD)
-        note = "F6/F7: GUI size   F8: auto fit   F11: fullscreen   Tab: next page"
+        note = ("Auto fits the screen. Click AUTO for manual sizing. F8 restores Auto."
+                if automatic else "Manual zoom: F6/F7 size   F8: Auto   F11: fullscreen   Tab: next page")
+    elif layout["page"] == "audio":
+        for key, label in SETTINGS_ROWS["audio"]:
+            rect = layout["rows"][key]
+            draw_fitted_text(screen, label, small_font, ui_theme_color(UI_TEXT),
+                             pygame.Rect(panel.x + 14, rect.y, layout["label_width"] - 10, rect.height), "left")
+            if key in AUDIO_VOLUME_KEYS:
+                cells = layout["audio_controls"][key]
+                draw_neon_button(screen, cells["minus"], "−", small_font, UI_CYAN,
+                                 enabled=manager.preferences[key] > 0)
+                draw_fitted_text(screen, graphics_setting_label(manager, key), small_font,
+                                 ui_theme_color(UI_TEXT), cells["value"])
+                draw_neon_button(screen, cells["plus"], "+", small_font, UI_CYAN,
+                                 enabled=manager.preferences[key] < 100)
+            else:
+                draw_neon_button(screen, rect, graphics_setting_label(manager, key), small_font,
+                                 UI_CORAL if manager.preferences[key] else UI_MINT)
+        note = "Master affects all sound. Volume and mute changes apply immediately."
     else:
         for key, label in SETTINGS_ROWS[layout["page"]]:
             rect = layout["rows"][key]
@@ -1705,6 +1836,9 @@ PLAYER_CONTROLS = (
     (pygame.K_KP4, pygame.K_KP6, pygame.K_KP8, pygame.K_KP5, (pygame.K_KP_ENTER, pygame.K_KP7)),
 )
 DEFAULT_PLAYER_CONTROLS = PLAYER_CONTROLS
+# Optional run-local auxiliary bindings; None keeps the legacy nearby fallback.
+PLAYER_SPRINT_BINDINGS = (None, None, None, None)
+PLAYER_GIVE_LIFE_BINDINGS = (None, None, None, None)
 PLAYER_AUTOFIRE = (False, False, False, False)
 PLAYER_NAMES = ("", "", "", "")
 PLAYER_NAME_MAX_LENGTH = 16
@@ -1789,7 +1923,7 @@ class HeldInput:
             self.fire_deadlines.pop(key, None)
 
 
-KEYBOARD_ACTIONS = ("LEFT", "RIGHT", "UP", "DOWN", "FIRE")
+KEYBOARD_ACTIONS = ("LEFT", "RIGHT", "UP", "DOWN", "FIRE", "SPRINT", "GIVE LIFE")
 KEYBOARD_RESERVED_KEYS = frozenset((pygame.K_ESCAPE, pygame.K_F6, pygame.K_F7,
                                    pygame.K_F8, pygame.K_F9, pygame.K_F11))
 
@@ -1815,10 +1949,14 @@ def life_share_keys():
                 pygame.K_COMMA, pygame.K_PERIOD, pygame.K_SLASH,
                 pygame.K_QUOTE, pygame.K_SEMICOLON)
     used = {key for row in PLAYER_CONTROLS for key in (*row[:4], *row[4])}
+    used.update(key for key in (*PLAYER_GIVE_LIFE_BINDINGS, *PLAYER_SPRINT_BINDINGS)
+                if key is not None)
     chosen = []
     for index, key in enumerate(preferred):
-        available = next(candidate for candidate in (key, *nearby[index], *fallback, *preferred)
-                         if candidate not in used and candidate not in KEYBOARD_RESERVED_KEYS)
+        explicit = PLAYER_GIVE_LIFE_BINDINGS[index]
+        available = explicit if explicit is not None else next(
+            candidate for candidate in (key, *nearby[index], *fallback, *preferred)
+            if candidate not in used and candidate not in KEYBOARD_RESERVED_KEYS)
         chosen.append(available)
         used.add(available)
     return tuple(chosen)
@@ -1854,6 +1992,7 @@ def sprint_keys():
                 pygame.K_SLASH, pygame.K_QUOTE, pygame.K_SEMICOLON)
     used = {key for row in PLAYER_CONTROLS for key in (*row[:4], *row[4])}
     used.update(life_share_keys())
+    used.update(key for key in PLAYER_SPRINT_BINDINGS if key is not None)
     used.update(KEYBOARD_RESERVED_KEYS)
     used.update((pygame.K_LALT, pygame.K_TAB, pygame.K_CAPSLOCK, pygame.K_F4))
     chosen = []
@@ -1861,8 +2000,10 @@ def sprint_keys():
         # A remap for one pilot should not displace another pilot's preferred
         # sprint key when a fallback elsewhere is available.
         protected = set(preferred) - {key}
-        available = next(candidate for candidate in (key, *nearby[index], *fallback, *preferred)
-                         if candidate not in used and candidate not in protected)
+        explicit = PLAYER_SPRINT_BINDINGS[index]
+        available = explicit if explicit is not None else next(
+            candidate for candidate in (key, *nearby[index], *fallback, *preferred)
+            if candidate not in used and candidate not in protected)
         chosen.append(available)
         used.add(available)
     return tuple(chosen)
@@ -2111,11 +2252,15 @@ class PlayerNameMenu:
 
 def default_keyboard_preferences():
     return {"bindings": [[*row[:4], list(row[4])] for row in DEFAULT_PLAYER_CONTROLS],
-            "auto_fire": [False] * 4}
+            "auto_fire": [False] * 4, "sprint": [None] * 4, "give_life": [None] * 4}
 
 
 def validate_keyboard_preferences(data):
-    """Reject an invalid mapping as a whole; never let two pilots share a key."""
+    """Validate all pilot actions; missing auxiliary rows migrate from old saves.
+
+    Null auxiliary entries retain the nearby collision-free legacy key chooser.
+    Explicit choices are portable and must be unique across every pilot/action.
+    """
     if not isinstance(data, dict):
         return None
     rows, auto_fire = data.get("bindings"), data.get("auto_fire")
@@ -2136,7 +2281,20 @@ def validate_keyboard_preferences(data):
             return None
         seen.update(keys)
         result.append([*row[:4], list(row[4])])
-    return {"bindings": result, "auto_fire": list(auto_fire)}
+    preferences = {"bindings": result, "auto_fire": list(auto_fire)}
+    for action in ("sprint", "give_life"):
+        choices = data.get(action, [None] * 4)
+        if not isinstance(choices, list) or len(choices) != 4:
+            return None
+        for key in choices:
+            if key is None:
+                continue
+            if (type(key) is not int or key not in allowed or key in KEYBOARD_RESERVED_KEYS
+                    or key in seen):
+                return None
+            seen.add(key)
+        preferences[action] = list(choices)
+    return preferences
 
 
 def load_keyboard_preferences(filename=None):
@@ -2145,15 +2303,22 @@ def load_keyboard_preferences(filename=None):
 
 
 def apply_keyboard_preferences(preferences):
-    global PLAYER_CONTROLS, PLAYER_AUTOFIRE
-    PLAYER_CONTROLS = tuple((*row[:4], tuple(row[4])) for row in preferences["bindings"])
-    PLAYER_AUTOFIRE = tuple(preferences["auto_fire"])
+    global PLAYER_CONTROLS, PLAYER_AUTOFIRE, PLAYER_SPRINT_BINDINGS, PLAYER_GIVE_LIFE_BINDINGS
+    validated = validate_keyboard_preferences(preferences)
+    if validated is None:
+        return False
+    PLAYER_CONTROLS = tuple((*row[:4], tuple(row[4])) for row in validated["bindings"])
+    PLAYER_AUTOFIRE = tuple(validated["auto_fire"])
+    PLAYER_SPRINT_BINDINGS = tuple(validated["sprint"])
+    PLAYER_GIVE_LIFE_BINDINGS = tuple(validated["give_life"])
+    return True
 
 
 def current_keyboard_preferences():
     """Snapshot editable lists without sharing them with any cached save."""
     return {"bindings": [[*row[:4], list(row[4])] for row in PLAYER_CONTROLS],
-            "auto_fire": list(PLAYER_AUTOFIRE)}
+            "auto_fire": list(PLAYER_AUTOFIRE), "sprint": list(PLAYER_SPRINT_BINDINGS),
+            "give_life": list(PLAYER_GIVE_LIFE_BINDINGS)}
 
 
 def reset_run_profile():
@@ -2214,22 +2379,27 @@ def player_control_labels(index):
 
 @ui_layout
 def keyboard_controls_layout():
-    panel = pygame.Rect(0, 0, min(700, SCREEN_WIDTH - 24), min(400, SCREEN_HEIGHT - 24))
+    """Seven remappable actions and firing state fit the smallest UI canvas."""
+    panel = pygame.Rect(0, 0, min(740, SCREEN_WIDTH - 24), min(460, SCREEN_HEIGHT - 24))
     panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
     gap = 10
     inner = panel.width - 32
     tabs = [pygame.Rect(panel.x + 16 + index * ((inner + gap) // 4), panel.y + 43,
                         (inner - gap * 3) // 4, 28) for index in range(4)]
     width = (inner - gap) // 2
+    pitch = min(42, max(28, (panel.height - 196) // 4))
     cells = [pygame.Rect(panel.x + 16 + index % 2 * (width + gap),
-                         panel.y + 84 + index // 2 * 40, width, 32) for index in range(6)]
-    footer_y = panel.y + 214
-    return {"panel": panel, "tabs": tabs, "actions": cells[:5], "auto_fire": cells[5],
-            "reset": pygame.Rect(panel.x + 16, footer_y, width, 32),
-            "done": pygame.Rect(panel.x + 16 + width + gap, footer_y, width, 32),
-            "help": pygame.Rect(panel.x + 16, panel.y + 258, inner, 19),
-            "status": pygame.Rect(panel.x + 16, panel.y + 280, inner, 19),
-            "held": pygame.Rect(panel.x + 16, panel.y + 302, inner, 19)}
+                         panel.y + 84 + index // 2 * pitch, width, pitch - 7)
+             for index in range(8)]
+    footer_y = cells[-1].bottom + 10
+    button_height = 28
+    help_y = footer_y + button_height + 9
+    return {"panel": panel, "tabs": tabs, "actions": cells[:7], "auto_fire": cells[7],
+            "reset": pygame.Rect(panel.x + 16, footer_y, width, button_height),
+            "done": pygame.Rect(panel.x + 16 + width + gap, footer_y, width, button_height),
+            "help": pygame.Rect(panel.x + 16, help_y, inner, 18),
+            "status": pygame.Rect(panel.x + 16, help_y + 21, inner, 18),
+            "held": pygame.Rect(panel.x + 16, help_y + 42, inner, 18)}
 
 
 class KeyboardControls:
@@ -2256,23 +2426,33 @@ class KeyboardControls:
         return True
 
     def bind(self, action, key):
-        if type(action) is not int or not 0 <= action < 5:
+        if type(action) is not int or not 0 <= action < len(KEYBOARD_ACTIONS):
+            return False
+        if type(key) is not int:
+            self.status = "That key cannot be used. Try a different key."
             return False
         if key in KEYBOARD_RESERVED_KEYS:
             self.status = "That key is reserved for menus or display controls."
             return False
-        candidate = {"bindings": [[*row[:4], list(row[4])] for row in self.preferences["bindings"]],
-                     "auto_fire": list(self.preferences["auto_fire"])}
+        candidate = deepcopy(self.preferences)
+        # Only explicit auxiliary bindings are protected here. Automatic legacy
+        # choices may relocate when old movement/fire profiles occupy that key.
         for player, row in enumerate(candidate["bindings"]):
-            for other_action, keys in enumerate((*[(value,) for value in row[:4]], tuple(row[4]))):
+            actions = [*( (value,) for value in row[:4]), tuple(row[4]),
+                       (candidate["sprint"][player],), (candidate["give_life"][player],)]
+            for other_action, keys in enumerate(actions):
                 if key in keys and (player != self.player or other_action != action):
                     self.status = f"{control_key_label(key)} is already {player_display_name(player + 1)} {KEYBOARD_ACTIONS[other_action]}."
                     return False
-        candidate["bindings"][self.player][action] = [key] if action == 4 else key
-        if validate_keyboard_preferences(candidate) is None:
+        if action < 5:
+            candidate["bindings"][self.player][action] = [key] if action == 4 else key
+        else:
+            candidate["sprint" if action == 5 else "give_life"][self.player] = key
+        validated = validate_keyboard_preferences(candidate)
+        if validated is None:
             self.status = "That key cannot be used. Try a different key."
             return False
-        self.preferences = candidate
+        self.preferences = validated
         self.status = f"{player_display_name(self.player + 1)} {KEYBOARD_ACTIONS[action]} is now {control_key_label(key)}."
         self._save()
         return True
@@ -2339,7 +2519,10 @@ class KeyboardControls:
             draw_neon_button(screen, rect, player_display_name(index + 1), small_font, PLAYER_COLORS[index],
                              selected=index == self.player)
         for action, rect in enumerate(layout["actions"]):
-            keys = self.preferences["bindings"][self.player][action]
+            if action < 5:
+                keys = self.preferences["bindings"][self.player][action]
+            else:
+                keys = (sprint_keys() if action == 5 else life_share_keys())[self.player]
             label = " / ".join(control_key_label(key) for key in keys) if action == 4 else control_key_label(keys)
             if self.waiting_action == action:
                 label = "PRESS A KEY..."
@@ -3128,7 +3311,7 @@ def draw_space_background(screen, style="menu", now=None):
         return
     width, height = screen.get_size()
     theme = graphics_option("ui_theme") if palette is not None else None
-    key = (width, height, style, level, theme)
+    key = (width, height, style, level, theme, getattr(screen, "density", (1, 1)))
     entry = _SPACE_BACKGROUNDS.get(key)
     if level == "stars":
         # Sparse stars avoid constructing or scaling any nebula surfaces.
@@ -3153,7 +3336,7 @@ def draw_space_background(screen, style="menu", now=None):
             top = palette["bg"]
             bottom = blend_color(top, palette["panel"], 0.7)
             first, second = palette["primary"], palette["secondary"]
-        background = pygame.Surface((width, height))
+        background = ui_surface_like((width, height), screen, opaque=True)
         for y in range(height):
             color = blend_color(top, bottom, y / max(1, height - 1))
             render_draw.line(background, color, (0, y), (width, y))
@@ -3620,27 +3803,19 @@ def create_music_sound():
         return None
 
 class AudioManager:
-    """Own reusable sounds and reserve channel zero for the looping soundtrack."""
-    def __init__(self):
+    """Own sound resources and independent live master/music/effect/UI gains."""
+    def __init__(self, preferences=None):
         self.enabled = False
-        self.shoot = None
-        self.hit = None
-        self.powerup = None
-        self.ram = None
-        self.explosion = None
-        self.ui_hover = None
-        self.ui_click = None
-        self.music = None
-        self.music_channel = None
+        self.shoot = self.hit = self.powerup = self.ram = self.explosion = None
+        self.ui_hover = self.ui_click = self.music = self.music_channel = None
+        configured = load_display_preferences() if preferences is None else preferences
+        validated = _validated_display_preferences(configured)
+        self.preferences = {key: validated[key] for key in AUDIO_DEFAULTS}
         try:
             pygame.mixer.init()
             self.enabled = True
         except Exception:
-            self.enabled = False
-
-        if not self.enabled:
             return
-
         self.shoot = create_tone_sound(520, 45, 0.12)
         self.hit = create_tone_sound(180, 60, 0.18)
         self.powerup = create_tone_sound(740, 120, 0.15)
@@ -3652,12 +3827,52 @@ class AudioManager:
         if self.music is not None:
             pygame.mixer.set_reserved(1)
             self.music_channel = pygame.mixer.Channel(0)
-            self.music_channel.set_volume(INVASION_MUSIC_VOLUME)
+        # Apply persisted mute/gain before starting the loop: no startup blip.
+        self.apply_preferences(self.preferences)
+        if self.music_channel is not None:
             self.music_channel.play(self.music, loops=-1)
 
+    def gain(self, bus):
+        if self.preferences["audio_muted"]:
+            return 0.0
+        return self.preferences["master_volume"] * self.preferences[bus] / 10000.0
+
+    def sound_bus(self, sound):
+        return "ui_volume" if sound is self.ui_hover or sound is self.ui_click else "sfx_volume"
+
+    def apply_preferences(self, preferences):
+        validated = _validated_display_preferences(preferences)
+        self.preferences = {key: validated[key] for key in AUDIO_DEFAULTS}
+        if not self.enabled:
+            return
+        # Update channels already playing long effects as well as future sounds.
+        # Setting channel gain preserves the synthesizer's original headroom.
+        try:
+            if self.music_channel is not None:
+                self.music_channel.set_volume(INVASION_MUSIC_VOLUME * self.gain("music_volume"))
+            for index in range(pygame.mixer.get_num_channels()):
+                if index == 0 and self.music_channel is not None:
+                    continue
+                channel = pygame.mixer.Channel(index)
+                sound = channel.get_sound()
+                if sound is not None:
+                    channel.set_volume(self.gain(self.sound_bus(sound)))
+        except pygame.error:
+            # Losing an audio device must not prevent settings or gameplay.
+            return
+
     def play(self, sound):
-        if self.enabled and sound is not None:
-            sound.play()
+        if not self.enabled or sound is None:
+            return
+        volume = self.gain(self.sound_bus(sound))
+        if volume <= 0:
+            return
+        try:
+            channel = sound.play()
+            if channel is not None:
+                channel.set_volume(volume)
+        except pygame.error:
+            return
 
 
 AUDIO_MANAGER = None
@@ -3689,6 +3904,42 @@ def get_unlocked_boss_attacks(round_num):
 # Animation state advances in simulation updates, while drawing reads the state.
 _SHIP_ARTWORK = {}
 _POWERUP_ICON_CACHE = {}
+SHIP_ANIMATION_CACHE_LIMIT = 128
+POWERUP_ICON_CACHE_LIMIT = 128
+
+
+class _ArtworkImage(_Surface):
+    """A logical preview plus immutable instructions for final-size artwork.
+
+    The world can keep small previews for compatibility and Pixel rendering.
+    A native canvas requests a new raster from this source specification instead
+    of enlarging that preview. Copies used for lighting are tagged only after
+    all changes, so the selected animation and hit flash remain reproducible.
+    """
+    def __init__(self, image, spec):
+        super().__init__(image.get_size(), pygame.SRCALPHA)
+        _Surface.blit(self, image, (0, 0))
+        self.artwork_spec = spec
+
+
+def native_artwork_image(source, target_size):
+    """Rebuild recognized artwork at its final size; unknown images keep fallback."""
+    spec = getattr(source, "artwork_spec", None)
+    if not spec:
+        return None
+    size = tuple(max(1, int(value)) for value in target_size)
+    if size == source.get_size():
+        return source
+    if spec[0] == "ship":
+        return generate_smooth_ship_sprite(spec[1], spec[2], *size)
+    if spec[0] == "animation":
+        _, art, color, style, index, hit = spec
+        frames, hit_frames = generate_ship_animation(art, color, *size, style,
+                                                     quality="smooth")
+        return (hit_frames if hit else frames)[index]
+    if spec[0] == "powerup":
+        return _powerup_icon_image(spec[1], size)
+    return None
 
 
 def artwork_filter():
@@ -3737,21 +3988,22 @@ def rounded_art_contours(art_matrix):
             previous, current = current, following
             if current == start:
                 break
-        points = []
-        for index, vertex in enumerate(vertices):
-            before, after = vertices[index - 1], vertices[(index + 1) % len(vertices)]
-            incoming = (vertex[0] - before[0], vertex[1] - before[1])
-            outgoing = (after[0] - vertex[0], after[1] - vertex[1])
-            if incoming == outgoing:
-                points.append(vertex)
-                continue
-            radius = 0.28
-            entry = (vertex[0] - incoming[0] * radius, vertex[1] - incoming[1] * radius)
-            exit_point = (vertex[0] + outgoing[0] * radius, vertex[1] + outgoing[1] * radius)
-            for step in range(5):
-                t = step / 4
-                points.append(((1 - t) ** 2 * entry[0] + 2 * (1 - t) * t * vertex[0] + t * t * exit_point[0],
-                               (1 - t) ** 2 * entry[1] + 2 * (1 - t) * t * vertex[1] + t * t * exit_point[1]))
+        # Remove redundant points before fitting a continuous curve. Keeping
+        # every unit-grid vertex merely rounded tiny corners and still looked
+        # like enlarged pixels at 4K. Corner cutting blends whole hull edges.
+        points = [vertex for index, vertex in enumerate(vertices)
+                  if ((vertex[0] - vertices[index - 1][0],
+                       vertex[1] - vertices[index - 1][1]) !=
+                      (vertices[(index + 1) % len(vertices)][0] - vertex[0],
+                       vertices[(index + 1) % len(vertices)][1] - vertex[1]))]
+        for _ in range(3):
+            curved = []
+            for first, second in zip(points, points[1:] + points[:1]):
+                curved.extend(((first[0] * .75 + second[0] * .25,
+                                first[1] * .75 + second[1] * .25),
+                               (first[0] * .25 + second[0] * .75,
+                                first[1] * .25 + second[1] * .75)))
+            points = curved
         area = sum(a[0] * b[1] - b[0] * a[1]
                    for a, b in zip(vertices, vertices[1:] + vertices[:1]))
         contours.append((area, points))
@@ -3786,6 +4038,7 @@ def generate_smooth_ship_sprite(art_matrix, color, width, height):
     result = scale_render_surface(hull, (width, height))
     if pygame.display.get_surface() is not None:
         result = result.convert_alpha()
+    result = _ArtworkImage(result, ("ship", tuple(art_matrix), tuple(color[:3])))
     if len(_SHIP_ARTWORK) >= 512:
         _SHIP_ARTWORK.pop(next(iter(_SHIP_ARTWORK)))
     _SHIP_ARTWORK[key] = result
@@ -3830,9 +4083,9 @@ def generate_pixel_sprite(art_matrix, color, width, height, quality=None):
     return result
 
 
-def generate_ship_animation(art_matrix, color, width, height, style="alien"):
+def generate_ship_animation(art_matrix, color, width, height, style="alien", *, quality=None):
     """Build shared resolution-aware frames once; no external files are needed."""
-    quality = artwork_filter()
+    quality = artwork_filter() if quality is None else quality
     key = (tuple(art_matrix), tuple(color), int(width), int(height), style, quality)
     if key in _SHIP_ANIMATIONS:
         return _SHIP_ANIMATIONS[key]
@@ -3861,7 +4114,7 @@ def generate_ship_animation(art_matrix, color, width, height, style="alien"):
             (cols // 2 - 2, rows // 2), (cols // 2 + 2, rows // 2),
         )
         if quality == "pixel":
-            pixels = generate_pixel_sprite(matrix, color, cols, rows)
+            pixels = generate_pixel_sprite(matrix, color, cols, rows, quality="pixel").copy()
             for x, y in lights:
                 if 0 <= x < cols and 0 <= y < rows and art[y][x] == "X":
                     pixels.set_at((x, y), light)
@@ -3874,10 +4127,16 @@ def generate_ship_animation(art_matrix, color, width, height, style="alien"):
                     render_draw.circle(frame, light, location, max(1, round(width / cols * 0.23)))
         hit = frame.copy()
         hit.fill((165, 165, 165, 0), special_flags=pygame.BLEND_RGBA_ADD)
+        if quality == "smooth":
+            common = ("animation", tuple(art_matrix), tuple(color), style, frame_index)
+            frame = _ArtworkImage(frame, (*common, False))
+            hit = _ArtworkImage(hit, (*common, True))
         frames.append(frame)
         hit_frames.append(hit)
 
     result = (tuple(frames), tuple(hit_frames))
+    if len(_SHIP_ANIMATIONS) >= SHIP_ANIMATION_CACHE_LIMIT:
+        _SHIP_ANIMATIONS.pop(next(iter(_SHIP_ANIMATIONS)))
     _SHIP_ANIMATIONS[key] = result
     return result
 
@@ -3986,7 +4245,7 @@ def draw_animated_player(screen, player, now):
         draw_player_nameplate(screen, player)
         return
     frame = animated_ship_frame(player, player["sprite"])
-    canvas = pygame.Surface((PLAYER_WIDTH + 64, PLAYER_HEIGHT + 88), pygame.SRCALPHA)
+    canvas = ui_surface_like((PLAYER_WIDTH + 64, PLAYER_HEIGHT + 88), screen)
     body = frame.get_rect(center=canvas.get_rect().center)
     # The engine is an ANIMATED *central* thruster. No side flames or wing-tip
     # blinking: the side silhouette stays perfectly stable as the jet pulses.
@@ -4034,7 +4293,7 @@ def draw_animated_player(screen, player, now):
         render_draw.line(canvas, UI_TEXT, (body.left - 4, scan_y), (body.right + 4, scan_y), 2)
     if player.get("animation_hit", 0):
         render_draw.circle(canvas, UI_CYAN, body.center, 23 + player["animation_hit"], 2)
-    canvas = pygame.transform.rotate(canvas, round(player.get("animation_bank", 0)))
+    canvas = rotate_render_surface(canvas, round(player.get("animation_bank", 0)))
     center = (round(player["x"] + PLAYER_WIDTH / 2), round(player["y"] + PLAYER_HEIGHT / 2))
     draw_soft_glow(screen, center, player["color"], radius=24, strength=50)
     screen.blit(canvas, canvas.get_rect(center=center))
@@ -4113,11 +4372,11 @@ def draw_animated_enemy(screen, enemy):
                    radius=26 if enemy.get("is_boss") else 18, strength=25 + round(pulse * 3) * 5)
     frame = animated_ship_frame(enemy, enemy["surface"])
     angle = round(enemy.get("animation_bank", 0))
-    if angle:
-        key = (frame, angle)
+    if angle or (enemy["type"] == "phantom" and isinstance(screen, NativeUISurface)):
+        key = (frame, angle, getattr(screen, "density", (1, 1)))
         rotated = _ROTATED_ENEMY_SPRITES.get(key)
         if rotated is None:
-            rotated = pygame.transform.rotate(frame, angle)
+            rotated = rotate_render_surface(frame, angle, screen)
             if len(_ROTATED_ENEMY_SPRITES) >= 256:
                 _ROTATED_ENEMY_SPRITES.pop(next(iter(_ROTATED_ENEMY_SPRITES)))
             _ROTATED_ENEMY_SPRITES[key] = rotated
@@ -4606,7 +4865,7 @@ def update_and_draw_particles(screen, particles, advance=True):
                 bounds = bounds.clip(ring_bounds).clip(screen.get_clip())
                 if not bounds.width or not bounds.height:
                     continue
-                pulse = pygame.Surface(bounds.size, pygame.SRCALPHA)
+                pulse = ui_surface_like(bounds.size, screen)
                 center = (position[0] - bounds.x, position[1] - bounds.y)
                 alpha = round(190 * (1 - progress))
                 render_draw.circle(pulse, (*p["color"], alpha), center, radius, 3)
@@ -4623,7 +4882,7 @@ def update_and_draw_particles(screen, particles, advance=True):
                                  radius * 2 + 7, radius * 2 + 7).clip(screen.get_clip())
             if not bounds.width or not bounds.height:
                 continue
-            pulse = pygame.Surface(bounds.size, pygame.SRCALPHA)
+            pulse = ui_surface_like(bounds.size, screen)
             center = (position[0] - bounds.x, position[1] - bounds.y)
             alpha = round(190 * (1 - progress))
             render_draw.circle(pulse, (*p["color"], alpha), center, radius, 4)
@@ -10152,13 +10411,14 @@ class _ScaledArtworkDraw:
     """Rasterize small vector icons above logical resolution once per kind."""
 
     def __init__(self, scale):
-        self.scale = scale
+        self.factors = (scale, scale) if isinstance(scale, (int, float)) else tuple(scale)
+        self.scale = min(self.factors)
 
     def point(self, position):
-        return tuple(round(value * self.scale) for value in position)
+        return tuple(round(value * factor) for value, factor in zip(position, self.factors))
 
     def rectangle(self, rect):
-        return tuple(round(value * self.scale) for value in rect)
+        return tuple(round(value * self.factors[index % 2]) for index, value in enumerate(rect))
 
     def circle(self, surface, color, center, radius, width=0):
         return render_draw.circle(surface, color, self.point(center), round(radius * self.scale), round(width * self.scale))
@@ -10182,20 +10442,31 @@ class _ScaledArtworkDraw:
         return render_draw.arc(surface, color, self.rectangle(rect), start, stop, round(width * self.scale))
 
 
+def _powerup_icon_image(powerup_type, size=(32, 32)):
+    """Rasterize the icon vectors at final size, with bounded immutable reuse."""
+    size = tuple(max(1, int(value)) for value in size)
+    key = powerup_type if size == (32, 32) else (powerup_type, size)
+    icon = _POWERUP_ICON_CACHE.get(key)
+    if icon is not None:
+        return icon
+    samples = 4
+    canvas = pygame.Surface((size[0] * samples, size[1] * samples), pygame.SRCALPHA)
+    _draw_powerup_icon_primitives(canvas, powerup_type, (16, 16),
+                                  (size[0] / 32 * samples, size[1] / 32 * samples))
+    icon = _ArtworkImage(scale_render_surface(canvas, size), ("powerup", powerup_type))
+    if len(_POWERUP_ICON_CACHE) >= POWERUP_ICON_CACHE_LIMIT:
+        _POWERUP_ICON_CACHE.pop(next(iter(_POWERUP_ICON_CACHE)))
+    _POWERUP_ICON_CACHE[key] = icon
+    return icon
+
+
 def draw_powerup_icon(screen, powerup_type, center):
-    """Use cached antialiased glyphs in Smooth mode, direct shapes in Potato."""
+    """Use scalable antialiased glyphs in Smooth mode, direct shapes in Potato."""
     if artwork_filter() == "pixel" or not graphics_feature_enabled("animations"):
         _draw_powerup_icon_primitives(screen, powerup_type, center)
         return
-    icon = _POWERUP_ICON_CACHE.get(powerup_type)
-    if icon is None:
-        samples = 4
-        canvas = pygame.Surface((32 * samples, 32 * samples), pygame.SRCALPHA)
-        _draw_powerup_icon_primitives(canvas, powerup_type, (16, 16), samples)
-        icon = scale_render_surface(canvas, (32, 32))
-        _POWERUP_ICON_CACHE[powerup_type] = icon
+    icon = _powerup_icon_image(powerup_type)
     screen.blit(icon, (round(center[0]) - 16, round(center[1]) - 16))
-
 
 def _draw_powerup_icon_primitives(screen, powerup_type, center, samples=1):
     draw = render_draw if samples == 1 else _ScaledArtworkDraw(samples)
@@ -10474,7 +10745,7 @@ def draw_world_powerup(screen, powerup, now):
     visual_phase = powerup.get("visual_phase", POWERUP_TYPES.index(key) * 0.73
                               if key in POWERUP_TYPES else 0)
     phase = now / 650 * speed + visual_phase
-    surface = pygame.Surface((72, 72), pygame.SRCALPHA)
+    surface = ui_surface_like((72, 72), screen)
     center = (36, 36)
     pulse = 0.5 + 0.5 * math.sin(now / 240 + visual_phase)
     if graphics_feature_enabled("glow"):
@@ -10525,7 +10796,7 @@ def draw_powerup_collection_particle(screen, particle):
     progress = 1 - fraction
     color = particle["color"]
     if particle.get("kind") == "shatter":
-        surface = pygame.Surface((18, 18), pygame.SRCALPHA)
+        surface = ui_surface_like((18, 18), screen)
         angle = particle.get("angle", 0) + progress * 1.8
         points = []
         for index, radius in enumerate((7, 2, 7, 2)):
@@ -10536,14 +10807,14 @@ def draw_powerup_collection_particle(screen, particle):
         render_draw.line(surface, (*UI_TEXT, round(120 * fraction)), points[0], points[2], 1)
         screen.blit(surface, (round(particle["x"]) - 9, round(particle["y"]) - 9))
     elif particle.get("role") == "ring":
-        surface = pygame.Surface((80, 80), pygame.SRCALPHA)
+        surface = ui_surface_like((80, 80), screen)
         radius = round(8 + 26 * progress)
         draw_powerup_aura(surface, (40, 40), (*color, round(145 * fraction)),
                           particle["motif"], particle["count"],
                           particle.get("angle", 0) + progress * 0.8, radius)
         screen.blit(surface, (round(particle["x"]) - 40, round(particle["y"]) - 40))
     else:
-        surface = pygame.Surface((14, 14), pygame.SRCALPHA)
+        surface = ui_surface_like((14, 14), screen)
         angle = particle.get("angle", 0)
         end = (round(7 + math.cos(angle) * 4 * fraction),
                round(7 + math.sin(angle) * 4 * fraction))
@@ -11001,7 +11272,7 @@ def draw_support_powerups(screen, player, now):
     radius = max(64,
                  GRAVITY_FIELD_RADIUS + 4 if player.get("gravity_until", 0) > now else 0,
                  BULLET_TIME_RADIUS + 4 if player.get("bullet_time_until", 0) > now else 0)
-    effects = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
+    effects = ui_surface_like((radius * 2 + 4, radius * 2 + 4), screen)
     cx = cy = radius + 2
     phase = now / 650 + player["number"] * 0.8
 
@@ -11205,7 +11476,7 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
         height = max(5, round(rect.height * 0.70))
     else:
         width, height = bullet.get("projectile_base_size", rect.size)
-    sprite = pygame.Surface((width, height), pygame.SRCALPHA)
+    sprite = ui_surface_like((width, height), screen)
     if bullet.get("type") == "bomb" and not hostile:
         draw_soft_glow(screen, rect.center, color, radius=17, strength=65)
         render_draw.ellipse(sprite, color, sprite.get_rect())
@@ -11225,7 +11496,7 @@ def draw_homing_projectile(screen, bullet, color, hostile=False):
         if bullet.get("type") == "missile":
             render_draw.line(sprite, UI_GOLD, (width // 2, height - 3),
                              (width // 2, height - 1), 2)
-    rotated = pygame.transform.rotate(sprite, -math.degrees(heading) - 90)
+    rotated = rotate_render_surface(sprite, -math.degrees(heading) - 90)
     draw_rect = rotated.get_rect(center=rect.center)
     screen.blit(rotated, draw_rect)
     return draw_rect
@@ -11643,7 +11914,7 @@ def draw_round_transition(screen, round_num, round_font, transition_timer):
     color = UI_CORAL if round_num % 5 == 0 else UI_CYAN
     text_surf = round_font.render(text_str, True, color)
     panel_width = max(420, text_surf.get_width() + 86)
-    fade_surf = pygame.Surface((panel_width, text_surf.get_height() + 82), pygame.SRCALPHA)
+    fade_surf = ui_surface_like((panel_width, text_surf.get_height() + 82), screen)
     panel = fade_surf.get_rect().inflate(-12, -12)
     draw_neon_panel(fade_surf, panel, color)
     fade_surf.blit(text_surf, text_surf.get_rect(center=panel.center))
@@ -13356,6 +13627,14 @@ def main():
                                    if rect.collidepoint(event.pos)), None)
                     if tab is not None:
                         settings_page = tab
+                    elif settings_page == "audio" and option in AUDIO_VOLUME_KEYS:
+                        cells = settings_layout["audio_controls"][option]
+                        if cells["minus"].collidepoint(event.pos):
+                            display_manager.adjust_audio_volume(option, -1)
+                        elif cells["plus"].collidepoint(event.pos):
+                            display_manager.adjust_audio_volume(option, 1)
+                    elif settings_page == "audio" and option == "audio_muted":
+                        display_manager.toggle_audio_mute()
                     elif option == "preset":
                         current = display_manager.graphics_preset_name()
                         index = GRAPHICS_PRESET_OPTIONS.index(current) if current in GRAPHICS_PRESET_OPTIONS else -1
@@ -13368,7 +13647,7 @@ def main():
                     elif settings_page == "display" and settings_layout["larger"].collidepoint(event.pos):
                         display_manager.adjust_gui_scale(1)
                     elif settings_page == "display" and settings_layout["auto"].collidepoint(event.pos):
-                        display_manager.reset_gui_scale()
+                        display_manager.toggle_gui_scale_mode()
                     elif settings_page == "display" and settings_layout["mode"].collidepoint(event.pos):
                         display_manager.toggle_fullscreen()
                     elif settings_page == "display" and settings_layout["potato"].collidepoint(event.pos):
